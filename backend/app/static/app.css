@@ -131,6 +131,19 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
 .card-body.flush { padding: 0; }
 .toolbar { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
 
+/* settings forms: label column + control, wraps on narrow screens */
+.form-row {
+  display: flex; align-items: center; gap: 12px;
+  margin-bottom: 12px; flex-wrap: wrap;
+}
+.form-row > label {
+  width: 96px; flex: none; font-size: 13px; color: #4b5563;
+}
+.form-row > input[type="text"], .form-row > input:not([type]),
+.form-row > input[type="password"] { flex: 1; min-width: 240px; }
+.form-row > input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--accent); }
+@media (max-width: 700px) { .form-row > label { width: 100%; } }
+
 table { border-collapse: collapse; width: 100%; }
 th, td { text-align: left; padding: 10px 18px; border-bottom: 1px solid var(--line); font-size: 13px; }
 th { background: #fafbfd; color: var(--muted); font-weight: 500; font-size: 12px; }
