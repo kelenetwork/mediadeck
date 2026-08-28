@@ -12,7 +12,7 @@
 ## Phase 2 — import lanes + user management
 - [ ] Cloud-drive import module (port of existing internal dashboard)
 - [ ] Drive-link import module
-- [ ] Emby user management: create/disable/policy templates, invite codes
+- [x] Emby user management: create/disable/password/policy (invite codes pending)
 
 ## Phase 3 — acquisition shell + review
 - [ ] MoviePilot adapter (search/subscribe/download/history) behind thin API shim

@@ -79,3 +79,27 @@ def test_history_and_dispatch_log() -> None:
         r = client.get("/api/nodes/mock-a/history", headers=_basic())
         assert r.status_code == 200
         assert isinstance(r.json(), list)
+
+
+def test_emby_user_management() -> None:
+    with TestClient(app) as client:
+        created = client.post("/api/emby/users", headers=_basic(),
+                              json={"name": "new-demo"}).json()
+        uid = created["Id"]
+        assert created["Name"] == "new-demo"
+        assert client.post(f"/api/emby/users/{uid}/disable", headers=_basic()).json()["disabled"]
+        users = {u["Id"]: u for u in client.get("/api/emby/users", headers=_basic()).json()}
+        assert users[uid]["Policy"]["IsDisabled"] is True
+        assert client.post(f"/api/emby/users/{uid}/enable", headers=_basic()).json()["disabled"] is False
+        assert client.post(f"/api/emby/users/{uid}/password", headers=_basic(),
+                           json={"new_password": "secret123"}).json()["ok"]
+        r = client.post(f"/api/emby/users/{uid}/policy", headers=_basic(),
+                        json={"SimultaneousStreamLimit": 2, "NotAllowed": "x"})
+        assert r.json()["ok"]
+        users = {u["Id"]: u for u in client.get("/api/emby/users", headers=_basic()).json()}
+        assert users[uid]["Policy"]["SimultaneousStreamLimit"] == 2
+        assert "NotAllowed" not in users[uid]["Policy"]
+        # unknown user -> 404; empty policy patch -> 422
+        assert client.post("/api/emby/users/nope/disable", headers=_basic()).status_code == 404
+        assert client.post(f"/api/emby/users/{uid}/policy", headers=_basic(),
+                           json={"Whatever": 1}).status_code == 422
