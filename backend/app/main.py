@@ -69,6 +69,11 @@ def _mock_nodes(cfg: Any):
     ]
 
 
+@app.get("/", include_in_schema=False)
+async def root() -> RedirectResponse:
+    return RedirectResponse("/docs", status_code=307)
+
+
 @app.get("/healthz")
 async def healthz() -> dict[str, str]:
     return {"status": "ok"}

@@ -153,3 +153,9 @@ def test_semver_helpers() -> None:
     assert semver_key("v1.2") is None and semver_key("junk") is None
     assert latest_tag(["v0.1.0", "v0.10.0", "v0.2.9", "nope"]) == "v0.10.0"
     assert latest_tag(["nope"]) is None
+
+
+def test_root_redirects_to_docs() -> None:
+    with TestClient(app) as client:
+        r = client.get("/", follow_redirects=False)
+        assert r.status_code == 307 and r.headers["location"] == "/docs"
