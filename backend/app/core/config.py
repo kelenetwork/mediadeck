@@ -19,14 +19,32 @@ from pydantic import BaseModel
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-class StreamNode(BaseModel):
-    """A streaming edge node.
+class NodePool(BaseModel):
+    """One media root that a node can serve.
 
-    ``capacity`` is the number of concurrent streams this node can serve --
-    an absolute number, not a relative share.  Load is expressed as the ratio
-    ``active_streams / capacity``, so "80% full" means the same thing on every
-    node regardless of size, and the dispatch threshold is comparable across
-    a heterogeneous fleet.
+    A real Emby server rarely has a single media root.  This stack has two
+    (``/media`` from a union mount and ``/media-gd3`` from a second Drive),
+    and a single global "strip this prefix" rule cannot express that: with
+    ``strip_prefix=/media`` the path ``/media-gd3/x.mkv`` becomes ``-gd3/x.mkv``
+    and the entire second library 404s on the node.
+
+    So mapping is per-root and per-node: ``emby_prefix`` is the path as Emby
+    reports it, ``url_prefix`` is where the node serves that same tree.
+    """
+
+    name: str                    # "main", "gd3"
+    emby_prefix: str             # "/media-gd3" as Emby reports it
+    url_prefix: str              # "/s/gd3" as the node serves it
+    node_path: str = ""          # "/mnt/gdrive3/Media" — for generated config
+    rclone_remote: str = ""      # "gdrive3:Media" — for generated mount unit
+
+
+class StreamNode(BaseModel):
+    """A streaming edge node and everything needed to build and drive it.
+
+    Node-scoped settings live here, not in global settings: the Drive identity,
+    cache location and signing key are properties *of a machine*, and two nodes
+    routinely differ in all three.
     """
 
     name: str
@@ -34,6 +52,24 @@ class StreamNode(BaseModel):
     probe_url: str         # internal /load probe endpoint
     capacity: float = 100  # max concurrent streams this node can serve
     enabled: bool = True
+
+    # -- delivery (per node) -------------------------------------------------
+    pools: list[NodePool] = []
+    sign_secret: str = ""          # empty -> unsigned (public) URLs
+    sign_ttl_seconds: int = 21600
+    # nginx secure_link argument names. ca1's production site already uses
+    # k/e; hardcoding md5/expires would 403 every request on it.
+    sign_arg_digest: str = "k"
+    sign_arg_expires: str = "e"
+
+    # -- provisioning inputs (per node) --------------------------------------
+    cache_dir: str = "/var/cache/mediadeck"
+    cache_size: str = "500G"
+    # Drive identity for this node. Held here so enrollment is genuinely
+    # one-command: without it the operator would still have to SSH in and run
+    # `rclone config`, which is exactly the manual step this replaces.
+    rclone_conf: str = ""
+    enroll_token: str = ""         # one-shot token for unattended install
 
 
 class Settings(BaseSettings):
@@ -89,15 +125,16 @@ class Settings(BaseSettings):
 def demo_nodes() -> list[StreamNode]:
     """Credential-free demo fleet used when MEDIADECK_MOCK=1.
 
-    These are seeded into the settings store like real nodes, so mock mode
-    stays self-consistent: what the settings page lists is exactly what the
-    scheduler dispatches to.
+    Seeded into the settings store like real nodes, so mock mode stays
+    self-consistent: what the settings page lists is what the scheduler
+    dispatches to.
     """
+    pools = [NodePool(name="main", emby_prefix="/media", url_prefix="/s/main")]
     return [
         StreamNode(name="mock-a", base_url="https://mock-a.example",
-                   probe_url="mock://a", capacity=100),
+                   probe_url="mock://a", capacity=100, pools=list(pools)),
         StreamNode(name="mock-b", base_url="https://mock-b.example",
-                   probe_url="mock://b", capacity=100),
+                   probe_url="mock://b", capacity=100, pools=list(pools)),
     ]
 
 

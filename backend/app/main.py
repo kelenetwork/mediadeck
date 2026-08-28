@@ -8,7 +8,13 @@ from pathlib import Path as FilePath
 from typing import Any
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Request, status
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.responses import (
+    FileResponse,
+    JSONResponse,
+    PlainTextResponse,
+    RedirectResponse,
+    StreamingResponse,
+)
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 
@@ -18,11 +24,16 @@ from app.core.cache import TTLCache
 from app.core.config import settings
 from app.core.errors import ConfigError, NotConfigured, UpstreamError
 from app.core.store import SettingsStore
+from app.modules.events import EventStream, safe_stream
 from app.modules.imports import ImportManager, JobKind, MockExecutor
 from app.modules.mounts import MockMounts, MountsReader
 from app.modules.pipeline import MockPipeline, PipelineReader
 from app.modules.playback import PlaybackRouter
-from app.modules.provisioning import emby_frontend_snippet, install_script
+from app.modules.provisioning import (
+    emby_frontend_snippet,
+    enroll_command,
+    install_script,
+)
 from app.modules.scheduler import Scheduler
 from app.modules.settings import SettingsService
 from app.modules.storage import MockStorage, StorageManager
@@ -123,16 +134,36 @@ async def _startup() -> None:
         app.state.scheduler,
         app.state.settings_service.playback_config,
         app.state.settings_service.emby_config,
-        app.state.settings_service.delivery_config,
     )
 
     async def probe_loop() -> None:
         while True:
             with contextlib.suppress(Exception):
                 await app.state.scheduler.refresh()
-            await asyncio.sleep(15)
+            # Wakes early when nodes change, so a node added in the UI shows
+            # its real health at once rather than after up to 15 seconds.
+            await app.state.scheduler.wait_for_change(15)
 
     app.state.probe_task = asyncio.create_task(probe_loop())
+
+    async def _nodes_topic() -> Any:
+        config = {n["name"]: n for n in app.state.settings_service.nodes_public()}
+        out = []
+        for state in app.state.scheduler.snapshot():
+            row = dict(config.get(state["name"], {}))
+            row.update(state)
+            out.append(row)
+        return out
+
+    app.state.events = EventStream({
+        "nodes": _nodes_topic,
+        "sessions": lambda: app.state.cache.resolve(
+            "emby:sessions", app.state.emby.active_sessions, ttl=5),
+        "pipeline": lambda: asyncio.to_thread(app.state.pipeline.snapshot),
+        "tasks": lambda: asyncio.to_thread(app.state.tasks.snapshot),
+        "mounts": lambda: asyncio.to_thread(app.state.mounts.snapshot),
+        "playback": lambda: asyncio.to_thread(app.state.playback.recent, 30),
+    })
 
 
 STATIC_DIR = FilePath(__file__).parent / "static"
@@ -152,6 +183,28 @@ async def root(_: str = Depends(_auth)) -> FileResponse:
 @app.get("/healthz")
 async def healthz() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/api/stream", dependencies=[Depends(_auth)])
+async def event_stream(request: Request, topics: str = "") -> StreamingResponse:
+    """Server-sent events: push changes instead of polling every 30s.
+
+    Polling was wrong in both directions -- a stream starting now stayed
+    invisible for up to 30s, while an idle panel hammered Emby forever, and
+    the periodic re-render wiped whatever the operator was typing.
+    """
+    wanted = [t.strip() for t in topics.split(",") if t.strip()]
+    return StreamingResponse(
+        safe_stream(app.state.events.iterate(wanted)),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            # nginx buffers proxied responses by default, which would hold
+            # every event until the buffer fills -- i.e. no live updates.
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.get("/agent/loadprobe.py", include_in_schema=False)
@@ -180,7 +233,6 @@ async def settings_overview() -> dict[str, Any]:
         "emby": service.emby_public(),
         "dispatch": service.dispatch_config(),
         "playback": service.playback_config(),
-        "delivery": service.delivery_public(),
         "integration": service.integration_config(),
         "nodes": service.nodes_public(),
     }
@@ -218,7 +270,19 @@ async def settings_dispatch_save(payload: dict[str, Any] = Body(...)) -> dict[st
 # ---- streaming nodes -------------------------------------------------------
 @app.get("/api/nodes", dependencies=[Depends(_auth)])
 async def nodes() -> list[dict[str, Any]]:
-    return app.state.scheduler.snapshot()
+    """Live health merged with stored config, so the UI has one source.
+
+    The scheduler knows health; the settings store knows media roots and
+    whether a signing key is set. Returning only one of them forces the UI to
+    stitch two lists together and get them out of sync.
+    """
+    config = {n["name"]: n for n in app.state.settings_service.nodes_public()}
+    merged = []
+    for state in app.state.scheduler.snapshot():
+        row = dict(config.get(state["name"], {}))
+        row.update(state)
+        merged.append(row)
+    return merged
 
 
 @app.post("/api/nodes", dependencies=[Depends(_auth)])
@@ -441,8 +505,8 @@ async def playback_log(limit: int = 100) -> list[dict[str, Any]]:
 async def playback_preview(item_id: str) -> dict[str, Any]:
     """Dry-run one interception so the operator can confirm path mapping.
 
-    Setting strip_prefix/path_template wrong yields 404s on the node that are
-    painful to debug from client logs; this shows the resolved target first.
+    A wrong media-root mapping yields 404s on the node that are painful to
+    debug from client logs; this shows the resolved target first.
     """
     decision = await app.state.playback.route(
         item_id, f"emby/Videos/{item_id}/stream.mkv", {"Static": "true"}
@@ -452,26 +516,10 @@ async def playback_preview(item_id: str) -> dict[str, Any]:
         "target": decision.target,
         "reason": decision.reason,
         "node": decision.node,
+        "pool": decision.pool,
         "media_path": decision.media_path,
         "signed": decision.signed,
     }
-
-
-# ---- delivery security -----------------------------------------------------
-@app.get("/api/settings/delivery", dependencies=[Depends(_auth)])
-async def settings_delivery_get() -> dict[str, Any]:
-    return app.state.settings_service.delivery_public()
-
-
-@app.put("/api/settings/delivery", dependencies=[Depends(_auth)])
-async def settings_delivery_save(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:  # noqa: B008
-    return app.state.settings_service.save_delivery(payload)
-
-
-@app.post("/api/settings/delivery/rotate", dependencies=[Depends(_auth)])
-async def settings_delivery_rotate() -> dict[str, Any]:
-    """Issue a new signing key, invalidating every link already handed out."""
-    return app.state.settings_service.rotate_delivery_secret()
 
 
 # ---- integration / node provisioning ---------------------------------------
@@ -502,40 +550,73 @@ async def integration_frontend(server: str = "caddy") -> dict[str, Any]:
     }
 
 
-@app.get("/api/nodes/{name}/install", dependencies=[Depends(_auth)])
-async def node_install_script(
-    name: str,
-    remote: str = "gdrive",
-    cache_dir: str = "/var/cache/mediadeck",
-    cache_size: str = "500G",
-) -> dict[str, Any]:
-    """Render the installer that turns a bare server into this node.
+@app.post("/api/nodes/{name}/rotate-secret", dependencies=[Depends(_auth)])
+async def node_rotate_secret(name: str) -> dict[str, Any]:
+    """Issue a new signing key for one node, invalidating its issued links."""
+    try:
+        return app.state.settings_service.rotate_node_secret(name)
+    except KeyError:
+        raise HTTPException(404, "unknown node") from None
 
-    Registering a node the panel cannot actually reach only produces 404s, so
-    the panel emits the rclone mount, nginx vhost and probe unit that make the
-    registration true. Nothing is executed and no host is contacted here.
+
+@app.get("/api/nodes/{name}/enroll", dependencies=[Depends(_auth)])
+async def node_enroll_command(name: str) -> dict[str, Any]:
+    """The single command that turns a bare server into this node.
+
+    Everything the node needs -- Drive identity, media roots, cache, signing
+    key -- is already stored against the node, so the operator does not fill
+    anything in on the target machine. The installer fetches that config from
+    the panel using a one-shot enrollment token.
     """
     service = app.state.settings_service
-    node = next((n for n in service.nodes() if n.name == name), None)
+    node = service.node(name)
     if node is None:
         raise HTTPException(404, "unknown node")
-    integration = service.integration_config()
-    delivery = service.delivery_config()
+    panel = service.integration_config()["panel_public_url"]
+    if not panel:
+        raise HTTPException(
+            409, "请先在「系统设置 → 接入方式」填写面板对外地址，节点需要用它回连"
+        )
+    token = service.node_enroll_token(name)
     return {
         "node": name,
-        "signing_enabled": delivery["signing_enabled"],
-        "script": install_script(
-            node_name=node.name,
-            base_url=node.base_url,
-            media_root=integration["node_media_root"],
-            remote=remote,
-            cache_dir=cache_dir,
-            cache_size=cache_size,
-            panel_url=integration["panel_public_url"] or "http://127.0.0.1:8300",
-            signing_enabled=delivery["signing_enabled"],
-            secret=delivery["secret"],
+        "command": enroll_command(panel, token),
+        "ready": bool(node.pools),
+        "warnings": (
+            [] if node.pools else ["该节点尚未配置媒体根，安装后无法提供任何文件"]
         ),
     }
+
+
+@app.get("/api/nodes/{name}/install", dependencies=[Depends(_auth)])
+async def node_install_script(name: str) -> dict[str, Any]:
+    """Render the installer for review (same content the one-liner fetches)."""
+    service = app.state.settings_service
+    node = service.node(name)
+    if node is None:
+        raise HTTPException(404, "unknown node")
+    panel = service.integration_config()["panel_public_url"] or "http://127.0.0.1:8300"
+    return {
+        "node": name,
+        "signing_enabled": bool(node.sign_secret),
+        "script": install_script(node, panel),
+    }
+
+
+@app.get("/api/enroll/{token}/script", include_in_schema=False)
+async def enroll_script(token: str) -> PlainTextResponse:
+    """Unauthenticated by design: the enrollment token *is* the credential.
+
+    A bare server has no panel login, so the one-liner cannot use HTTP Basic.
+    The token is per node, unguessable, and only yields that node's installer.
+    """
+    service = app.state.settings_service
+    node = service.node_by_enroll_token(token)
+    if node is None:
+        raise HTTPException(404, "invalid or expired enrollment token")
+    panel = service.integration_config()["panel_public_url"] or "http://127.0.0.1:8300"
+    return PlainTextResponse(install_script(node, panel),
+                             media_type="text/x-shellscript")
 
 
 @app.get("/emby/Videos/{item_id}/{rest:path}")
