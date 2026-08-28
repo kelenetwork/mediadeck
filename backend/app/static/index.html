@@ -44,6 +44,7 @@
     <button data-tab="nodes">推流节点</button>
     <button data-tab="users">用户</button>
     <button data-tab="imports">上片</button>
+    <button data-tab="acq">搜索/订阅</button>
     <button data-tab="update">更新</button>
   </nav>
 </header>
@@ -102,6 +103,27 @@
       <button class="act primary" onclick="submitImport()">提交</button>
     </div>
     <table id="imports"><thead><tr><th>ID</th><th>类型</th><th>来源</th><th>状态</th><th>进度</th><th>操作</th></tr></thead><tbody></tbody></table>
+  </div>
+</section>
+
+<section id="tab-acq">
+  <div class="card">
+    <h3>资源搜索</h3>
+    <div class="row">
+      <input id="acq-kw" placeholder="片名 / 关键词" style="flex:1;min-width:240px">
+      <button class="act primary" onclick="searchMedia()">识别媒体</button>
+      <button class="act" onclick="searchTorrents()">搜索站点资源</button>
+    </div>
+    <table id="acq-media" style="display:none"><thead><tr><th>标题</th><th>年份</th><th>类型</th><th>TMDB</th><th>操作</th></tr></thead><tbody></tbody></table>
+    <table id="acq-torrents" style="display:none"><thead><tr><th>标题</th><th>站点</th><th>清晰度</th><th>体积</th><th>做种</th><th>操作</th></tr></thead><tbody></tbody></table>
+  </div>
+  <div class="card">
+    <h3>当前订阅</h3>
+    <table id="acq-subs"><thead><tr><th>名称</th><th>年份</th><th>类型</th><th>季</th><th>缺集</th><th>状态</th><th>操作</th></tr></thead><tbody></tbody></table>
+  </div>
+  <div class="card">
+    <h3>正在下载</h3>
+    <table id="acq-dl"><thead><tr><th>任务</th><th>进度</th><th>状态</th><th>剩余</th></tr></thead><tbody></tbody></table>
   </div>
 </section>
 
@@ -265,6 +287,82 @@ async function cancelImport(id) {
     toast('已取消'); loadImports();
   } catch (e) { toast('取消失败: ' + e.message, 1); }
 }
+// ---- acquisition ----
+async function searchMedia() {
+  const kw = $('#acq-kw').value.trim();
+  if (!kw) return toast('输入关键词', 1);
+  try {
+    const ms = await api('/api/mp/media/search?keyword=' + encodeURIComponent(kw));
+    $('#acq-torrents').style.display = 'none';
+    $('#acq-media').style.display = '';
+    $('#acq-media tbody').innerHTML = ms.length ? ms.map(m =>
+      `<tr><td>${m.title||''}</td><td>${m.year||''}</td><td>${m.type||''}</td><td>${m.tmdb_id||''}</td>
+       <td><button class="act primary" onclick="subscribe(${m.tmdb_id},'${m.type}')">订阅</button></td></tr>`).join('')
+      : '<tr><td colspan="5" class="muted">无结果</td></tr>';
+  } catch (e) { toast('识别失败: ' + e.message, 1); }
+}
+async function searchTorrents() {
+  const kw = $('#acq-kw').value.trim();
+  if (!kw) return toast('输入关键词', 1);
+  toast('站点搜索中，可能需要十几秒…');
+  try {
+    const ts = await api('/api/mp/torrents/search?keyword=' + encodeURIComponent(kw));
+    $('#acq-media').style.display = 'none';
+    $('#acq-torrents').style.display = '';
+    $('#acq-torrents tbody').innerHTML = ts.length ? ts.map((t, i) =>
+      `<tr><td title="${t.description||''}">${(t.title||'').slice(0,60)}</td><td>${t.site||''}</td>
+       <td>${t.resolution||''}</td><td>${fmtBytes(t.size)}</td><td>${t.seeders??''}</td>
+       <td><button class="act primary" onclick='downloadTorrent(${JSON.stringify(t.enclosure)},${JSON.stringify(t.title)})'>下载</button></td></tr>`).join('')
+      : '<tr><td colspan="6" class="muted">无结果</td></tr>';
+  } catch (e) { toast('搜索失败: ' + e.message, 1); }
+}
+async function subscribe(tmdbId, mediaType) {
+  let season = null;
+  if (mediaType && mediaType.includes('剧')) {
+    const s = prompt('订阅第几季？（留空 = 全部/默认）');
+    if (s) season = parseInt(s);
+  }
+  try {
+    const r = await api('/api/mp/subscribes', {method: 'POST',
+      body: JSON.stringify({tmdb_id: tmdbId, media_type: mediaType, season})});
+    toast(r.ok ? '已订阅' : ('订阅失败: ' + r.message), !r.ok);
+    loadSubs();
+  } catch (e) { toast('订阅失败: ' + e.message, 1); }
+}
+async function loadSubs() {
+  try {
+    const ss = await api('/api/mp/subscribes');
+    $('#acq-subs tbody').innerHTML = ss.length ? ss.map(s =>
+      `<tr><td>${s.name||''}</td><td>${s.year||''}</td><td>${s.type||''}</td>
+       <td>${s.season??''}</td><td>${s.lack_episode??''}/${s.total_episode??''}</td><td>${s.state||''}</td>
+       <td><button class="act danger" onclick="delSub(${s.id})">退订</button></td></tr>`).join('')
+      : '<tr><td colspan="7" class="muted">无订阅</td></tr>';
+  } catch (e) { toast('订阅加载失败: ' + e.message, 1); }
+}
+async function delSub(id) {
+  if (!confirm('确认退订？')) return;
+  try { await api('/api/mp/subscribes/' + id, {method: 'DELETE'});
+    toast('已退订'); loadSubs();
+  } catch (e) { toast('退订失败: ' + e.message, 1); }
+}
+async function downloadTorrent(enclosure, title) {
+  if (!confirm('推送下载：' + title + '？')) return;
+  try {
+    const r = await api('/api/mp/download', {method: 'POST',
+      body: JSON.stringify({enclosure, title})});
+    toast(r.ok ? '已推送下载' : ('失败: ' + r.message), !r.ok);
+  } catch (e) { toast('下载失败: ' + e.message, 1); }
+}
+async function loadDownloading() {
+  try {
+    const ds = await api('/api/mp/downloading');
+    $('#acq-dl tbody').innerHTML = ds.length ? ds.map(d =>
+      `<tr><td>${d.title||''}</td>
+       <td><progress value="${(d.progress||0)/100}" max="1"></progress> ${(d.progress||0).toFixed(1)}%</td>
+       <td>${d.state||''}</td><td>${d.left_time||''}</td></tr>`).join('')
+      : '<tr><td colspan="4" class="muted">无下载任务</td></tr>';
+  } catch (e) { toast('下载列表失败: ' + e.message, 1); }
+}
 // ---- update ----
 async function loadVersion() {
   try { const v = await api('/api/update/version');
@@ -295,6 +393,7 @@ function refresh(tab) {
   else if (tab === 'nodes') loadNodes();
   else if (tab === 'users') loadUsers();
   else if (tab === 'imports') loadImports();
+  else if (tab === 'acq') { loadSubs(); loadDownloading(); }
   else if (tab === 'update') { loadVersion(); checkUpdate(); }
 }
 loadVersion(); loadOverview();

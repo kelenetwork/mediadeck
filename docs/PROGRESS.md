@@ -4,6 +4,22 @@ Newest entries first. Every working session appends one entry.
 
 ---
 
+## 2026-08-29 (2) — MoviePilot acquisition integration (v0.3.0)
+**Done**
+- `app/adapters/mp.py`: LiveMoviePilot (bearer login w/ token cache + renew on
+  401) and MockMoviePilot. Media recognition search, site torrent search,
+  subscribe add/list/delete, push download, downloading list.
+- Endpoints under /api/mp/*; panel gets a new 搜索/订阅 tab (media search ->
+  one-click subscribe w/ season prompt; torrent search -> one-click download;
+  subscription table w/ unsubscribe; active downloads w/ progress).
+- +1 test (13 passing), ruff clean.
+
+**Next**
+- Live import executor bridging host cloud-drive workers.
+- Invite codes; notification center.
+
+---
+
 ## 2026-08-29 (1) — basic functional web UI (v0.2.0)
 **Done**
 - Single-file functional panel at / (auth-protected): overview (sessions,

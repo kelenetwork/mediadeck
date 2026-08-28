@@ -160,4 +160,24 @@ def test_root_serves_panel() -> None:
         assert client.get("/", follow_redirects=False).status_code == 401
         r = client.get("/", headers=_basic())
         assert r.status_code == 200
-        assert "mediadeck" in r.text and "推流节点" in r.text
+        assert "mediadeck" in r.text and "推流节点" in r.text and "搜索/订阅" in r.text
+
+
+def test_mp_mock_flow() -> None:
+    with TestClient(app) as client:
+        media = client.get("/api/mp/media/search?keyword=demo", headers=_basic()).json()
+        assert media and media[0]["tmdb_id"] == 12345
+        torrents = client.get("/api/mp/torrents/search?keyword=demo", headers=_basic()).json()
+        assert torrents and torrents[0]["enclosure"] == "mock://torrent/1"
+        sub = client.post("/api/mp/subscribes", headers=_basic(),
+                          json={"tmdb_id": 12345, "media_type": "电视剧", "season": 1}).json()
+        assert sub["ok"]
+        subs = client.get("/api/mp/subscribes", headers=_basic()).json()
+        assert subs and subs[0]["name"] == "Demo Show"
+        assert client.delete("/api/mp/subscribes/1", headers=_basic()).json()["deleted"]
+        assert client.delete("/api/mp/subscribes/999", headers=_basic()).status_code == 404
+        dl = client.post("/api/mp/download", headers=_basic(),
+                         json={"enclosure": "mock://torrent/1", "title": "t"}).json()
+        assert dl["ok"]
+        active = client.get("/api/mp/downloading", headers=_basic()).json()
+        assert active and active[0]["state"] == "downloading"

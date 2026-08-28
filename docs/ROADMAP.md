@@ -15,7 +15,7 @@
 - [x] Emby user management: create/disable/password/policy (invite codes pending)
 
 ## Phase 3 — acquisition shell + review
-- [ ] MoviePilot adapter (search/subscribe/download/history) behind thin API shim
+- [x] MoviePilot adapter (search/subscribe/download/downloading) behind thin API shim
 - [ ] Identify/scrape review queue (AI verdicts, manual metadata correction)
 - [ ] Notification center with routing rules
 
