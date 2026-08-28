@@ -454,6 +454,8 @@ PAGES.settings = async () => {
   const s = await api('/api/settings').catch(() => null);
   if (!s) { $('#view').innerHTML = `<div class="card"><div class="empty">设置加载失败</div></div>`; return; }
   const e = s.emby, d = s.dispatch, p = s.playback;
+  const dl = s.delivery || { signing_enabled: false, secret_set: false, ttl_seconds: 21600 };
+  const ig = s.integration || { panel_public_url: '', emby_public_url: '', node_media_root: '/srv/media' };
   const connected = e.enabled && e.api_key_set;
   $('#view').innerHTML = `
     ${s.mock_mode ? card('演示模式', '当前以 MEDIADECK_MOCK=1 运行',
@@ -523,7 +525,51 @@ PAGES.settings = async () => {
         </div>
         <div id="pb-result" class="muted" style="margin-top:10px"></div>
       </div>`)}
-    ${tableCard('推流节点', `${s.nodes.length} 个已配置 · 在「节点管理」中新增与监控`,
+    ${card('链接安全（签名）', dl.signing_enabled ? '已启用 — 播放链接带签名且会过期'
+      : '⚠ 未启用 — 发给客户端的节点链接是永久公开的，任何人拿到都能下载',
+      `<div class="card-body">
+        <div class="muted" style="margin-bottom:12px">
+          不签名时，用户从浏览器里复制出播放地址就能无限制转发。
+          开启后链接带有效期，过期自动失效。
+          <b>节点上的 nginx 必须使用同一个密钥</b>（下方安装脚本会自动写入）。
+        </div>
+        <div class="form-row"><label>启用签名</label>
+          <input id="dl-enabled" type="checkbox" ${dl.signing_enabled ? 'checked' : ''}>
+          <span class="muted">开启后请重新部署节点配置，否则节点会 403</span></div>
+        <div class="form-row"><label>签名密钥</label>
+          <input id="dl-secret" type="password" placeholder="${dl.secret_set ? esc(dl.secret_masked) + '（留空则不修改）' : '留空保存将自动生成'}"></div>
+        <div class="form-row"><label>链接有效期</label>
+          <input id="dl-ttl" type="number" min="60" max="604800" value="${esc(dl.ttl_seconds)}" style="width:130px">
+          <span class="muted">秒（${Math.round(dl.ttl_seconds / 3600)} 小时）— 建议大于最长一部片的片长</span></div>
+        <div class="toolbar">
+          <button class="btn primary" id="dl-save">保存</button>
+          <button class="btn danger" id="dl-rotate">重置密钥</button>
+          <span class="muted">重置后已发出的链接全部失效</span>
+        </div>
+      </div>`)}
+    ${card('接入方式', '你现有的 Emby 域名如何把播放分发到节点',
+      `<div class="card-body">
+        <div class="muted" style="margin-bottom:12px">
+          用户仍然只访问你原来的 Emby 地址，客户端不用改任何设置。
+          只需在反代里把<b>播放请求</b>转给面板，Web 界面、刷剁、图片、转码照旧走 Emby。
+        </div>
+        <div class="form-row"><label>面板地址</label>
+          <input id="ig-panel" value="${esc(ig.panel_public_url)}" placeholder="http://127.0.0.1:8300"></div>
+        <div class="form-row"><label>Emby 地址</label>
+          <input id="ig-emby" value="${esc(ig.emby_public_url)}" placeholder="https://emby.example.com"></div>
+        <div class="form-row"><label>节点媒体根</label>
+          <input id="ig-root" value="${esc(ig.node_media_root)}" placeholder="/srv/media">
+          <span class="muted">节点上挂载媒体的目录</span></div>
+        <div class="toolbar">
+          <select id="ig-server" style="width:130px">
+            <option value="caddy">Caddy</option><option value="nginx">nginx</option>
+          </select>
+          <button class="btn" id="ig-show">生成反代配置</button>
+          <button class="btn primary" id="ig-save">保存</button>
+        </div>
+        <div id="ig-out" style="margin-top:10px"></div>
+      </div>`)}
+    ${tableCard('推流节点', `${s.nodes.length} 个已配置 · 在「节点管理」中新增与获取安装脚本`,
       ['名称', '对外地址', '探针地址', '并发容量', '状态'],
       s.nodes.map((n) => `<tr><td>${esc(n.name)}</td><td>${esc(n.base_url)}</td>
         <td>${esc(n.probe_url)}</td><td>${esc(n.capacity)}</td>
@@ -533,7 +579,51 @@ PAGES.settings = async () => {
   $('#dp-save').onclick = saveDispatch;
   $('#pb-save').onclick = savePlayback;
   $('#pb-preview').onclick = previewPlayback;
+  $('#dl-save').onclick = saveDelivery;
+  $('#dl-rotate').onclick = rotateDeliverySecret;
+  $('#ig-save').onclick = saveIntegration;
+  $('#ig-show').onclick = showFrontendConfig;
 };
+async function saveDelivery() {
+  const key = $('#dl-secret').value;
+  try {
+    await api('/api/settings/delivery', { method: 'PUT', body: JSON.stringify({
+      signing_enabled: $('#dl-enabled').checked,
+      secret: key === '' ? SECRET_KEEP : key,
+      ttl_seconds: parseInt($('#dl-ttl').value, 10) || 21600,
+    }) });
+    toast('链接签名配置已保存');
+    renderPage('settings');
+  } catch (e) { toast('保存失败: ' + e.message, 1); }
+}
+async function rotateDeliverySecret() {
+  if (!confirm('重新生成签名密钥？\n\n已发出去的所有播放链接会立即失效，\n正在播放的用户需要重新起播。\n\n换密钥后必须重新部署节点配置。')) return;
+  try {
+    await api('/api/settings/delivery/rotate', { method: 'POST' });
+    toast('密钥已更新，请重新部署节点');
+    renderPage('settings');
+  } catch (e) { toast('操作失败: ' + e.message, 1); }
+}
+async function saveIntegration() {
+  try {
+    await api('/api/settings/integration', { method: 'PUT', body: JSON.stringify({
+      panel_public_url: $('#ig-panel').value.trim(),
+      emby_public_url: $('#ig-emby').value.trim(),
+      node_media_root: $('#ig-root').value.trim(),
+    }) });
+    toast('接入配置已保存');
+    renderPage('settings');
+  } catch (e) { toast('保存失败: ' + e.message, 1); }
+}
+async function showFrontendConfig() {
+  const el = $('#ig-out');
+  el.textContent = '生成中…';
+  try {
+    const r = await api(`/api/integration/frontend?server=${encodeURIComponent($('#ig-server').value)}`);
+    el.innerHTML = `<div class="muted" style="margin-bottom:6px">把下面配置加到你的反代，然后 reload：</div>
+      <pre class="codeblock">${esc(r.config)}</pre>`;
+  } catch (e) { el.innerHTML = `<span class="tag bad">生成失败</span> ${esc(e.message)}`; }
+}
 function playbackPayload() {
   return {
     enabled: $('#pb-enabled').checked,
@@ -649,6 +739,9 @@ api('/api/whoami').then((w) => {
   $('#who-initial').textContent = (w.user || '?').slice(0, 1).toUpperCase();
 }).catch(() => {});
 go((location.hash || '').replace('#/', '') || 'dashboard');
+/* Pages with forms must not auto-refresh: re-rendering mid-edit wipes whatever
+   the operator is currently typing. */
+const NO_AUTO_REFRESH = new Set(['update', 'settings']);
 state.timer = setInterval(() => {
-  if (state.page !== 'update') renderPage(state.page);
+  if (!NO_AUTO_REFRESH.has(state.page)) renderPage(state.page);
 }, 30000);

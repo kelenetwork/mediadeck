@@ -31,6 +31,8 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote, urlencode
 
+from app.modules.signing import sign_url
+
 # Path fragments that mean "Emby is transcoding this".  Transcoded output is
 # produced on the Emby host and does not exist on a node, so these must always
 # be served by Emby regardless of policy.
@@ -49,6 +51,7 @@ class Decision:
     reason: str
     node: str | None = None
     media_path: str | None = None
+    signed: bool = False
 
 
 class TTLCache:
@@ -120,11 +123,12 @@ def build_node_url(base_url: str, relative_path: str) -> str:
 
 class PlaybackRouter:
     def __init__(self, emby: Any, scheduler: Any, config_provider: Any,
-                 emby_config_provider: Any) -> None:
+                 emby_config_provider: Any, delivery_provider: Any = None) -> None:
         self._emby = emby
         self._scheduler = scheduler
         self._config = config_provider
         self._emby_config = emby_config_provider
+        self._delivery = delivery_provider or (dict)
         self._cache = TTLCache()
         self._log: list[dict[str, Any]] = []
 
@@ -147,6 +151,7 @@ class PlaybackRouter:
             "node": decision.node,
             "reason": decision.reason,
             "media_path": decision.media_path,
+            "signed": decision.signed,
         })
         if len(self._log) > 500:
             del self._log[:-500]
@@ -215,13 +220,26 @@ class PlaybackRouter:
             self._record(decision, item_id)
             return decision
 
-        target = build_node_url(chosen.node.base_url, relative)
+        # Signing turns the node URL into a short-lived credential instead of
+        # a permanent public download link.
+        delivery = self._delivery() or {}
+        signed = False
+        if delivery.get("signing_enabled") and delivery.get("secret"):
+            target = sign_url(
+                chosen.node.base_url, relative,
+                str(delivery["secret"]), int(delivery.get("ttl_seconds") or 21600),
+            )
+            signed = True
+        else:
+            target = build_node_url(chosen.node.base_url, relative)
+
         decision = Decision(
             redirected=True,
             target=target,
             reason="redirected",
             node=chosen.node.name,
             media_path=media_path,
+            signed=signed,
         )
         self._record(decision, item_id)
         return decision

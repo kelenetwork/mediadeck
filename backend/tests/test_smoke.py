@@ -464,3 +464,150 @@ def test_path_mapping_helpers() -> None:
     assert is_transcode_request("emby/Videos/1/master.m3u8", {}) is True
     assert is_transcode_request("emby/Videos/1/stream.mkv", {"Static": "true"}) is False
     assert is_transcode_request("emby/Videos/1/stream.mkv", {}) is True
+
+
+# ---- settings contract -----------------------------------------------------
+def test_settings_overview_contract() -> None:
+    """The settings page reads these keys directly.
+
+    A missing key here is not a cosmetic bug: the page throws on
+    `s.playback.enabled` and renders nothing at all. This shipped once, so it
+    is pinned by a test.
+    """
+    with TestClient(app) as client:
+        body = client.get("/api/settings", headers=_basic()).json()
+        assert {"mock_mode", "emby", "dispatch", "playback",
+                "delivery", "integration", "nodes"} <= set(body)
+        assert {"enabled", "direct_only", "strip_prefix",
+                "path_template"} <= set(body["playback"])
+        assert {"signing_enabled", "secret_set", "secret_masked",
+                "ttl_seconds"} <= set(body["delivery"])
+        assert {"panel_public_url", "emby_public_url",
+                "node_media_root"} <= set(body["integration"])
+        # secrets must never appear in cleartext form in this payload
+        assert "api_key" not in body["emby"]
+        assert "secret" not in body["delivery"]
+
+
+# ---- signed delivery -------------------------------------------------------
+def test_signing_defaults_off_and_roundtrip() -> None:
+    from app.modules.signing import compute_digest, sign_url, verify
+    with TestClient(app) as client:
+        cfg = client.get("/api/settings/delivery", headers=_basic()).json()
+        assert cfg["signing_enabled"] is False and cfg["secret_set"] is False
+
+        saved = client.put("/api/settings/delivery", headers=_basic(),
+                           json={"signing_enabled": True, "ttl_seconds": 3600}).json()
+        # enabling without a key must generate one, not sign with ""
+        assert saved["signing_enabled"] is True and saved["secret_set"] is True
+        assert saved["ttl_seconds"] == 3600
+
+    # digest must match nginx secure_link_md5 over the DECODED uri
+    url = sign_url("https://n.test", "TV/My Show/第01集.mkv", "s3cr3t", 600, now=1000)
+    assert "md5=" in url and "expires=1600" in url
+    assert "%E7%AC%AC01" in url  # url-encoded, digest was not
+    digest = compute_digest("/TV/My Show/第01集.mkv", 1600, "s3cr3t")
+    assert f"md5={digest}" in url
+    assert verify("/TV/My Show/第01集.mkv", digest, 1600, "s3cr3t", now=1000) is True
+    assert verify("/TV/My Show/第01集.mkv", digest, 1600, "s3cr3t", now=2000) is False
+    assert verify("/other.mkv", digest, 1600, "s3cr3t", now=1000) is False
+
+
+def test_signed_urls_used_for_playback() -> None:
+    with TestClient(app) as client:
+        client.put("/api/settings/playback", headers=_basic(),
+                   json={"enabled": True, "strip_prefix": "/media"})
+        client.put("/api/settings/delivery", headers=_basic(),
+                   json={"signing_enabled": True, "secret": "unit-test-secret"})
+        r = client.get("/emby/Videos/item42/stream.mkv?Static=true",
+                       headers=_basic(), follow_redirects=False)
+        location = r.headers["location"]
+        assert "md5=" in location and "expires=" in location
+        preview = client.get("/api/playback/preview?item_id=item42", headers=_basic()).json()
+        assert preview["signed"] is True
+
+
+def test_secret_rotation_invalidates_old_links() -> None:
+    with TestClient(app) as client:
+        client.put("/api/settings/delivery", headers=_basic(),
+                   json={"signing_enabled": True, "secret": "first-secret"})
+        before = client.get("/api/settings/delivery", headers=_basic()).json()
+        rotated = client.post("/api/settings/delivery/rotate", headers=_basic()).json()
+        assert rotated["secret_set"] is True
+        assert rotated["secret_masked"] != before["secret_masked"]
+
+
+def test_delivery_ttl_validation() -> None:
+    with TestClient(app) as client:
+        assert client.put("/api/settings/delivery", headers=_basic(),
+                          json={"ttl_seconds": 10}).status_code == 422
+        assert client.put("/api/settings/delivery", headers=_basic(),
+                          json={"ttl_seconds": 99999999}).status_code == 422
+
+
+# ---- node provisioning -----------------------------------------------------
+def test_install_script_is_complete_and_consistent() -> None:
+    with TestClient(app) as client:
+        client.put("/api/settings/integration", headers=_basic(), json={
+            "panel_public_url": "https://panel.test",
+            "emby_public_url": "https://emby.test",
+            "node_media_root": "/srv/media",
+        })
+        client.put("/api/settings/delivery", headers=_basic(),
+                   json={"signing_enabled": True, "secret": "node-shared-secret"})
+        client.post("/api/nodes", headers=_basic(), json={
+            "name": "edge-1", "base_url": "https://edge1.test",
+            "probe_url": "http://10.0.0.9:9800/load", "capacity": 40})
+
+        body = client.get("/api/nodes/edge-1/install", headers=_basic()).json()
+        script = body["script"]
+        # every layer a node needs must be present, or the node 404s in ways
+        # that are painful to debug from client logs
+        assert "rclone mount" in script
+        assert "vfs-cache-mode full" in script
+        assert "secure_link_md5" in script
+        assert "node-shared-secret" in script      # node must share the key
+        assert "user_allow_other" in script        # else nginx cannot read mount
+        assert "certbot" in script
+        assert "loadprobe" in script
+        assert "/agent/loadprobe.py" in script     # served by this panel
+        assert "__NGINX_SITE__" not in script      # template fully rendered
+        assert client.get("/api/nodes/ghost/install", headers=_basic()).status_code == 404
+
+
+def test_install_script_warns_when_unsigned() -> None:
+    with TestClient(app) as client:
+        client.post("/api/nodes", headers=_basic(), json={
+            "name": "edge-1", "base_url": "https://edge1.test",
+            "probe_url": "http://10.0.0.9:9800/load"})
+        script = client.get("/api/nodes/edge-1/install", headers=_basic()).json()["script"]
+        assert "未启用签名" in script
+
+
+def test_frontend_snippet_only_routes_stream_paths() -> None:
+    with TestClient(app) as client:
+        client.put("/api/settings/integration", headers=_basic(), json={
+            "panel_public_url": "https://panel.test",
+            "emby_public_url": "https://emby.test"})
+        for server in ("caddy", "nginx"):
+            cfg = client.get(f"/api/integration/frontend?server={server}",
+                             headers=_basic()).json()["config"]
+            # only stream requests may be diverted; the web UI, images and
+            # transcoding must keep going straight to Emby
+            assert "emby/Videos" in cfg and "stream" in cfg
+            assert "panel.test" in cfg and "emby.test" in cfg
+
+
+def test_integration_validation() -> None:
+    with TestClient(app) as client:
+        assert client.put("/api/settings/integration", headers=_basic(),
+                          json={"panel_public_url": "panel.test"}).status_code == 422
+        assert client.put("/api/settings/integration", headers=_basic(),
+                          json={"node_media_root": "relative/path"}).status_code == 422
+
+
+def test_agent_is_downloadable() -> None:
+    with TestClient(app) as client:
+        r = client.get("/agent/loadprobe.py")
+        assert r.status_code == 200
+        assert "active_streams" in r.text
