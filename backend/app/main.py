@@ -4,10 +4,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import secrets
+from pathlib import Path as FilePath
 from typing import Any
 
 from fastapi import Body, Depends, FastAPI, HTTPException, status
-from fastapi.responses import RedirectResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 from app.adapters.live import LiveEmby, LiveProbe
@@ -69,9 +70,12 @@ def _mock_nodes(cfg: Any):
     ]
 
 
+STATIC_DIR = FilePath(__file__).parent / "static"
+
+
 @app.get("/", include_in_schema=False)
-async def root() -> RedirectResponse:
-    return RedirectResponse("/docs", status_code=307)
+async def root(_: str = Depends(_auth)) -> FileResponse:
+    return FileResponse(STATIC_DIR / "index.html")
 
 
 @app.get("/healthz")

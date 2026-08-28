@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mediadeck</title>
+<style>
+  /* Functional baseline only — visual design pass comes in Phase 4. */
+  body { font-family: system-ui, sans-serif; margin: 0; background: #f5f6f8; color: #222; }
+  header { background: #fff; border-bottom: 1px solid #e0e0e0; padding: 10px 16px;
+           display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+  header h1 { font-size: 18px; margin: 0; }
+  header .ver { color: #888; font-size: 13px; }
+  nav button { border: 1px solid #ccc; background: #fff; padding: 6px 14px; cursor: pointer;
+               border-radius: 4px; font-size: 14px; }
+  nav button.active { background: #2563eb; color: #fff; border-color: #2563eb; }
+  main { padding: 16px; max-width: 1100px; margin: 0 auto; }
+  section { display: none; }
+  section.active { display: block; }
+  table { border-collapse: collapse; width: 100%; background: #fff; font-size: 14px; }
+  th, td { border: 1px solid #e3e3e3; padding: 8px 10px; text-align: left; }
+  th { background: #fafafa; }
+  .card { background: #fff; border: 1px solid #e3e3e3; border-radius: 6px;
+          padding: 14px 16px; margin-bottom: 14px; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 10px; }
+  input, select { padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 14px; }
+  button.act { border: 1px solid #2563eb; color: #2563eb; background: #fff; padding: 5px 10px;
+               border-radius: 4px; cursor: pointer; font-size: 13px; }
+  button.act.danger { border-color: #dc2626; color: #dc2626; }
+  button.act.primary { background: #2563eb; color: #fff; }
+  .ok { color: #16a34a; } .bad { color: #dc2626; } .muted { color: #888; }
+  #toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+           background: #333; color: #fff; padding: 10px 18px; border-radius: 6px;
+           display: none; font-size: 14px; z-index: 10; }
+  progress { width: 120px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>mediadeck</h1>
+  <span class="ver" id="version">…</span>
+  <nav id="nav">
+    <button data-tab="overview" class="active">总览</button>
+    <button data-tab="nodes">推流节点</button>
+    <button data-tab="users">用户</button>
+    <button data-tab="imports">上片</button>
+    <button data-tab="update">更新</button>
+  </nav>
+</header>
+<main>
+
+<section id="tab-overview" class="active">
+  <div class="card">
+    <h3>在线播放</h3>
+    <table id="sessions"><thead><tr><th>用户</th><th>客户端</th><th>方式</th><th>码率</th><th>内容</th></tr></thead><tbody></tbody></table>
+  </div>
+  <div class="card">
+    <h3>管线队列 <span class="muted" id="pipe-age"></span></h3>
+    <table id="queues"><thead><tr><th>队列</th><th>条目</th><th>体积</th><th>最老滞留</th></tr></thead><tbody></tbody></table>
+  </div>
+  <div class="card">
+    <h3>上传身份配额</h3>
+    <table id="quota"><thead><tr><th>身份</th><th>状态</th><th>受限起始</th></tr></thead><tbody></tbody></table>
+  </div>
+  <div class="card">
+    <h3>本地应急仓</h3>
+    <div id="fallback" class="muted">…</div>
+    <div id="alerts"></div>
+  </div>
+</section>
+
+<section id="tab-nodes">
+  <div class="card">
+    <h3>推流节点</h3>
+    <table id="nodes"><thead><tr><th>节点</th><th>状态</th><th>活跃流</th><th>出口 Mbps</th><th>权重</th><th>归一化负载</th><th>操作</th></tr></thead><tbody></tbody></table>
+  </div>
+  <div class="card">
+    <h3>最近分发</h3>
+    <table id="dispatch"><thead><tr><th>时间</th><th>节点</th><th>负载</th><th>候选数</th><th>请求</th></tr></thead><tbody></tbody></table>
+  </div>
+</section>
+
+<section id="tab-users">
+  <div class="card">
+    <div class="row">
+      <input id="new-user-name" placeholder="新用户名">
+      <button class="act primary" onclick="createUser()">创建用户</button>
+    </div>
+    <table id="users"><thead><tr><th>用户</th><th>状态</th><th>操作</th></tr></thead><tbody></tbody></table>
+  </div>
+</section>
+
+<section id="tab-imports">
+  <div class="card">
+    <div class="row">
+      <select id="imp-kind">
+        <option value="drive-link">网盘链接</option>
+        <option value="cloud-drive">云盘目录</option>
+      </select>
+      <input id="imp-src" placeholder="链接 / 目录引用" style="flex:1;min-width:260px">
+      <input id="imp-cat" placeholder="分类(可选)" style="width:110px">
+      <button class="act primary" onclick="submitImport()">提交</button>
+    </div>
+    <table id="imports"><thead><tr><th>ID</th><th>类型</th><th>来源</th><th>状态</th><th>进度</th><th>操作</th></tr></thead><tbody></tbody></table>
+  </div>
+</section>
+
+<section id="tab-update">
+  <div class="card">
+    <h3>版本与更新</h3>
+    <div class="row"><span>当前：</span><b id="upd-current">…</b></div>
+    <div class="row"><span>最新：</span><b id="upd-latest">…</b> <span id="upd-flag"></span></div>
+    <div class="row">
+      <button class="act" onclick="checkUpdate()">检查更新</button>
+      <button class="act primary" id="upd-apply" onclick="applyUpdate()" disabled>一键更新</button>
+    </div>
+    <div class="muted">更新时服务会自动重启，页面十几秒后恢复。</div>
+  </div>
+</section>
+
+</main>
+<div id="toast"></div>
+<script>
+const $ = (s) => document.querySelector(s);
+function toast(msg, bad) {
+  const t = $('#toast');
+  t.textContent = msg; t.style.background = bad ? '#dc2626' : '#333';
+  t.style.display = 'block';
+  clearTimeout(t._h); t._h = setTimeout(() => t.style.display = 'none', 3000);
+}
+async function api(path, opts) {
+  const r = await fetch(path, Object.assign({headers: {'Content-Type': 'application/json'}}, opts));
+  if (!r.ok) { let d = ''; try { d = (await r.json()).detail || ''; } catch {}
+    throw new Error(`${r.status} ${d}`); }
+  return r.json();
+}
+function fmtBytes(n) {
+  if (!n) return '0';
+  const u = ['B','KB','MB','GB','TB']; let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return n.toFixed(1) + ' ' + u[i];
+}
+function fmtAge(s) {
+  if (!s) return '-';
+  if (s < 3600) return Math.round(s/60) + ' 分钟';
+  if (s < 86400) return (s/3600).toFixed(1) + ' 小时';
+  return (s/86400).toFixed(1) + ' 天';
+}
+// ---- tabs ----
+$('#nav').addEventListener('click', (e) => {
+  if (e.target.tagName !== 'BUTTON') return;
+  document.querySelectorAll('#nav button').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('main section').forEach(s => s.classList.remove('active'));
+  e.target.classList.add('active');
+  $('#tab-' + e.target.dataset.tab).classList.add('active');
+  refresh(e.target.dataset.tab);
+});
+// ---- overview ----
+async function loadOverview() {
+  try {
+    const ss = await api('/api/emby/sessions');
+    $('#sessions tbody').innerHTML = ss.length ? ss.map(s =>
+      `<tr><td>${s.UserName||''}</td><td>${s.Client||''}</td><td>${s.PlayMethod||''}</td>
+       <td>${s.BitrateMbps||0} Mbps</td><td>${s.Item||''}</td></tr>`).join('')
+      : '<tr><td colspan="5" class="muted">无在线播放</td></tr>';
+  } catch (e) { toast('会话加载失败: ' + e.message, 1); }
+  try {
+    const p = await api('/api/pipeline');
+    if (!p.available) { $('#pipe-age').textContent = '(快照不可用)'; return; }
+    $('#pipe-age').textContent = `(${Math.round(p.snapshot_age_seconds)}s 前${p.stale ? ' · 已过期' : ''})`;
+    const d = p.data;
+    $('#queues tbody').innerHTML = (d.queues||[]).map(q =>
+      `<tr><td>${q.name}</td><td>${q.items}</td><td>${fmtBytes(q.bytes)}</td><td>${fmtAge(q.oldest_age_seconds)}</td></tr>`).join('');
+    $('#quota tbody').innerHTML = (d.quota||[]).map(q =>
+      `<tr><td>${q.identity}</td><td class="${q.state==='ok'?'ok':'bad'}">${q.state}</td><td>${q.limited_since||'-'}</td></tr>`).join('');
+    const f = d.fallback || {};
+    $('#fallback').textContent = `${f.items||0} 个文件 / ${fmtBytes(f.bytes)} （容量 ${fmtBytes(f.capacity_bytes)}）`;
+    $('#alerts').innerHTML = (d.alerts||[]).map(a =>
+      `<div class="${a.level==='warn'?'bad':'muted'}">⚠ ${a.message}</div>`).join('');
+  } catch (e) { toast('管线加载失败: ' + e.message, 1); }
+}
+// ---- nodes ----
+async function loadNodes() {
+  try {
+    const ns = await api('/api/nodes');
+    $('#nodes tbody').innerHTML = ns.length ? ns.map(n =>
+      `<tr><td>${n.name}</td>
+       <td class="${n.available?'ok':'bad'}">${n.available?'可用':(n.manually_disabled?'已下线':'不健康')}</td>
+       <td>${n.active_streams}</td><td>${n.egress_mbps}</td><td>${n.weight}</td>
+       <td>${n.normalized_load}</td>
+       <td>${n.manually_disabled
+          ? `<button class="act" onclick="nodeCtl('${n.name}','enable')">上线</button>`
+          : `<button class="act danger" onclick="nodeCtl('${n.name}','disable')">下线</button>`}</td></tr>`).join('')
+      : '<tr><td colspan="7" class="muted">未配置节点</td></tr>';
+    const log = await api('/api/dispatch/log?limit=20');
+    $('#dispatch tbody').innerHTML = log.length ? log.slice().reverse().map(e =>
+      `<tr><td>${new Date(e.ts*1000).toLocaleTimeString()}</td><td>${e.node||'-'}</td>
+       <td>${e.normalized_load??'-'}</td><td>${e.candidates}</td><td>${e.context||''}</td></tr>`).join('')
+      : '<tr><td colspan="5" class="muted">暂无分发记录</td></tr>';
+  } catch (e) { toast('节点加载失败: ' + e.message, 1); }
+}
+async function nodeCtl(name, action) {
+  try { await api(`/api/nodes/${encodeURIComponent(name)}/${action}`, {method: 'POST'});
+    toast(`${name} ${action==='disable'?'已下线':'已上线'}`); loadNodes();
+  } catch (e) { toast('操作失败: ' + e.message, 1); }
+}
+// ---- users ----
+async function loadUsers() {
+  try {
+    const us = await api('/api/emby/users');
+    $('#users tbody').innerHTML = us.map(u => {
+      const dis = u.Policy && u.Policy.IsDisabled;
+      return `<tr><td>${u.Name}</td>
+        <td class="${dis?'bad':'ok'}">${dis?'已禁用':'正常'}</td>
+        <td>${dis
+          ? `<button class="act" onclick="userCtl('${u.Id}','enable')">启用</button>`
+          : `<button class="act danger" onclick="userCtl('${u.Id}','disable')">禁用</button>`}
+          <button class="act" onclick="resetPw('${u.Id}','${u.Name}')">改密</button></td></tr>`;
+    }).join('');
+  } catch (e) { toast('用户加载失败: ' + e.message, 1); }
+}
+async function userCtl(id, action) {
+  try { await api(`/api/emby/users/${id}/${action}`, {method: 'POST'});
+    toast('已' + (action==='disable'?'禁用':'启用')); loadUsers();
+  } catch (e) { toast('操作失败: ' + e.message, 1); }
+}
+async function createUser() {
+  const name = $('#new-user-name').value.trim();
+  if (!name) return toast('请输入用户名', 1);
+  try { await api('/api/emby/users', {method: 'POST', body: JSON.stringify({name})});
+    $('#new-user-name').value = ''; toast('用户已创建'); loadUsers();
+  } catch (e) { toast('创建失败: ' + e.message, 1); }
+}
+async function resetPw(id, name) {
+  const pw = prompt(`为 ${name} 设置新密码（至少 6 位）`);
+  if (!pw) return;
+  try { await api(`/api/emby/users/${id}/password`, {method: 'POST',
+      body: JSON.stringify({new_password: pw})});
+    toast('密码已更新');
+  } catch (e) { toast('改密失败: ' + e.message, 1); }
+}
+// ---- imports ----
+async function loadImports() {
+  try {
+    const js = await api('/api/imports?limit=50');
+    $('#imports tbody').innerHTML = js.length ? js.map(j =>
+      `<tr><td>${j.id}</td><td>${j.kind}</td><td>${j.source_ref}</td>
+       <td class="${j.state==='done'?'ok':(j.state==='failed'?'bad':'')}">${j.state}${j.error?` (${j.error})`:''}</td>
+       <td><progress value="${j.progress}" max="1"></progress> ${j.items_done}/${j.items_total}</td>
+       <td>${(j.state==='queued'||j.state==='running')
+          ? `<button class="act danger" onclick="cancelImport('${j.id}')">取消</button>` : ''}</td></tr>`).join('')
+      : '<tr><td colspan="6" class="muted">暂无任务</td></tr>';
+  } catch (e) { toast('任务加载失败: ' + e.message, 1); }
+}
+async function submitImport() {
+  const src = $('#imp-src').value.trim();
+  if (!src) return toast('请输入来源', 1);
+  try { await api('/api/imports', {method: 'POST', body: JSON.stringify(
+      {kind: $('#imp-kind').value, source_ref: src, category: $('#imp-cat').value.trim()})});
+    $('#imp-src').value = ''; toast('任务已提交'); loadImports();
+  } catch (e) { toast('提交失败: ' + e.message, 1); }
+}
+async function cancelImport(id) {
+  try { await api(`/api/imports/${id}/cancel`, {method: 'POST'});
+    toast('已取消'); loadImports();
+  } catch (e) { toast('取消失败: ' + e.message, 1); }
+}
+// ---- update ----
+async function loadVersion() {
+  try { const v = await api('/api/update/version');
+    $('#version').textContent = v.version;
+    $('#upd-current').textContent = `${v.version} (${v.commit})`;
+  } catch { $('#version').textContent = '?'; }
+}
+async function checkUpdate() {
+  try {
+    const c = await api('/api/update/check');
+    $('#upd-latest').textContent = c.latest || '-';
+    $('#upd-flag').innerHTML = c.update_available
+      ? '<span class="bad">有新版本</span>' : '<span class="ok">已是最新</span>';
+    $('#upd-apply').disabled = !c.update_available;
+  } catch (e) { toast('检查失败: ' + e.message, 1); }
+}
+async function applyUpdate() {
+  if (!confirm('确认更新？服务将自动重启。')) return;
+  try {
+    const r = await api('/api/update/apply', {method: 'POST', body: JSON.stringify({})});
+    toast(`更新到 ${r.target} 中，请稍候…`);
+    setTimeout(() => location.reload(), 15000);
+  } catch (e) { toast('更新失败: ' + e.message, 1); }
+}
+// ---- refresh loop ----
+function refresh(tab) {
+  if (tab === 'overview') loadOverview();
+  else if (tab === 'nodes') loadNodes();
+  else if (tab === 'users') loadUsers();
+  else if (tab === 'imports') loadImports();
+  else if (tab === 'update') { loadVersion(); checkUpdate(); }
+}
+loadVersion(); loadOverview();
+setInterval(() => {
+  const active = document.querySelector('#nav button.active');
+  if (active && active.dataset.tab !== 'update') refresh(active.dataset.tab);
+}, 20000);
+</script>
+</body>
+</html>

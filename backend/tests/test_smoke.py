@@ -155,7 +155,9 @@ def test_semver_helpers() -> None:
     assert latest_tag(["nope"]) is None
 
 
-def test_root_redirects_to_docs() -> None:
+def test_root_serves_panel() -> None:
     with TestClient(app) as client:
-        r = client.get("/", follow_redirects=False)
-        assert r.status_code == 307 and r.headers["location"] == "/docs"
+        assert client.get("/", follow_redirects=False).status_code == 401
+        r = client.get("/", headers=_basic())
+        assert r.status_code == 200
+        assert "mediadeck" in r.text and "推流节点" in r.text
