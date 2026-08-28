@@ -4,6 +4,21 @@ Newest entries first. Every working session appends one entry.
 
 ---
 
+## 2026-08-28 (6) — self-update from the web panel
+**Done**
+- `app/modules/updater.py`: version (git describe), check origin for newest
+  semver release tag, apply update via detached helper (fetch tags, checkout,
+  pip install, service restart) so the API process can die safely mid-update.
+- Endpoints: GET /api/update/version, GET /api/update/check,
+  POST /api/update/apply (409 when already up to date / no valid tag).
+- +2 tests (11 passing), ruff clean.
+
+**Next**
+- First release tag v0.1.0 + local deployment as a systemd service.
+- Live import executor; invite codes.
+
+---
+
 ## 2026-08-28 (5) — import lane module skeleton
 **Done**
 - `app/modules/imports.py`: unified ImportJob lifecycle (queued/running/done/
