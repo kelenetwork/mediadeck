@@ -196,3 +196,71 @@ def test_tasks_mock() -> None:
         }
         for item in tasks:
             assert required <= set(item)
+
+
+def test_storage_mock() -> None:
+    with TestClient(app) as client:
+        headers = _basic()
+        remotes = client.get("/api/storage/remotes", headers=headers).json()
+        names = {item["name"] for item in remotes}
+        assert {"mock-drive", "mock-s3"} <= names
+        drive = next(item for item in remotes if item["name"] == "mock-drive")
+        assert drive["options"]["token"] == "***"
+        added = client.post(
+            "/api/storage/remotes",
+            headers=headers,
+            json={
+                "name": "mock-extra",
+                "type": "alias",
+                "options": {"remote": "mock-drive"},
+            },
+        )
+        assert added.status_code == 200
+        assert added.json()["name"] == "mock-extra"
+        tested = client.post("/api/storage/remotes/mock-drive/test", headers=headers)
+        assert tested.status_code == 200
+        assert tested.json()["ok"] is True
+        mounts = client.get("/api/storage/mounts", headers=headers).json()
+        by_name = {item["name"]: item for item in mounts}
+        assert by_name["media-main"]["status"] == "active"
+        assert by_name["media-cold"]["status"] == "inactive"
+        created = client.post(
+            "/api/storage/mounts",
+            headers=headers,
+            json={
+                "name": "media-hot",
+                "remote": "mock-drive",
+                "remote_path": "hot",
+                "target": "media-hot",
+                "read_only": True,
+                "allow_other": True,
+            },
+        )
+        assert created.status_code == 200
+        started = client.post("/api/storage/mounts/media-hot/start", headers=headers)
+        assert started.status_code == 200
+        stopped = client.post("/api/storage/mounts/media-hot/stop", headers=headers)
+        assert stopped.status_code == 200
+        deleted = client.delete("/api/storage/mounts/media-hot", headers=headers)
+        assert deleted.status_code == 200
+        remaining = {
+            item["name"] for item in client.get("/api/storage/mounts", headers=headers).json()
+        }
+        assert "media-hot" not in remaining
+        bad_name = client.post(
+            "/api/storage/remotes",
+            headers=headers,
+            json={"name": "bad name", "type": "alias", "options": {}},
+        )
+        assert bad_name.status_code == 422
+        bad_target = client.post(
+            "/api/storage/mounts",
+            headers=headers,
+            json={
+                "name": "escape",
+                "remote": "mock-drive",
+                "remote_path": "",
+                "target": "../escape",
+            },
+        )
+        assert bad_target.status_code == 422
