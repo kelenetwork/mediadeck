@@ -4,6 +4,17 @@ Newest entries first. Every working session appends one entry.
 
 ---
 
+## 2026-08-29 (1) — basic functional web UI (v0.2.0)
+**Done**
+- Single-file functional panel at / (auth-protected): overview (sessions,
+  pipeline queues, quota, fallback, alerts), stream nodes (status + dispatch
+  log + enable/disable), Emby users (create/disable/enable/password), import
+  jobs (submit/progress/cancel), update tab (check + one-click apply).
+- Plain functional styling only; the visual design pass stays in Phase 4.
+- Tests 12/12, ruff clean.
+
+---
+
 ## 2026-08-28 (7) — root path redirect (v0.1.1)
 **Done**
 - GET / now 307-redirects to /docs so the panel root is not a bare 404.
