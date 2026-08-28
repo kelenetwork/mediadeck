@@ -4,6 +4,24 @@ Newest entries first. Every working session appends one entry.
 
 ---
 
+## 2026-08-29 (3) — panel shell redesign (v0.4.0)
+**Done**
+- Replaced the flat tab page with a proper admin shell: grouped left sidebar
+  (概览 / 工作台 / 资源服务 / 系统管理), sticky topbar with page title+subtitle,
+  hash routing, 30s auto refresh, toast layer.
+- Split static assets into index.html + app.css + app.js (mounted at /static);
+  new /api/whoami for the sidebar identity block.
+- Pages: dashboard (6 stat cards + sessions/queues/quota/alerts), 搜索订阅,
+  下载任务, 网盘上片, 用户管理, 节点管理, 管线状态, 版本更新.
+- Page registry (PAGES) so new modules only add one entry + one nav item.
+- Tests 13/13, ruff clean.
+
+**Next**
+- Fill pages step by step per owner feedback (media library, invites,
+  scheduled tasks, playback reports).
+
+---
+
 ## 2026-08-29 (2) — MoviePilot acquisition integration (v0.3.0)
 **Done**
 - `app/adapters/mp.py`: LiveMoviePilot (bearer login w/ token cache + renew on
