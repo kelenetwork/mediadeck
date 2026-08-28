@@ -7,11 +7,39 @@ from typing import Any
 
 
 class MockEmby:
+    def __init__(self) -> None:
+        self._users: dict[str, dict[str, Any]] = {
+            "u1": {"Id": "u1", "Name": "demo-user-1", "Policy": {"IsDisabled": False}},
+            "u2": {"Id": "u2", "Name": "demo-user-2", "Policy": {"IsDisabled": True}},
+        }
+        self._next = 3
+
     async def list_users(self) -> list[dict[str, Any]]:
-        return [
-            {"Id": "u1", "Name": "demo-user-1", "Policy": {"IsDisabled": False}},
-            {"Id": "u2", "Name": "demo-user-2", "Policy": {"IsDisabled": True}},
-        ]
+        return list(self._users.values())
+
+    async def create_user(self, name: str) -> dict[str, Any]:
+        uid = f"u{self._next}"
+        self._next += 1
+        user = {"Id": uid, "Name": name, "Policy": {"IsDisabled": False}}
+        self._users[uid] = user
+        return user
+
+    async def set_user_disabled(self, user_id: str, disabled: bool) -> bool:
+        user = self._users.get(user_id)
+        if not user:
+            return False
+        user["Policy"]["IsDisabled"] = disabled
+        return True
+
+    async def set_user_password(self, user_id: str, new_password: str) -> bool:
+        return user_id in self._users
+
+    async def apply_policy(self, user_id: str, policy_patch: dict[str, Any]) -> bool:
+        user = self._users.get(user_id)
+        if not user:
+            return False
+        user["Policy"].update(policy_patch)
+        return True
 
     async def active_sessions(self) -> list[dict[str, Any]]:
         return [

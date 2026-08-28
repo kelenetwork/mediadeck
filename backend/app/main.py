@@ -6,7 +6,7 @@ import contextlib
 import secrets
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Body, Depends, FastAPI, HTTPException, status
 from fastapi.responses import RedirectResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
@@ -134,3 +134,42 @@ async def emby_users() -> list[dict[str, Any]]:
 @app.get("/api/emby/sessions", dependencies=[Depends(_auth)])
 async def emby_sessions() -> list[dict[str, Any]]:
     return await app.state.emby.active_sessions()
+
+
+@app.post("/api/emby/users", dependencies=[Depends(_auth)])
+async def emby_create_user(name: str = Body(..., embed=True, min_length=1, max_length=60)) -> dict[str, Any]:
+    return await app.state.emby.create_user(name)
+
+
+@app.post("/api/emby/users/{user_id}/disable", dependencies=[Depends(_auth)])
+async def emby_disable_user(user_id: str) -> dict[str, bool]:
+    if not await app.state.emby.set_user_disabled(user_id, True):
+        raise HTTPException(404, "unknown user")
+    return {"disabled": True}
+
+
+@app.post("/api/emby/users/{user_id}/enable", dependencies=[Depends(_auth)])
+async def emby_enable_user(user_id: str) -> dict[str, bool]:
+    if not await app.state.emby.set_user_disabled(user_id, False):
+        raise HTTPException(404, "unknown user")
+    return {"disabled": False}
+
+
+@app.post("/api/emby/users/{user_id}/password", dependencies=[Depends(_auth)])
+async def emby_set_password(user_id: str, new_password: str = Body(..., embed=True, min_length=6)) -> dict[str, bool]:
+    if not await app.state.emby.set_user_password(user_id, new_password):
+        raise HTTPException(404, "unknown user")
+    return {"ok": True}
+
+
+@app.post("/api/emby/users/{user_id}/policy", dependencies=[Depends(_auth)])
+async def emby_apply_policy(user_id: str, policy: dict[str, Any] = Body(...)) -> dict[str, bool]:  # noqa: B008
+    allowed = {"IsDisabled", "EnableRemoteAccess", "SimultaneousStreamLimit",
+               "RemoteClientBitrateLimit", "InvalidLoginAttemptCount",
+               "IsHidden", "EnableLiveTvAccess", "EnableContentDownloading"}
+    patch = {k: v for k, v in policy.items() if k in allowed}
+    if not patch:
+        raise HTTPException(422, "no allowed policy fields in body")
+    if not await app.state.emby.apply_policy(user_id, patch):
+        raise HTTPException(404, "unknown user")
+    return {"ok": True}

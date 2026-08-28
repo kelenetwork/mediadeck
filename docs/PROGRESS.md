@@ -4,6 +4,20 @@ Newest entries first. Every working session appends one entry.
 
 ---
 
+## 2026-08-28 (4) — Emby user management (write ops)
+**Done**
+- EmbyAdapter contract extended: create_user, set_user_disabled,
+  set_user_password, apply_policy (mock + live implementations).
+- Endpoints: POST /api/emby/users, /{id}/disable|enable, /{id}/password,
+  /{id}/policy (policy patch restricted to an allowlist of safe fields).
+- +1 test (8 passing), ruff clean.
+
+**Next**
+- Import-lane module skeleton (cloud-drive importers, Phase 2).
+- Invite-code system design.
+
+---
+
 ## 2026-08-28 (3) — scheduler dispatch log + probe history
 **Done**
 - Scheduler keeps per-node probe history (deque, ~3h at 15s interval) and a
