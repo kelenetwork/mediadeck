@@ -6,7 +6,7 @@ normalized load = active_streams / weight.  Ties broken by egress headroom.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from app.core.config import StreamNode

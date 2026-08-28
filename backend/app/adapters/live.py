@@ -51,5 +51,5 @@ class LiveProbe:
                     "active_streams": int(data.get("active_streams", 0)),
                     "egress_mbps": float(data.get("egress_mbps", 0.0)),
                 }
-        except Exception:
+        except (httpx.HTTPError, ValueError, KeyError):
             return {"ok": False, "active_streams": 0, "egress_mbps": 0.0}
