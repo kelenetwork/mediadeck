@@ -4,6 +4,14 @@ Newest entries first. Every working session appends one entry.
 
 ---
 
+## 2026-08-28 (7) — root path redirect (v0.1.1)
+**Done**
+- GET / now 307-redirects to /docs so the panel root is not a bare 404.
+- +1 test (12 passing), ruff clean. Released as v0.1.1 to exercise the
+  web-triggered update flow end to end.
+
+---
+
 ## 2026-08-28 (6) — self-update from the web panel
 **Done**
 - `app/modules/updater.py`: version (git describe), check origin for newest
