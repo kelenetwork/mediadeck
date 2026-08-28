@@ -19,6 +19,7 @@ const NAV = [
     { id: 'nodes', icon: '⛁', label: '节点管理', sub: '推流节点负载与调度' },
     { id: 'pipeline', icon: '⇄', label: '管线状态', sub: '整理、上传队列与配额' },
     { id: 'mounts', icon: '⛃', label: '挂载管理', sub: '存储挂载健康与缓存占用' },
+    { id: 'tasks', icon: '⏱', label: '调度中心', sub: '定时任务运行状态与失败追踪' },
   ]},
   { group: '系统管理', items: [
     { id: 'update', icon: '⟳', label: '版本更新', sub: '检查并应用新版本' },
@@ -348,6 +349,48 @@ PAGES.mounts = async () => {
           <td>${x.fs_free_bytes == null ? '<span class="muted">-</span>' : fmtBytes(x.fs_free_bytes)}</td></tr>`;
       }).join(''))}
     ${card('告警', '存储层异常', (d.alerts || []).length
+      ? `<div class="card-body flush">${d.alerts.map((a) =>
+          `<div class="list-row"><div class="t">${esc(a.message)}</div>
+           <span class="tag ${a.level === 'warn' ? 'warn' : 'bad'}">${esc(a.level)}</span></div>`).join('')}</div>`
+      : `<div class="empty">无告警</div>`)}`;
+};
+
+PAGES.tasks = async () => {
+  const t = await api('/api/tasks').catch(() => ({ available: false }));
+  if (!t.available) {
+    $('#view').innerHTML = `<div class="card"><div class="empty">调度快照不可用</div></div>`;
+    return;
+  }
+  const d = t.data, ts = d.tasks || [];
+  const failed = ts.filter((x) => x.last_status === 'failed').length;
+  const disabled = ts.filter((x) => !x.enabled).length;
+  const statusCls = (st) => (st === 'ok' ? 'ok' : st === 'failed' ? 'bad'
+    : st === 'unknown' ? 'idle' : 'warn');
+  $('#view').innerHTML = `
+    <div class="stat-grid">
+      ${stat('⏱', ts.length, '任务总数', '快照中的定时任务')}
+      ${stat('⚠', failed, '当前失败', failed ? '最近一次运行失败' : '全部正常')}
+      ${stat('⏸', disabled, '已禁用', '未纳入调度')}
+    </div>
+    ${tableCard('定时任务', `快照 ${Math.round(t.snapshot_age_seconds)}s 前${t.stale ? ' · 已过期' : ''}`,
+      ['任务名', '计划', '状态', '上次运行', '耗时', '连续失败'],
+      ts.map((x) => {
+        const ageSec = x.last_run ? (Date.now() / 1000) - x.last_run : null;
+        const age = ageSec == null ? '-' : fmtAge(ageSec) + '前';
+        const dur = x.last_duration_ms == null
+          ? '<span class="muted">-</span>' : `${esc(x.last_duration_ms)} ms`;
+        const streak = x.failure_streak > 0
+          ? `<span class="tag bad">${esc(x.failure_streak)}</span>`
+          : '<span class="muted">0</span>';
+        const st = x.last_status || 'unknown';
+        return `<tr><td>${esc(x.name)}${x.enabled ? '' : '<div class="s muted">已禁用</div>'}</td>
+          <td>${esc(x.schedule)}</td>
+          <td><span class="tag ${statusCls(st)}">${esc(st)}</span></td>
+          <td>${esc(age)}</td>
+          <td>${dur}</td>
+          <td>${streak}</td></tr>`;
+      }).join(''))}
+    ${card('告警', '调度异常', (d.alerts || []).length
       ? `<div class="card-body flush">${d.alerts.map((a) =>
           `<div class="list-row"><div class="t">${esc(a.message)}</div>
            <span class="tag ${a.level === 'warn' ? 'warn' : 'bad'}">${esc(a.level)}</span></div>`).join('')}</div>`

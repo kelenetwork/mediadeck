@@ -4,6 +4,27 @@ Newest entries first. Every working session appends one entry.
 
 ---
 
+## 2026-08-29 (6) — scheduled task center (v0.7.0)
+**Done**
+- `app/modules/tasks.py`: TasksReader over a sanitized host snapshot (missing
+  file / unreadable JSON fail-safe, stale after 600s) + MockTasks covering ok,
+  failing-with-streak, never-run and disabled jobs.
+- `tasks_snapshot_path` setting, `GET /api/tasks`, env placeholder.
+- Panel page 调度中心: three stat cards (total / currently failing / disabled),
+  task table (schedule, status tag, relative last-run, duration, failure
+  streak highlighted) and an alert card.
+- First task produced under the new split-role workflow: implementation was
+  delegated to a coding subagent, then reviewed line-by-line and committed by
+  the main agent. Review notes: pattern-consistent with mounts.py, all HTML
+  interpolation escaped, no real identifiers, null last_run handled.
+- Tests 15/15, ruff clean.
+
+**Next**
+- Host-side task collector (outside repo) exporting the sanitized snapshot.
+- v0.8.0 invites & access.
+
+---
+
 ## 2026-08-29 (5) — mount health module (v0.6.0)
 **Done**
 - Rewrote ROADMAP into a self-driving plan (v0.6 mounts -> v0.7 scheduled
