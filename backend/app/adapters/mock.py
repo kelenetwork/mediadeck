@@ -53,6 +53,14 @@ class MockEmby:
         user["Policy"].update(policy_patch)
         return True
 
+    async def item_media_paths(self, item_id: str) -> dict[str, str]:
+        if item_id == "unknown":
+            return {}
+        return {
+            f"src-{item_id}": f"/media/Movies/Demo/{item_id}.mkv",
+            f"src-{item_id}-alt": f"/media/Movies/Demo/{item_id}.alt.mkv",
+        }
+
     async def libraries(self) -> list[dict[str, Any]]:
         return [
             {"name": "demo-movies", "type": "movies", "items": 120, "locations": 2},

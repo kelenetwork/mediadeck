@@ -15,13 +15,22 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from app.core.config import Settings, StreamNode
+from app.core.config import Settings, StreamNode, demo_nodes
 from app.core.errors import ConfigError
 from app.core.store import SettingsStore
 
 SECRET_UNCHANGED = "__KEEP__"
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$")
 MAX_NODES = 64
+
+# Playback interception is opt-in: it changes where clients actually fetch
+# bytes from, so it must never switch itself on during an upgrade.
+PLAYBACK_DEFAULTS: dict[str, Any] = {
+    "enabled": False,
+    "direct_only": True,
+    "strip_prefix": "",
+    "path_template": "{path}",
+}
 
 
 def mask_secret(value: str) -> str:
@@ -73,7 +82,12 @@ class SettingsService:
             "policy": "affinity",
             "load_threshold": 0.8,
         }, persist=False)
-        self._store.set("nodes", [n.model_dump() for n in cfg.nodes()], persist=False)
+        self._store.set_section("playback", dict(PLAYBACK_DEFAULTS), persist=False)
+        # Mock mode seeds a demo fleet through the same path as real nodes, so
+        # the settings page and the scheduler can never disagree about what
+        # exists.
+        seed = cfg.nodes() or (demo_nodes() if cfg.mediadeck_mock else [])
+        self._store.set("nodes", [n.model_dump() for n in seed], persist=False)
         self._store.save()
         return True
 
@@ -168,6 +182,35 @@ class SettingsService:
         if self._scheduler:
             self._scheduler.set_policy(policy, threshold)
         return self.dispatch_config()
+
+    # -- playback ------------------------------------------------------------
+    def playback_config(self) -> dict[str, Any]:
+        section = self._store.section("playback")
+        cfg = dict(PLAYBACK_DEFAULTS)
+        for key in cfg:
+            if key in section:
+                cfg[key] = section[key]
+        cfg["enabled"] = bool(cfg["enabled"])
+        cfg["direct_only"] = bool(cfg["direct_only"])
+        cfg["strip_prefix"] = str(cfg["strip_prefix"] or "")
+        cfg["path_template"] = str(cfg["path_template"] or "{path}")
+        return cfg
+
+    def save_playback(self, payload: dict[str, Any]) -> dict[str, Any]:
+        current = self.playback_config()
+        template = str(payload.get("path_template", current["path_template"]) or "{path}")
+        if "{path}" not in template:
+            raise ConfigError("路径模板必须包含 {path} 占位符")
+        enabled = bool(payload.get("enabled", current["enabled"]))
+        if enabled and not self.nodes():
+            raise ConfigError("启用播放分流前必须至少配置一个推流节点")
+        self._store.set_section("playback", {
+            "enabled": enabled,
+            "direct_only": bool(payload.get("direct_only", current["direct_only"])),
+            "strip_prefix": str(payload.get("strip_prefix", current["strip_prefix"]) or ""),
+            "path_template": template,
+        })
+        return self.playback_config()
 
     # -- nodes ---------------------------------------------------------------
     def nodes(self) -> list[StreamNode]:

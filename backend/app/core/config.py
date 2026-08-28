@@ -86,6 +86,21 @@ class Settings(BaseSettings):
         return out
 
 
+def demo_nodes() -> list[StreamNode]:
+    """Credential-free demo fleet used when MEDIADECK_MOCK=1.
+
+    These are seeded into the settings store like real nodes, so mock mode
+    stays self-consistent: what the settings page lists is exactly what the
+    scheduler dispatches to.
+    """
+    return [
+        StreamNode(name="mock-a", base_url="https://mock-a.example",
+                   probe_url="mock://a", capacity=100),
+        StreamNode(name="mock-b", base_url="https://mock-b.example",
+                   probe_url="mock://b", capacity=100),
+    ]
+
+
 @lru_cache
 def settings() -> Settings:
     return Settings()

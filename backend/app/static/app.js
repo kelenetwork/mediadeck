@@ -453,7 +453,7 @@ PAGES.tasks = async () => {
 PAGES.settings = async () => {
   const s = await api('/api/settings').catch(() => null);
   if (!s) { $('#view').innerHTML = `<div class="card"><div class="empty">设置加载失败</div></div>`; return; }
-  const e = s.emby, d = s.dispatch;
+  const e = s.emby, d = s.dispatch, p = s.playback;
   const connected = e.enabled && e.api_key_set;
   $('#view').innerHTML = `
     ${s.mock_mode ? card('演示模式', '当前以 MEDIADECK_MOCK=1 运行',
@@ -495,6 +495,34 @@ PAGES.settings = async () => {
         <div class="toolbar"><button class="btn primary" id="dp-save">保存策略</button>
           <span id="dp-result" class="muted"></span></div>
       </div>`)}
+    ${card('播放分流（Emby 接管）', p.enabled ? '已启用 — 客户端播放会被 302 分发到推流节点'
+      : '未启用 — 当前所有播放仍由 Emby 主机直接吐流',
+      `<div class="card-body">
+        <div class="muted" style="margin-bottom:12px">
+          开启后，客户端的播放请求经面板按文件亲和分发到节点。
+          <b>转码、无法识别的条目、无可用节点时会自动回退由 Emby 直接提供</b>，不会因为面板出错导致放不了。
+        </div>
+        <div class="form-row"><label>启用分流</label>
+          <input id="pb-enabled" type="checkbox" ${p.enabled ? 'checked' : ''}>
+          <span class="muted">需先配置至少一个推流节点</span></div>
+        <div class="form-row"><label>仅直播</label>
+          <input id="pb-direct" type="checkbox" ${p.direct_only ? 'checked' : ''}>
+          <span class="muted">转码流由 Emby 主机生成，节点上没有，建议保持勾选</span></div>
+        <div class="form-row"><label>去除前缀</label>
+          <input id="pb-strip" value="${esc(p.strip_prefix)}" placeholder="/media"></div>
+        <div class="form-row"><label>路径模板</label>
+          <input id="pb-template" value="${esc(p.path_template)}" placeholder="{path}"></div>
+        <div class="muted" style="margin:0 0 10px">
+          Emby 看到的是 <code>/media/Movies/x.mkv</code>，节点上可能是另一个根目录。
+          去除 <code>/media</code> 后套用模板得到节点侧路径；模板必须包含 <code>{path}</code>。
+        </div>
+        <div class="toolbar">
+          <input id="pb-item" placeholder="填入 Emby ItemId 试算" style="width:200px">
+          <button class="btn" id="pb-preview">预览路径</button>
+          <button class="btn primary" id="pb-save">保存</button>
+        </div>
+        <div id="pb-result" class="muted" style="margin-top:10px"></div>
+      </div>`)}
     ${tableCard('推流节点', `${s.nodes.length} 个已配置 · 在「节点管理」中新增与监控`,
       ['名称', '对外地址', '探针地址', '并发容量', '状态'],
       s.nodes.map((n) => `<tr><td>${esc(n.name)}</td><td>${esc(n.base_url)}</td>
@@ -503,7 +531,41 @@ PAGES.settings = async () => {
   $('#em-save').onclick = saveEmby;
   $('#em-test').onclick = testEmby;
   $('#dp-save').onclick = saveDispatch;
+  $('#pb-save').onclick = savePlayback;
+  $('#pb-preview').onclick = previewPlayback;
 };
+function playbackPayload() {
+  return {
+    enabled: $('#pb-enabled').checked,
+    direct_only: $('#pb-direct').checked,
+    strip_prefix: $('#pb-strip').value.trim(),
+    path_template: $('#pb-template').value.trim() || '{path}',
+  };
+}
+async function savePlayback() {
+  try {
+    await api('/api/settings/playback', { method: 'PUT', body: JSON.stringify(playbackPayload()) });
+    toast('播放分流配置已保存');
+    renderPage('settings');
+  } catch (err) { toast('保存失败: ' + err.message, 1); }
+}
+async function previewPlayback() {
+  const id = $('#pb-item').value.trim();
+  const el = $('#pb-result');
+  if (!id) { el.innerHTML = '<span class="tag warn">请先填入 ItemId</span>'; return; }
+  el.textContent = '正在试算…';
+  try {
+    const r = await api(`/api/playback/preview?item_id=${encodeURIComponent(id)}`);
+    el.innerHTML = r.redirected
+      ? `<span class="tag ok">分流到 ${esc(r.node)}</span><br>
+         <span class="muted">Emby 路径</span> <code>${esc(r.media_path)}</code><br>
+         <span class="muted">节点 URL</span> <code>${esc(r.target)}</code>`
+      : `<span class="tag warn">不分流（${esc(r.reason)}）</span><br>
+         <span class="muted">将由 Emby 直接提供</span> <code>${esc(r.target)}</code>`;
+  } catch (err) {
+    el.innerHTML = `<span class="tag bad">试算失败</span> ${esc(err.message)}`;
+  }
+}
 function embyPayload() {
   const key = $('#em-key').value;
   return {

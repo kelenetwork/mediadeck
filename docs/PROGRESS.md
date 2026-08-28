@@ -185,6 +185,55 @@ Newest entries first. Every working session appends one entry.
 
 ---
 
+## 2026-08-29 (2) — playback interception (multi-node becomes real)
+**Done**
+- `app/modules/playback.py`: PlaybackRouter — Emby-compatible stream edge at
+  `GET /emby/Videos/{id}/{rest}`. Resolves the item's backing file via Emby,
+  uses that **file path** (not the request URL) as the affinity key, and 302s
+  the client to the chosen node's copy. Until now the scheduler only had the
+  `/stream/` test edge, so no real client ever reached it.
+- **Fail-open by construction**: disabled, transcode/HLS, missing `Static=true`,
+  unresolved item, no healthy node, empty mapped path and Emby errors all fall
+  through to the Emby origin. A panel bug can only mean "not accelerated this
+  time", never "playback is broken".
+- Operator-configurable path mapping (`strip_prefix` + `path_template`) because
+  a node's media root rarely matches Emby's; `{path}` placeholder enforced.
+  `GET /api/playback/preview?item_id=` dry-runs the mapping so misconfiguration
+  is caught in the UI instead of as 404s in client logs.
+- TTL cache (300s) on item->path lookups so a popular title starting on many
+  clients does not become one Emby metadata call per client; negatives cached
+  too. Cache invalidated on settings save.
+- `LiveEmby.item_media_paths()` maps MediaSourceId -> on-disk path, skipping
+  http(s) sources that have no local file to serve.
+- Decision log (`/api/playback/log`) records reason/node/media_path per
+  interception, so "why did this not accelerate" is answerable.
+- Interception defaults to **off** and refuses to enable without a node.
+- Panel: 播放分流 card in 系统设置 (toggle, direct-only, path mapping, preview).
+
+**Fixed while testing**
+- Mock demo nodes were fabricated in `main.py` and never entered the settings
+  store, so the settings page showed 0 nodes while the node page showed 2 —
+  the same panel contradicting itself, and the "needs a node" guard misfiring.
+  Demo nodes now seed through the store like real ones; `_mock_nodes()` removed
+  and the scheduler reads nodes from a single source of truth.
+
+**Verified** (live mock instance)
+- Real Emby path `/emby/Videos/item42/stream.mkv?Static=true` -> 302 to node.
+- Affinity: same item 10/10 to one node; 30 distinct items split 17/13.
+- Fail-open: m3u8, no-Static, unknown item, disabled -> all to Emby origin.
+- Path template `files/{path}` -> `https://node/files/Movies/Demo/item7.mkv`.
+- 28 tests passing, ruff clean.
+
+**Next**
+- Node agent: serve mapped media paths (currently the node side is assumed).
+- Invite codes / access control (v0.8.0).
+
+**Open questions**
+- Node-side auth: clients get a plain node URL. Signed/expiring URLs are needed
+  before this is exposed to untrusted users commercially.
+
+---
+
 ## 2026-08-29 — settings center + affinity dispatch
 **Done**
 - `app/core/store.py`: JSON-backed runtime settings document (atomic write,

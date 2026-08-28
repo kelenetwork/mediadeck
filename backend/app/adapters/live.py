@@ -159,6 +159,35 @@ class LiveEmby:
             )
             return pr.status_code in (200, 204)
 
+    # -- playback ------------------------------------------------------------
+    async def item_media_paths(self, item_id: str) -> dict[str, str]:
+        """Map MediaSourceId -> on-disk file path for one item.
+
+        This is what lets playback interception key affinity on the actual
+        file rather than on the request URL, so every client watching the
+        same title converges on the same node.
+        """
+        base, headers, timeout, verify = self._conn()
+        async with self._client(timeout, verify) as client:
+            r = self._check(await client.get(
+                f"{base}/emby/Items",
+                headers=headers,
+                params={"Ids": item_id, "Fields": "MediaSources,Path", "Recursive": "true"},
+            ))
+            r.raise_for_status()
+            items = (r.json() or {}).get("Items") or []
+        out: dict[str, str] = {}
+        for item in items:
+            for source in item.get("MediaSources") or []:
+                path = source.get("Path")
+                source_id = source.get("Id")
+                # Remote/streamed sources have no local file to hand to a node.
+                if path and source_id and not str(path).lower().startswith("http"):
+                    out[str(source_id)] = str(path)
+            if not out and item.get("Path"):
+                out[str(item_id)] = str(item["Path"])
+        return out
+
     # -- library -------------------------------------------------------------
     async def libraries(self) -> list[dict[str, Any]]:
         base, headers, timeout, verify = self._conn()

@@ -368,3 +368,99 @@ def test_dispatch_policy_switch() -> None:
                           json={"policy": "random"}).status_code == 422
         assert client.put("/api/settings/dispatch", headers=_basic(),
                           json={"policy": "affinity", "load_threshold": 0}).status_code == 422
+
+
+# ---- playback interception -------------------------------------------------
+def test_playback_defaults_off() -> None:
+    """Interception changes where bytes come from: it must never self-enable."""
+    with TestClient(app) as client:
+        cfg = client.get("/api/settings/playback", headers=_basic()).json()
+        assert cfg["enabled"] is False
+        assert cfg["direct_only"] is True
+        assert cfg["path_template"] == "{path}"
+
+
+def test_playback_enable_requires_a_node() -> None:
+    with TestClient(app) as client:
+        # mock mode ships two demo nodes, so enabling is allowed here
+        saved = client.put("/api/settings/playback", headers=_basic(),
+                           json={"enabled": True, "strip_prefix": "/media"}).json()
+        assert saved["enabled"] is True and saved["strip_prefix"] == "/media"
+        # template must keep the placeholder or every URL would be identical
+        assert client.put("/api/settings/playback", headers=_basic(),
+                          json={"path_template": "/fixed/no-placeholder"}).status_code == 422
+
+
+def test_playback_redirects_and_is_path_affine() -> None:
+    with TestClient(app) as client:
+        client.put("/api/settings/playback", headers=_basic(),
+                   json={"enabled": True, "strip_prefix": "/media"})
+        r = client.get("/emby/Videos/item42/stream.mkv?Static=true",
+                       headers=_basic(), follow_redirects=False)
+        assert r.status_code == 302
+        location = r.headers["location"]
+        assert "Movies/Demo/item42.mkv" in location
+        assert location.startswith("https://mock-")
+        # same item must keep resolving to the same node (cache locality)
+        targets = {
+            client.get("/emby/Videos/item42/stream.mkv?Static=true",
+                       headers=_basic(), follow_redirects=False).headers["location"]
+            for _ in range(8)
+        }
+        assert len(targets) == 1
+
+
+def test_playback_fails_open() -> None:
+    """Every uncertain case must fall back to Emby, never break playback."""
+    with TestClient(app) as client:
+        client.put("/api/settings/playback", headers=_basic(),
+                   json={"enabled": True, "strip_prefix": "/media"})
+
+        # transcode requests are produced on the Emby host, not on a node
+        r = client.get("/emby/Videos/item42/master.m3u8", headers=_basic(),
+                       follow_redirects=False)
+        assert r.status_code == 302 and "mock-" not in r.headers["location"]
+
+        # missing Static=true means Emby intends to remux/transcode
+        r = client.get("/emby/Videos/item42/stream.mkv", headers=_basic(),
+                       follow_redirects=False)
+        assert "mock-" not in r.headers["location"]
+
+        # unknown item -> cannot resolve a file -> origin
+        r = client.get("/emby/Videos/unknown/stream.mkv?Static=true",
+                       headers=_basic(), follow_redirects=False)
+        assert "mock-" not in r.headers["location"]
+
+        # disabled -> origin
+        client.put("/api/settings/playback", headers=_basic(), json={"enabled": False})
+        r = client.get("/emby/Videos/item42/stream.mkv?Static=true",
+                       headers=_basic(), follow_redirects=False)
+        assert "mock-" not in r.headers["location"]
+
+        reasons = {e["reason"] for e in client.get("/api/playback/log", headers=_basic()).json()}
+        assert {"transcode", "unresolved-item"} <= reasons
+
+
+def test_playback_preview_and_path_mapping() -> None:
+    with TestClient(app) as client:
+        client.put("/api/settings/playback", headers=_basic(), json={
+            "enabled": True, "strip_prefix": "/media", "path_template": "files/{path}"})
+        preview = client.get("/api/playback/preview?item_id=item7", headers=_basic()).json()
+        assert preview["redirected"] is True
+        assert preview["media_path"] == "/media/Movies/Demo/item7.mkv"
+        assert preview["target"].endswith("/files/Movies/Demo/item7.mkv")
+
+
+def test_path_mapping_helpers() -> None:
+    from app.modules.playback import build_node_url, is_transcode_request, map_media_path
+    assert map_media_path("/media/TV/a.mkv", "/media", "{path}") == "TV/a.mkv"
+    assert map_media_path("/media/TV/a.mkv", "/media/", "{path}") == "TV/a.mkv"
+    assert map_media_path("/other/a.mkv", "/media", "{path}") == "other/a.mkv"
+    assert map_media_path("D:\\media\\a.mkv", "D:/media", "{path}") == "a.mkv"
+    assert map_media_path("/media/a.mkv", "/media", "cdn/{path}") == "cdn/a.mkv"
+    # spaces and CJK must survive as a valid URL
+    assert build_node_url("https://n.test/", "TV/My Show/第01集.mkv") == (
+        "https://n.test/TV/My%20Show/%E7%AC%AC01%E9%9B%86.mkv")
+    assert is_transcode_request("emby/Videos/1/master.m3u8", {}) is True
+    assert is_transcode_request("emby/Videos/1/stream.mkv", {"Static": "true"}) is False
+    assert is_transcode_request("emby/Videos/1/stream.mkv", {}) is True

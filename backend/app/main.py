@@ -7,7 +7,7 @@ import secrets
 from pathlib import Path as FilePath
 from typing import Any
 
-from fastapi import Body, Depends, FastAPI, HTTPException, status
+from fastapi import Body, Depends, FastAPI, HTTPException, Request, status
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
@@ -20,6 +20,7 @@ from app.core.store import SettingsStore
 from app.modules.imports import ImportManager, JobKind, MockExecutor
 from app.modules.mounts import MockMounts, MountsReader
 from app.modules.pipeline import MockPipeline, PipelineReader
+from app.modules.playback import PlaybackRouter
 from app.modules.scheduler import Scheduler
 from app.modules.settings import SettingsService
 from app.modules.storage import MockStorage, StorageManager
@@ -100,14 +101,26 @@ async def _startup() -> None:
         app.state.updater = Updater(cfg.repo_root, cfg.service_name)
 
     dispatch = app.state.settings_service.dispatch_config()
+    # Nodes always come from the settings store -- in mock mode the demo fleet
+    # was seeded into it at bootstrap, so the settings page and the scheduler
+    # can never disagree about which nodes exist.
     app.state.scheduler = Scheduler(
-        app.state.settings_service.nodes() or _mock_nodes(cfg),
+        app.state.settings_service.nodes(),
         probe,
         policy=dispatch["policy"],
         load_threshold=dispatch["load_threshold"],
     )
     # Node/policy edits in the UI reconfigure this scheduler in place.
     app.state.settings_service.bind_scheduler(app.state.scheduler)
+
+    # Playback interception: the piece that puts the scheduler on the real
+    # client path instead of only the /stream test edge.
+    app.state.playback = PlaybackRouter(
+        app.state.emby,
+        app.state.scheduler,
+        app.state.settings_service.playback_config,
+        app.state.settings_service.emby_config,
+    )
 
     async def probe_loop() -> None:
         while True:
@@ -116,18 +129,6 @@ async def _startup() -> None:
             await asyncio.sleep(15)
 
     app.state.probe_task = asyncio.create_task(probe_loop())
-
-
-def _mock_nodes(cfg: Any):
-    from app.core.config import StreamNode
-    if not cfg.mediadeck_mock:
-        return []
-    return [
-        StreamNode(name="mock-a", base_url="https://mock-a.example",
-                   probe_url="mock://a", capacity=20),
-        StreamNode(name="mock-b", base_url="https://mock-b.example",
-                   probe_url="mock://b", capacity=40),
-    ]
 
 
 STATIC_DIR = FilePath(__file__).parent / "static"
@@ -392,6 +393,61 @@ async def imports_cancel(job_id: str) -> dict[str, bool]:
     if not app.state.imports.cancel(job_id):
         raise HTTPException(409, "job not cancellable")
     return {"cancelled": True}
+
+
+# ---- playback interception -------------------------------------------------
+@app.get("/api/settings/playback", dependencies=[Depends(_auth)])
+async def settings_playback_get() -> dict[str, Any]:
+    return app.state.settings_service.playback_config()
+
+
+@app.put("/api/settings/playback", dependencies=[Depends(_auth)])
+async def settings_playback_save(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:  # noqa: B008
+    saved = app.state.settings_service.save_playback(payload)
+    # Path mapping changed -> previously resolved paths may be stale.
+    app.state.playback.invalidate()
+    return saved
+
+
+@app.get("/api/playback/log", dependencies=[Depends(_auth)])
+async def playback_log(limit: int = 100) -> list[dict[str, Any]]:
+    return app.state.playback.recent(limit)
+
+
+@app.get("/api/playback/preview", dependencies=[Depends(_auth)])
+async def playback_preview(item_id: str) -> dict[str, Any]:
+    """Dry-run one interception so the operator can confirm path mapping.
+
+    Setting strip_prefix/path_template wrong yields 404s on the node that are
+    painful to debug from client logs; this shows the resolved target first.
+    """
+    decision = await app.state.playback.route(
+        item_id, f"emby/Videos/{item_id}/stream.mkv", {"Static": "true"}
+    )
+    return {
+        "redirected": decision.redirected,
+        "target": decision.target,
+        "reason": decision.reason,
+        "node": decision.node,
+        "media_path": decision.media_path,
+    }
+
+
+@app.get("/emby/Videos/{item_id}/{rest:path}")
+async def emby_video_stream(item_id: str, rest: str, request: Request) -> RedirectResponse:
+    """Emby-compatible stream edge.
+
+    Point clients (or a reverse proxy rule) at the panel for this path and
+    playback is dispatched across nodes. Anything uncertain falls through to
+    the Emby origin, so this can never be the reason playback fails.
+    """
+    query = dict(request.query_params)
+    decision = await app.state.playback.route(
+        item_id, f"emby/Videos/{item_id}/{rest}", query
+    )
+    if not decision.target:
+        raise HTTPException(409, "Emby origin not configured")
+    return RedirectResponse(decision.target, status_code=302)
 
 
 # ---- emby ------------------------------------------------------------------
