@@ -754,3 +754,44 @@ def test_client_token_is_read_from_every_shape_emby_uses() -> None:
         {"authorization": 'MediaBrowser Client="Emby", Token="c"'}, {}) == "c"
     assert caller_token({}, {"api_key": "d"}) == "d"
     assert caller_token({}, {}) == ""
+
+
+def test_real_client_path_shapes_reach_the_edge() -> None:
+    """Regression: real playback never matched the route at all.
+
+    This deployment's Emby log shows /emby/videos/<id>/original.mkv (lowercase,
+    298 of 400 samples) and /Videos/<id>/stream (no /emby prefix). Starlette
+    routes are case-sensitive, so registering only /emby/Videos meant real
+    playback silently bypassed the panel and dispatch looked broken.
+    """
+    with TestClient(app) as client:
+        client.put("/api/settings/playback", headers=_basic(), json={"enabled": True})
+        for path in (
+            "/emby/videos/item42/original.mkv",      # by far the most common
+            "/emby/Videos/item42/original.mkv",
+            "/Videos/item42/stream?Static=true",     # no /emby prefix
+            "/videos/item42/original.mp4",
+        ):
+            r = client.get(path, headers=_play(), follow_redirects=False)
+            assert r.status_code == 302, path
+            assert "mock-" in r.headers["location"], path
+
+
+def test_original_is_direct_play_without_static_flag() -> None:
+    """original.<ext> is the untouched file; requiring Static=true rejects it.
+
+    Real clients request original.mkv with no Static parameter, so treating a
+    missing flag as "transcode" would classify every real direct play as
+    non-accelerable -- which is what the observed traffic actually looked like.
+    """
+    from app.modules.playback import is_transcode_request
+    assert is_transcode_request("emby/videos/1/original.mkv", {}) is False
+    assert is_transcode_request("emby/videos/1/original.mp4", {}) is False
+    assert is_transcode_request("Videos/1/stream", {"Static": "true"}) is False
+    assert is_transcode_request("Videos/1/stream", {}) is True
+    # generated on the Emby host, never present on a node -> default-deny
+    assert is_transcode_request("emby/videos/1/master.m3u8", {}) is True
+    assert is_transcode_request("emby/videos/1/main.m3u8", {}) is True
+    assert is_transcode_request("emby/videos/1/hls/segment1.ts", {}) is True
+    assert is_transcode_request("emby/videos/1/manifest.mpd", {}) is True
+    assert is_transcode_request("emby/Videos/1/AdditionalParts", {}) is True

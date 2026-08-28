@@ -42,12 +42,13 @@ from urllib.parse import urlencode
 
 from app.modules.signing import public_url, sign_url
 
-# Path fragments that mean "Emby is transcoding this".  Transcoded output is
-# produced on the Emby host and does not exist on a node.
-TRANSCODE_MARKERS = (
-    "master.m3u8", "main.m3u8", "manifest", "hls", "live.m3u8",
-    "transcod", "/segments/", ".ts", "dash", ".mpd",
-)
+# Emby serves the untouched file at .../original.<ext>; that is direct play by
+# definition.  .../stream.<ext> is direct play only when Static=true, otherwise
+# Emby intends to remux.  Everything else on this path (HLS playlists, DASH
+# manifests, segments) is generated on the Emby host and does not exist on a
+# node, so it must never be redirected.
+DIRECT_ORIGINAL = "original"
+DIRECT_STREAM = "stream"
 
 
 @dataclass
@@ -120,13 +121,23 @@ def caller_token(headers: Any, query: dict[str, str]) -> str:
 
 
 def is_transcode_request(path: str, query: dict[str, str]) -> bool:
-    lowered = path.lower()
-    if any(marker in lowered for marker in TRANSCODE_MARKERS):
-        return True
-    # Emby marks true direct play with Static=true; its absence on a /stream
-    # request generally means the server intends to remux or transcode.
-    static = (query.get("Static") or query.get("static") or "").lower()
-    return static not in ("true", "1")
+    """Decide whether Emby is generating this response rather than serving a file.
+
+    Default-deny: anything not positively recognised as direct play is treated
+    as transcode and left to Emby. Guessing wrong in that direction merely
+    skips acceleration; guessing wrong the other way redirects a client to a
+    node for a file that does not exist there.
+    """
+    tail = path.rsplit("/", 1)[-1].lower()
+    endpoint = tail.split(".", 1)[0]
+    if endpoint == DIRECT_ORIGINAL:
+        # Real clients request original.mkv without Static=true; requiring it
+        # here would classify every real direct play as a transcode.
+        return False
+    if endpoint == DIRECT_STREAM:
+        static = (query.get("Static") or query.get("static") or "").lower()
+        return static not in ("true", "1")
+    return True
 
 
 def match_pool(media_path: str, pools: list[Any]) -> tuple[Any, str] | None:

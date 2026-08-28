@@ -619,7 +619,6 @@ async def enroll_script(token: str) -> PlainTextResponse:
                              media_type="text/x-shellscript")
 
 
-@app.get("/emby/Videos/{item_id}/{rest:path}")
 async def emby_video_stream(item_id: str, rest: str, request: Request) -> RedirectResponse:
     """Emby-compatible stream edge.
 
@@ -633,14 +632,27 @@ async def emby_video_stream(item_id: str, rest: str, request: Request) -> Redire
     Emby applies its own decision and the fail-open contract still holds.
     """
     query = dict(request.query_params)
+    # Preserve the exact incoming path: the fallback URL must point back at the
+    # same Emby endpoint the client actually asked for, not a normalised guess.
     decision = await app.state.playback.route(
-        item_id, f"emby/Videos/{item_id}/{rest}", query,
+        item_id, request.url.path.lstrip("/"), query,
         caller_token=caller_token(request.headers, query),
         require_auth=True,
     )
     if not decision.target:
         raise HTTPException(409, "Emby origin not configured")
     return RedirectResponse(decision.target, status_code=302)
+
+
+# Real client traffic uses several shapes for this path. Observed in this
+# deployment's Emby log: /emby/videos/<id>/original.mkv (lowercase, by far the
+# most common), /Videos/<id>/stream (no /emby prefix) and mixed casings.
+# Starlette routes are case-sensitive, so registering only one shape means real
+# playback silently never reaches the panel and dispatch appears to do nothing.
+for _prefix in ("/emby/Videos", "/emby/videos", "/Videos", "/videos"):
+    app.get(_prefix + "/{item_id}/{rest:path}", include_in_schema=False)(
+        emby_video_stream
+    )
 
 
 # ---- emby ------------------------------------------------------------------
