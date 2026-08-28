@@ -14,6 +14,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.adapters.live import LiveEmby, LiveProbe, probe_emby
 from app.adapters.mock import MockEmby, MockProbe
+from app.core.cache import TTLCache
 from app.core.config import settings
 from app.core.errors import ConfigError, NotConfigured, UpstreamError
 from app.core.store import SettingsStore
@@ -21,6 +22,7 @@ from app.modules.imports import ImportManager, JobKind, MockExecutor
 from app.modules.mounts import MockMounts, MountsReader
 from app.modules.pipeline import MockPipeline, PipelineReader
 from app.modules.playback import PlaybackRouter
+from app.modules.provisioning import emby_frontend_snippet, install_script
 from app.modules.scheduler import Scheduler
 from app.modules.settings import SettingsService
 from app.modules.storage import MockStorage, StorageManager
@@ -73,6 +75,7 @@ async def _startup() -> None:
     cfg = settings()
     store = SettingsStore(cfg.settings_file)
     app.state.store = store
+    app.state.cache = TTLCache()
     app.state.settings_service = SettingsService(store)
     # First run: migrate .env values into the editable settings document so
     # existing deployments keep working, then never read them again.
@@ -120,6 +123,7 @@ async def _startup() -> None:
         app.state.scheduler,
         app.state.settings_service.playback_config,
         app.state.settings_service.emby_config,
+        app.state.settings_service.delivery_config,
     )
 
     async def probe_loop() -> None:
@@ -150,6 +154,22 @@ async def healthz() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/agent/loadprobe.py", include_in_schema=False)
+async def agent_loadprobe() -> FileResponse:
+    """Serve the node probe agent so the installer can fetch it from here.
+
+    Kept as a route rather than a copy under static/ so there is exactly one
+    copy of the agent in the repo and it cannot drift.
+    """
+    for candidate in (
+        FilePath(__file__).resolve().parents[2] / "agent" / "loadprobe.py",
+        FilePath(__file__).resolve().parents[3] / "agent" / "loadprobe.py",
+    ):
+        if candidate.is_file():
+            return FileResponse(candidate, media_type="text/x-python")
+    raise HTTPException(404, "agent not found in this deployment")
+
+
 # ---- settings --------------------------------------------------------------
 @app.get("/api/settings", dependencies=[Depends(_auth)])
 async def settings_overview() -> dict[str, Any]:
@@ -159,6 +179,9 @@ async def settings_overview() -> dict[str, Any]:
         "mock_mode": settings().mediadeck_mock,
         "emby": service.emby_public(),
         "dispatch": service.dispatch_config(),
+        "playback": service.playback_config(),
+        "delivery": service.delivery_public(),
+        "integration": service.integration_config(),
         "nodes": service.nodes_public(),
     }
 
@@ -430,6 +453,88 @@ async def playback_preview(item_id: str) -> dict[str, Any]:
         "reason": decision.reason,
         "node": decision.node,
         "media_path": decision.media_path,
+        "signed": decision.signed,
+    }
+
+
+# ---- delivery security -----------------------------------------------------
+@app.get("/api/settings/delivery", dependencies=[Depends(_auth)])
+async def settings_delivery_get() -> dict[str, Any]:
+    return app.state.settings_service.delivery_public()
+
+
+@app.put("/api/settings/delivery", dependencies=[Depends(_auth)])
+async def settings_delivery_save(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:  # noqa: B008
+    return app.state.settings_service.save_delivery(payload)
+
+
+@app.post("/api/settings/delivery/rotate", dependencies=[Depends(_auth)])
+async def settings_delivery_rotate() -> dict[str, Any]:
+    """Issue a new signing key, invalidating every link already handed out."""
+    return app.state.settings_service.rotate_delivery_secret()
+
+
+# ---- integration / node provisioning ---------------------------------------
+@app.get("/api/settings/integration", dependencies=[Depends(_auth)])
+async def settings_integration_get() -> dict[str, Any]:
+    return app.state.settings_service.integration_config()
+
+
+@app.put("/api/settings/integration", dependencies=[Depends(_auth)])
+async def settings_integration_save(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:  # noqa: B008
+    return app.state.settings_service.save_integration(payload)
+
+
+@app.get("/api/integration/frontend", dependencies=[Depends(_auth)])
+async def integration_frontend(server: str = "caddy") -> dict[str, Any]:
+    """Reverse-proxy rule that puts the panel on the real playback path.
+
+    Answers "how does my existing Emby domain dispatch to nodes": the operator
+    keeps one public Emby hostname and only stream requests reach the panel.
+    """
+    service = app.state.settings_service
+    integration = service.integration_config()
+    emby_public = integration["emby_public_url"] or service.emby_config()["url"]
+    panel_public = integration["panel_public_url"] or "http://127.0.0.1:8300"
+    return {
+        "server": server,
+        "config": emby_frontend_snippet(panel_public, emby_public, server),
+    }
+
+
+@app.get("/api/nodes/{name}/install", dependencies=[Depends(_auth)])
+async def node_install_script(
+    name: str,
+    remote: str = "gdrive",
+    cache_dir: str = "/var/cache/mediadeck",
+    cache_size: str = "500G",
+) -> dict[str, Any]:
+    """Render the installer that turns a bare server into this node.
+
+    Registering a node the panel cannot actually reach only produces 404s, so
+    the panel emits the rclone mount, nginx vhost and probe unit that make the
+    registration true. Nothing is executed and no host is contacted here.
+    """
+    service = app.state.settings_service
+    node = next((n for n in service.nodes() if n.name == name), None)
+    if node is None:
+        raise HTTPException(404, "unknown node")
+    integration = service.integration_config()
+    delivery = service.delivery_config()
+    return {
+        "node": name,
+        "signing_enabled": delivery["signing_enabled"],
+        "script": install_script(
+            node_name=node.name,
+            base_url=node.base_url,
+            media_root=integration["node_media_root"],
+            remote=remote,
+            cache_dir=cache_dir,
+            cache_size=cache_size,
+            panel_url=integration["panel_public_url"] or "http://127.0.0.1:8300",
+            signing_enabled=delivery["signing_enabled"],
+            secret=delivery["secret"],
+        ),
     }
 
 
@@ -458,12 +563,20 @@ async def emby_users() -> list[dict[str, Any]]:
 
 @app.get("/api/emby/libraries", dependencies=[Depends(_auth)])
 async def emby_libraries() -> list[dict[str, Any]]:
-    return await app.state.emby.libraries()
+    # One item-count query per library makes this the slowest view in the
+    # panel; pages auto-refresh, so cache it instead of re-running per render.
+    return await app.state.cache.resolve(
+        "emby:libraries", app.state.emby.libraries, ttl=120
+    )
 
 
 @app.get("/api/emby/sessions", dependencies=[Depends(_auth)])
 async def emby_sessions() -> list[dict[str, Any]]:
-    return await app.state.emby.active_sessions()
+    # Short TTL: sessions must still feel live, but a 30s auto-refresh plus
+    # page switches should not hammer Emby.
+    return await app.state.cache.resolve(
+        "emby:sessions", app.state.emby.active_sessions, ttl=5
+    )
 
 
 @app.post("/api/emby/users", dependencies=[Depends(_auth)])

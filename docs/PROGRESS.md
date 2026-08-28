@@ -185,6 +185,58 @@ Newest entries first. Every working session appends one entry.
 
 ---
 
+## 2026-08-29 (3) — node provisioning, signed URLs, settings-page fix
+**Owner-reported issues, all root-caused**
+1. *Panel feels laggy* — `/api/emby/libraries` took 2.16s: one item-count query
+   per library (N+1), re-run on every page render and every 30s auto-refresh.
+   Added a shared TTL cache (libraries 120s, sessions 5s).
+2. *Settings page fails to load* — **my bug, shipped in v0.9.0**: `/api/settings`
+   never returned `playback`, but the page did `const p = s.playback` and then
+   read `p.enabled`, throwing before anything rendered. Added the field and
+   pinned the whole payload shape with `test_settings_overview_contract`, since
+   this class of bug is invisible until the page is opened.
+3. *Nodes are unconfigurable / "云里雾里"* — correct, and the most important
+   one. The panel could register a node but never explained how to build one;
+   registering a node that does not exist only produces 404s.
+4. *Security* — unsigned node URLs are permanent public download links.
+
+**Done**
+- `app/modules/signing.py`: nginx `secure_link_md5` compatible signed URLs with
+  expiry. Digest is computed over the **decoded** `$uri` and only the result is
+  percent-encoded — the reverse order 403s every path with a space or CJK
+  character, i.e. most of a Chinese library. Key rotation invalidates every
+  link already handed out.
+- `app/modules/provisioning.py`: renders the whole node stack from stored
+  settings — rclone mount unit (VFS cache, read-only, `Before=nginx`), nginx
+  vhost (secure_link, range support, autoindex off), loadprobe unit, and a
+  single install script wiring them together with self-checks. Also renders the
+  Caddy/nginx front-door rule that routes **only** stream paths to the panel,
+  which is the missing answer to "how does emby.example.com dispatch to nodes".
+  Nothing is executed and no remote host is contacted; it emits reviewable text.
+- Panel serves `/agent/loadprobe.py` so the installer fetches the agent from
+  the panel itself and there is exactly one copy of it in the repo.
+- Settings page gained 链接安全（签名）and 接入方式 cards; node page can fetch
+  its install script.
+- Settings/update pages no longer auto-refresh: re-rendering mid-edit wiped
+  whatever the operator was typing.
+
+**Verified**
+- Signed URL round-trip incl. CJK path; expiry and wrong-path rejection.
+- Install script contains every layer (mount, VFS cache, secure_link with the
+  shared secret, `user_allow_other`, certbot, probe) and no unrendered template.
+- Front-door snippet diverts only `emby/Videos/.../stream`.
+- 38 tests passing, ruff clean.
+
+**Next**
+- Node-side verification against a real server (ca1) once owner approves.
+- Invite codes / access control.
+
+**Open questions**
+- Install script assumes Debian/Ubuntu + systemd + nginx. Other distros need
+  either detection or a documented manual path.
+
+---
+
 ## 2026-08-29 (2) — playback interception (multi-node becomes real)
 **Done**
 - `app/modules/playback.py`: PlaybackRouter — Emby-compatible stream edge at

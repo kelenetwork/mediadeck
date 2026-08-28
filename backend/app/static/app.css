@@ -142,6 +142,14 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
 .form-row > input[type="text"], .form-row > input:not([type]),
 .form-row > input[type="password"] { flex: 1; min-width: 240px; }
 .form-row > input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--accent); }
+
+/* generated config snippets: must stay copyable and not blow up the layout */
+.codeblock {
+  background: #0f172a; color: #e2e8f0; padding: 12px 14px; border-radius: 6px;
+  font-size: 12px; line-height: 1.5; overflow-x: auto; max-height: 420px;
+  white-space: pre; margin: 0; user-select: all;
+}
+code { background: #f1f5f9; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
 @media (max-width: 700px) { .form-row > label { width: 100%; } }
 
 table { border-collapse: collapse; width: 100%; }

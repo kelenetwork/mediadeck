@@ -18,6 +18,7 @@ from typing import Any
 from app.core.config import Settings, StreamNode, demo_nodes
 from app.core.errors import ConfigError
 from app.core.store import SettingsStore
+from app.modules.signing import MAX_TTL, MIN_TTL, generate_secret
 
 SECRET_UNCHANGED = "__KEEP__"
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$")
@@ -30,6 +31,23 @@ PLAYBACK_DEFAULTS: dict[str, Any] = {
     "direct_only": True,
     "strip_prefix": "",
     "path_template": "{path}",
+}
+
+# Delivery security. An unsigned node URL is a permanent public download link;
+# signing makes it expire. Off by default because turning it on without the
+# matching nginx config on the node would 403 every stream.
+DELIVERY_DEFAULTS: dict[str, Any] = {
+    "signing_enabled": False,
+    "secret": "",
+    "ttl_seconds": 21600,
+}
+
+# How the operator's existing Emby entrypoint reaches this panel. Needed to
+# generate copy-pasteable reverse-proxy and node config instead of prose.
+INTEGRATION_DEFAULTS: dict[str, Any] = {
+    "panel_public_url": "",
+    "emby_public_url": "",
+    "node_media_root": "/srv/media",
 }
 
 
@@ -83,6 +101,8 @@ class SettingsService:
             "load_threshold": 0.8,
         }, persist=False)
         self._store.set_section("playback", dict(PLAYBACK_DEFAULTS), persist=False)
+        self._store.set_section("delivery", dict(DELIVERY_DEFAULTS), persist=False)
+        self._store.set_section("integration", dict(INTEGRATION_DEFAULTS), persist=False)
         # Mock mode seeds a demo fleet through the same path as real nodes, so
         # the settings page and the scheduler can never disagree about what
         # exists.
@@ -211,6 +231,90 @@ class SettingsService:
             "path_template": template,
         })
         return self.playback_config()
+
+    # -- delivery security ---------------------------------------------------
+    def delivery_config(self) -> dict[str, Any]:
+        section = self._store.section("delivery")
+        cfg = dict(DELIVERY_DEFAULTS)
+        for key in cfg:
+            if key in section:
+                cfg[key] = section[key]
+        cfg["signing_enabled"] = bool(cfg["signing_enabled"])
+        cfg["secret"] = str(cfg["secret"] or "")
+        try:
+            cfg["ttl_seconds"] = int(cfg["ttl_seconds"])
+        except (TypeError, ValueError):
+            cfg["ttl_seconds"] = DELIVERY_DEFAULTS["ttl_seconds"]
+        return cfg
+
+    def delivery_public(self) -> dict[str, Any]:
+        cfg = self.delivery_config()
+        return {
+            "signing_enabled": cfg["signing_enabled"],
+            "secret_set": bool(cfg["secret"]),
+            "secret_masked": mask_secret(cfg["secret"]),
+            "ttl_seconds": cfg["ttl_seconds"],
+        }
+
+    def save_delivery(self, payload: dict[str, Any]) -> dict[str, Any]:
+        current = self.delivery_config()
+        try:
+            ttl = int(payload.get("ttl_seconds", current["ttl_seconds"]))
+        except (TypeError, ValueError):
+            raise ConfigError("链接有效期必须是数字") from None
+        if not MIN_TTL <= ttl <= MAX_TTL:
+            raise ConfigError(f"链接有效期必须在 {MIN_TTL}–{MAX_TTL} 秒之间")
+
+        secret = payload.get("secret", SECRET_UNCHANGED)
+        if secret == SECRET_UNCHANGED or secret is None or secret == "":
+            secret = current["secret"]
+        secret = str(secret).strip()
+
+        enabled = bool(payload.get("signing_enabled", current["signing_enabled"]))
+        # Enabling without a key would sign with an empty secret; generate one
+        # rather than silently producing URLs the node cannot verify.
+        if enabled and not secret:
+            secret = generate_secret()
+
+        self._store.set_section("delivery", {
+            "signing_enabled": enabled,
+            "secret": secret,
+            "ttl_seconds": ttl,
+        })
+        return self.delivery_public()
+
+    def rotate_delivery_secret(self) -> dict[str, Any]:
+        current = self.delivery_config()
+        current["secret"] = generate_secret()
+        self._store.set_section("delivery", current)
+        return self.delivery_public()
+
+    # -- integration ---------------------------------------------------------
+    def integration_config(self) -> dict[str, Any]:
+        section = self._store.section("integration")
+        cfg = dict(INTEGRATION_DEFAULTS)
+        for key in cfg:
+            if key in section:
+                cfg[key] = str(section[key] or "")
+        return cfg
+
+    def save_integration(self, payload: dict[str, Any]) -> dict[str, Any]:
+        current = self.integration_config()
+        panel = str(payload.get("panel_public_url", current["panel_public_url"]) or "").strip()
+        emby = str(payload.get("emby_public_url", current["emby_public_url"]) or "").strip()
+        root = str(payload.get("node_media_root", current["node_media_root"]) or "").strip()
+        if panel:
+            panel = _require_http_url(panel, "面板对外地址")
+        if emby:
+            emby = _require_http_url(emby, "Emby 对外地址")
+        if root and not root.startswith("/"):
+            raise ConfigError("节点媒体根目录必须是绝对路径")
+        self._store.set_section("integration", {
+            "panel_public_url": panel,
+            "emby_public_url": emby,
+            "node_media_root": root or INTEGRATION_DEFAULTS["node_media_root"],
+        })
+        return self.integration_config()
 
     # -- nodes ---------------------------------------------------------------
     def nodes(self) -> list[StreamNode]:
