@@ -16,6 +16,7 @@ from app.adapters.live import LiveEmby, LiveProbe
 from app.adapters.mock import MockEmby, MockProbe
 from app.core.config import settings
 from app.modules.imports import ImportManager, JobKind, MockExecutor
+from app.modules.mounts import MockMounts, MountsReader
 from app.modules.pipeline import MockPipeline, PipelineReader
 from app.modules.scheduler import Scheduler
 from app.modules.updater import MockUpdater, Updater
@@ -44,6 +45,9 @@ async def _startup() -> None:
         probe = LiveProbe()
     app.state.pipeline = (
         MockPipeline() if cfg.mediadeck_mock else PipelineReader(cfg.pipeline_snapshot_path)
+    )
+    app.state.mounts = (
+        MockMounts() if cfg.mediadeck_mock else MountsReader(cfg.mounts_snapshot_path)
     )
     app.state.imports = ImportManager(MockExecutor() if cfg.mediadeck_mock else None)
     if cfg.mediadeck_mock or not cfg.repo_root:
@@ -165,6 +169,11 @@ async def update_apply(target: str | None = Body(None, embed=True)) -> dict[str,
     if not result.get("started"):
         raise HTTPException(409, result.get("error", "update not started"))
     return result
+
+
+@app.get("/api/mounts", dependencies=[Depends(_auth)])
+async def mounts() -> dict[str, Any]:
+    return app.state.mounts.snapshot()
 
 
 # ---- import lanes ----------------------------------------------------------

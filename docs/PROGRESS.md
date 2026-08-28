@@ -4,6 +4,27 @@ Newest entries first. Every working session appends one entry.
 
 ---
 
+## 2026-08-29 (5) — mount health module (v0.6.0)
+**Done**
+- Rewrote ROADMAP into a self-driving plan (v0.6 mounts -> v0.7 scheduled
+  tasks -> v0.8 invites/access -> v0.9 reports/notifications -> v1.0 live
+  import executor + UI pass); no longer waits for per-step direction.
+- `app/modules/mounts.py`: MountsReader over a sanitized host snapshot,
+  MockMounts for dev. GET /api/mounts.
+- Panel page 挂载管理: alive/stuck/cache stat cards, per-mount table
+  (kind, options, readdir latency, stuck-process count, cache usage vs
+  limit, free space) and an alert list.
+- Host collector (outside repo) probes readdir in a child process so a wedged
+  FUSE mount cannot hang the collector, counts D-state processes per mount,
+  measures VFS cache dirs, and flags a union mount missing allow_other —
+  the exact failure that took the library down earlier today.
+- Tests 14/14, ruff clean.
+
+**Next**
+- v0.7.0 scheduled task center.
+
+---
+
 ## 2026-08-29 (4) — drop acquisition module, add media library page (v0.5.0)
 **Done**
 - Owner decision: download/acquisition management stays out of scope. Removed

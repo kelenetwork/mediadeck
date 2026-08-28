@@ -18,6 +18,7 @@ const NAV = [
   { group: '资源服务', items: [
     { id: 'nodes', icon: '⛁', label: '节点管理', sub: '推流节点负载与调度' },
     { id: 'pipeline', icon: '⇄', label: '管线状态', sub: '整理、上传队列与配额' },
+    { id: 'mounts', icon: '⛃', label: '挂载管理', sub: '存储挂载健康与缓存占用' },
   ]},
   { group: '系统管理', items: [
     { id: 'update', icon: '⟳', label: '版本更新', sub: '检查并应用新版本' },
@@ -313,6 +314,43 @@ PAGES.pipeline = async () => {
       ? `<div class="card-body flush">${d.alerts.map((a) =>
           `<div class="list-row"><div class="t">${esc(a.message)}</div>
            <span class="tag ${a.level === 'warn' ? 'warn' : 'idle'}">${esc(a.level)}</span></div>`).join('')}</div>`
+      : `<div class="empty">无告警</div>`)}`;
+};
+
+PAGES.mounts = async () => {
+  const m = await api('/api/mounts').catch(() => ({ available: false }));
+  if (!m.available) {
+    $('#view').innerHTML = `<div class="card"><div class="empty">挂载快照不可用</div></div>`;
+    return;
+  }
+  const d = m.data, ms = d.mounts || [];
+  const alive = ms.filter((x) => x.alive).length;
+  const stuck = ms.reduce((a, x) => a + (x.stuck_processes || 0), 0);
+  const cache = ms.reduce((a, x) => a + (x.cache_bytes || 0), 0);
+  $('#view').innerHTML = `
+    <div class="stat-grid">
+      ${stat('⛃', `${alive} / ${ms.length}`, '挂载存活', '可正常读取目录')}
+      ${stat('⚠', stuck, '阻塞进程', stuck ? '存在不可中断 I/O' : '无卡死进程')}
+      ${stat('⛁', fmtBytes(cache), '缓存占用', 'VFS 本地缓存合计')}
+    </div>
+    ${tableCard('存储挂载', `快照 ${Math.round(m.snapshot_age_seconds)}s 前${m.stale ? ' · 已过期' : ''}`,
+      ['挂载', '类型', '状态', '探测耗时', '阻塞', '缓存', '可用空间'],
+      ms.map((x) => {
+        const cachePct = x.cache_limit_bytes
+          ? Math.round((x.cache_bytes / x.cache_limit_bytes) * 100) : null;
+        return `<tr><td>${esc(x.label)}<div class="s muted">${esc((x.options || []).join(','))}</div></td>
+          <td>${esc(x.kind)}</td>
+          <td><span class="tag ${x.alive ? 'ok' : 'bad'}">${x.alive ? '正常' : '异常'}</span></td>
+          <td>${x.readdir_ms == null ? '<span class="muted">超时</span>' : x.readdir_ms + ' ms'}</td>
+          <td>${x.stuck_processes ? `<span class="tag bad">${x.stuck_processes}</span>` : '<span class="muted">0</span>'}</td>
+          <td>${x.cache_bytes == null ? '<span class="muted">-</span>'
+            : `${fmtBytes(x.cache_bytes)}${cachePct == null ? '' : ` <span class="muted">(${cachePct}%)</span>`}`}</td>
+          <td>${x.fs_free_bytes == null ? '<span class="muted">-</span>' : fmtBytes(x.fs_free_bytes)}</td></tr>`;
+      }).join(''))}
+    ${card('告警', '存储层异常', (d.alerts || []).length
+      ? `<div class="card-body flush">${d.alerts.map((a) =>
+          `<div class="list-row"><div class="t">${esc(a.message)}</div>
+           <span class="tag ${a.level === 'warn' ? 'warn' : 'bad'}">${esc(a.level)}</span></div>`).join('')}</div>`
       : `<div class="empty">无告警</div>`)}`;
 };
 
