@@ -34,6 +34,7 @@ class Settings(BaseSettings):
 
     pipeline_snapshot_path: str = ""
     mounts_snapshot_path: str = ""
+    tasks_snapshot_path: str = ""
 
     repo_root: str = ""
     service_name: str = "mediadeck"

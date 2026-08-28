@@ -180,3 +180,19 @@ def test_mounts_mock() -> None:
         assert {"media-main", "media-union"} <= labels
         bad = [m for m in snap["data"]["mounts"] if not m["alive"]]
         assert bad and bad[0]["stuck_processes"] == 2
+
+
+def test_tasks_mock() -> None:
+    with TestClient(app) as client:
+        snap = client.get("/api/tasks", headers=_basic()).json()
+        assert snap["available"] is True
+        tasks = snap["data"]["tasks"]
+        assert tasks
+        failing = [t for t in tasks if t["failure_streak"] > 0]
+        assert failing and failing[0]["last_status"] == "failed"
+        required = {
+            "name", "schedule", "enabled", "last_run", "last_status",
+            "last_duration_ms", "exit_code", "failure_streak", "last_error",
+        }
+        for item in tasks:
+            assert required <= set(item)

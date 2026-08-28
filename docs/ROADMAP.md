@@ -24,12 +24,12 @@ wedges in D-state. This page makes all of it visible in one place.
 - [ ] VFS cache usage vs configured limits; free-space floor per filesystem
 - [ ] Panel page: mount table, health tags, stuck-process alerts
 
-## v0.7.0 — Scheduled task center
-Dozens of guards/workers run on cron; today their state is only visible by
-reading logs on the host.
-- [ ] Collector: per-job last run, exit status, duration, next due
-- [ ] Failure streak detection and surfacing on the dashboard
-- [ ] Panel page: job table, last output tail, manual trigger (allowlisted)
+## v0.7.0 — Scheduled task center (shipped)
+- [x] Snapshot schema: per-job schedule, last run, status, duration, exit code,
+      failure streak
+- [x] Panel page: stat cards, task table, alert list
+- [ ] Host collector wiring (in progress)
+- [ ] Manual trigger (allowlisted) — deferred
 
 ## v0.8.0 — Invites & access
 - [ ] Invite code issuing with quota/expiry, redemption -> Emby user creation

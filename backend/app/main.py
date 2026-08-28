@@ -19,6 +19,7 @@ from app.modules.imports import ImportManager, JobKind, MockExecutor
 from app.modules.mounts import MockMounts, MountsReader
 from app.modules.pipeline import MockPipeline, PipelineReader
 from app.modules.scheduler import Scheduler
+from app.modules.tasks import MockTasks, TasksReader
 from app.modules.updater import MockUpdater, Updater
 
 app = FastAPI(title="mediadeck", version="0.1.0")
@@ -48,6 +49,9 @@ async def _startup() -> None:
     )
     app.state.mounts = (
         MockMounts() if cfg.mediadeck_mock else MountsReader(cfg.mounts_snapshot_path)
+    )
+    app.state.tasks = (
+        MockTasks() if cfg.mediadeck_mock else TasksReader(cfg.tasks_snapshot_path)
     )
     app.state.imports = ImportManager(MockExecutor() if cfg.mediadeck_mock else None)
     if cfg.mediadeck_mock or not cfg.repo_root:
@@ -174,6 +178,11 @@ async def update_apply(target: str | None = Body(None, embed=True)) -> dict[str,
 @app.get("/api/mounts", dependencies=[Depends(_auth)])
 async def mounts() -> dict[str, Any]:
     return app.state.mounts.snapshot()
+
+
+@app.get("/api/tasks", dependencies=[Depends(_auth)])
+async def tasks() -> dict[str, Any]:
+    return app.state.tasks.snapshot()
 
 
 # ---- import lanes ----------------------------------------------------------
