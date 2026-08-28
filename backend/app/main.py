@@ -13,13 +13,14 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from app.adapters.live import LiveEmby, LiveProbe
 from app.adapters.mock import MockEmby, MockProbe
 from app.core.config import settings
+from app.modules.pipeline import MockPipeline, PipelineReader
 from app.modules.scheduler import Scheduler
 
 app = FastAPI(title="mediadeck", version="0.1.0")
 security = HTTPBasic()
 
 
-def _auth(credentials: HTTPBasicCredentials = Depends(security)) -> str:
+def _auth(credentials: HTTPBasicCredentials = Depends(security)) -> str:  # noqa: B008
     cfg = settings()
     user_ok = secrets.compare_digest(credentials.username, cfg.mediadeck_admin_user)
     pass_ok = secrets.compare_digest(credentials.password, cfg.mediadeck_admin_password)
@@ -37,6 +38,9 @@ async def _startup() -> None:
     else:
         app.state.emby = LiveEmby(cfg)
         probe = LiveProbe()
+    app.state.pipeline = (
+        MockPipeline() if cfg.mediadeck_mock else PipelineReader(cfg.pipeline_snapshot_path)
+    )
     app.state.scheduler = Scheduler(cfg.nodes() or _mock_nodes(cfg), probe)
 
     async def probe_loop() -> None:
@@ -100,6 +104,12 @@ async def stream_redirect(path: str) -> RedirectResponse:
     if not chosen:
         raise HTTPException(503, "no available streaming node")
     return RedirectResponse(f"{chosen.node.base_url.rstrip('/')}/{path}", status_code=302)
+
+
+# ---- pipeline --------------------------------------------------------------
+@app.get("/api/pipeline", dependencies=[Depends(_auth)])
+async def pipeline() -> dict[str, Any]:
+    return app.state.pipeline.snapshot()
 
 
 # ---- emby ------------------------------------------------------------------

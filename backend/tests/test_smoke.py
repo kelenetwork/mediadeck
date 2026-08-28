@@ -51,3 +51,11 @@ def test_emby_mock() -> None:
         assert any(u["Name"] == "demo-user-1" for u in users)
         sessions = client.get("/api/emby/sessions", headers=_basic()).json()
         assert sessions and "BitrateMbps" in sessions[0]
+
+
+def test_pipeline_mock() -> None:
+    with TestClient(app) as client:
+        snap = client.get("/api/pipeline", headers=_basic()).json()
+        assert snap["available"] is True
+        names = {q["name"] for q in snap["data"]["queues"]}
+        assert "staging" in names and "upload-lanes" in names

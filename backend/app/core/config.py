@@ -35,6 +35,8 @@ class Settings(BaseSettings):
 
     stream_nodes: str = "[]"
 
+    pipeline_snapshot_path: str = ""
+
     def nodes(self) -> list[StreamNode]:
         try:
             raw = json.loads(self.stream_nodes or "[]")

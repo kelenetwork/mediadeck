@@ -4,6 +4,25 @@ Newest entries first. Every working session appends one entry.
 
 ---
 
+## 2026-08-28 (2) — pipeline overview + node probe agent
+**Done**
+- `app/modules/pipeline.py`: PipelineReader serves a sanitized JSON snapshot
+  written by a host-local collector (real paths never enter the repo);
+  staleness detection (>300s); MockPipeline for credential-free dev.
+- `agent/loadprobe.py`: stdlib-only single-file load probe for streaming
+  nodes — /load endpoint reporting ESTABLISHED-connection stream count and
+  5s-window egress Mbps, optional bearer token.
+- Wired `/api/pipeline` into the app; +1 test (6 passing), ruff clean.
+
+**Next**
+- Dispatch log + probe history in scheduler.
+- Host-side collector script (lives outside this repo, on the operator host).
+
+**Open questions**
+- none new.
+
+---
+
 ## 2026-08-28 — Phase 1 scaffold
 **Done**
 - Repo initialized (public), FastAPI backend skeleton.
