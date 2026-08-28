@@ -5,9 +5,9 @@
 - [x] Load-aware 302 scheduler (weights, health, manual kick)
 - [x] Emby adapter: users + active sessions
 - [x] Smoke tests, mock mode boots credential-free
-- [ ] Pipeline overview module (queue depths, quota states, oldest stuck items)
-- [ ] Node probe agent (tiny /load endpoint to run on each streaming node)
-- [ ] Scheduler: probe history + dispatch log
+- [x] Pipeline overview module (queue depths, quota states, oldest stuck items)
+- [x] Node probe agent (tiny /load endpoint to run on each streaming node)
+- [x] Scheduler: probe history + dispatch log
 
 ## Phase 2 — import lanes + user management
 - [ ] Cloud-drive import module (port of existing internal dashboard)
