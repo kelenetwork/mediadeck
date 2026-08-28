@@ -170,3 +170,13 @@ def test_emby_libraries() -> None:
         libs = client.get("/api/emby/libraries", headers=_basic()).json()
         assert libs and libs[0]["name"] == "demo-movies"
         assert {"name", "type", "items", "locations"} <= set(libs[0])
+
+
+def test_mounts_mock() -> None:
+    with TestClient(app) as client:
+        snap = client.get("/api/mounts", headers=_basic()).json()
+        assert snap["available"] is True
+        labels = {m["label"] for m in snap["data"]["mounts"]}
+        assert {"media-main", "media-union"} <= labels
+        bad = [m for m in snap["data"]["mounts"] if not m["alive"]]
+        assert bad and bad[0]["stuck_processes"] == 2

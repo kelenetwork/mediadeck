@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     stream_nodes: str = "[]"
 
     pipeline_snapshot_path: str = ""
+    mounts_snapshot_path: str = ""
 
     repo_root: str = ""
     service_name: str = "mediadeck"

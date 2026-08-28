@@ -1,26 +1,44 @@
 # Roadmap
 
-## Phase 1 — scaffold + stream scheduling (current)
-- [x] FastAPI skeleton, settings-from-env, mock/live adapter split
-- [x] Load-aware 302 scheduler (weights, health, manual kick)
-- [x] Emby adapter: users + active sessions
-- [x] Smoke tests, mock mode boots credential-free
-- [x] Pipeline overview module (queue depths, quota states, oldest stuck items)
-- [x] Node probe agent (tiny /load endpoint to run on each streaming node)
-- [x] Scheduler: probe history + dispatch log
+Owner sets priorities when he wants to; otherwise this plan is executed
+top-down without asking. Every item ships as its own PR + release tag.
 
-## Phase 2 — import lanes + user management
-- [x] Cloud-drive import module skeleton (job lifecycle + API; live executor pending)
-- [x] Drive-link import kind (same lifecycle; live executor pending)
-- [x] Emby user management: create/disable/password/policy (invite codes pending)
+## Done
+- [x] Backend scaffold, env-only config, mock/live adapter split
+- [x] Load-aware 302 stream scheduler (weights, health, kick, history, log)
+- [x] Node load probe agent (stdlib single file)
+- [x] Pipeline overview (sanitized host collector -> panel)
+- [x] Emby user management (create/disable/password/policy)
+- [x] Import lane skeleton (job lifecycle + API)
+- [x] Web-triggered self-update to release tags
+- [x] Admin panel shell (grouped sidebar, stat cards, page registry)
+- [x] Media library overview
+- [~] Acquisition/downloads: dropped by owner decision (stays external)
 
-## Phase 3 — acquisition shell + review
-- [~] Acquisition shell dropped by owner decision (2026-08-29): downloads stay in the existing external tool
-- [x] Media library overview (libraries, item counts, storage locations)
-- [ ] Identify/scrape review queue (AI verdicts, manual metadata correction)
-- [ ] Notification center with routing rules
+## v0.6.0 — Mount health (next)
+Storage is the single most failure-prone layer in this stack: FUSE mounts go
+stale, a union mount loses allow_other and the whole library 403s, ffprobe
+wedges in D-state. This page makes all of it visible in one place.
+- [ ] Collector: per-mount liveness (readdir probe), backend type, options
+- [ ] Detect stuck I/O (processes blocked in uninterruptible sleep per mount)
+- [ ] VFS cache usage vs configured limits; free-space floor per filesystem
+- [ ] Panel page: mount table, health tags, stuck-process alerts
 
-## Phase 4 — replace external components
-- [ ] Request management (replaces external request tool)
-- [ ] Registration/invite system (replaces external bot)
-- [ ] Frontend polish pass (UI style decided by owner at this stage)
+## v0.7.0 — Scheduled task center
+Dozens of guards/workers run on cron; today their state is only visible by
+reading logs on the host.
+- [ ] Collector: per-job last run, exit status, duration, next due
+- [ ] Failure streak detection and surfacing on the dashboard
+- [ ] Panel page: job table, last output tail, manual trigger (allowlisted)
+
+## v0.8.0 — Invites & access
+- [ ] Invite code issuing with quota/expiry, redemption -> Emby user creation
+- [ ] Access control view: per-user device/stream limits at a glance
+
+## v0.9.0 — Playback reports & notifications
+- [ ] Playback history aggregation (top titles, per-user minutes, node split)
+- [ ] Notification center with routing rules and delivery log
+
+## v1.0.0 — Live import executor + UI pass
+- [ ] Bridge import jobs to real host-side workers (sanitized IPC)
+- [ ] Visual design pass across all pages
