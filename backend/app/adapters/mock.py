@@ -53,6 +53,10 @@ class MockEmby:
         user["Policy"].update(policy_patch)
         return True
 
+    async def verify_item_access(self, item_id: str, token: str) -> bool:
+        # Mirrors the live adapter: only a non-empty token is ever accepted.
+        return bool((token or "").strip()) and token != "invalid-token"
+
     async def item_media_paths(self, item_id: str) -> dict[str, str]:
         if item_id == "unknown":
             return {}

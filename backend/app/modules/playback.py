@@ -33,6 +33,8 @@ outcome is "playback did not get accelerated this time".
 """
 from __future__ import annotations
 
+import hashlib
+import re
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -95,6 +97,28 @@ class TTLCache:
         self._data.clear()
 
 
+def caller_token(headers: Any, query: dict[str, str]) -> str:
+    """Extract the caller's own Emby credential from a playback request.
+
+    Emby clients present it in several shapes depending on client and version;
+    missing any one of them here would make legitimate playback look
+    unauthenticated and silently disable acceleration for those clients.
+    """
+    for header in ("x-emby-token", "x-mediabrowser-token"):
+        value = headers.get(header)
+        if value:
+            return str(value).strip()
+    # Authorization: MediaBrowser Client="...", Token="abc"
+    auth = headers.get("authorization") or headers.get("x-emby-authorization") or ""
+    match = re.search(r'token\s*=\s*"?([^",\s]+)"?', str(auth), re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+    for key in ("api_key", "ApiKey", "apikey", "X-Emby-Token"):
+        if query.get(key):
+            return str(query[key]).strip()
+    return ""
+
+
 def is_transcode_request(path: str, query: dict[str, str]) -> bool:
     lowered = path.lower()
     if any(marker in lowered for marker in TRANSCODE_MARKERS):
@@ -133,6 +157,7 @@ class PlaybackRouter:
         self._config = config_provider
         self._emby_config = emby_config_provider
         self._cache = TTLCache()
+        self._auth_cache = TTLCache(ttl=60.0)
         self._log: list[dict[str, Any]] = []
 
     # -- helpers -------------------------------------------------------------
@@ -166,6 +191,27 @@ class PlaybackRouter:
 
     def invalidate(self) -> None:
         self._cache.clear()
+        self._auth_cache.clear()
+
+    async def _authorised(self, item_id: str, token: str) -> bool:
+        verify = getattr(self._emby, "verify_item_access", None)
+        if verify is None:  # pragma: no cover - adapter contract guarantees it
+            return False
+        # The panel may run far from Emby (here: Montreal vs Germany), so an
+        # uncached check would add a cross-continent round trip to every
+        # playback start. Cache positives only, and briefly: a revoked user
+        # keeps access for at most this long, while a denial is always
+        # re-checked so revocation cannot be cached into place.
+        key = f"auth:{item_id}:{hashlib.sha256(token.encode()).hexdigest()[:16]}"
+        if self._auth_cache.get(key):
+            return True
+        try:
+            allowed = bool(await verify(item_id, token))
+        except Exception:  # noqa: BLE001 - treat any failure as "not authorised"
+            return False
+        if allowed:
+            self._auth_cache.set(key, True)
+        return allowed
 
     async def _media_path(self, item_id: str, media_source_id: str | None) -> str | None:
         cache_key = f"{item_id}:{media_source_id or ''}"
@@ -187,7 +233,8 @@ class PlaybackRouter:
 
     # -- main entry ----------------------------------------------------------
     async def route(self, item_id: str, request_path: str,
-                    query: dict[str, str]) -> Decision:
+                    query: dict[str, str], caller_token: str = "",
+                    require_auth: bool = False) -> Decision:
         cfg = self._config() or {}
 
         if not cfg.get("enabled"):
@@ -195,6 +242,16 @@ class PlaybackRouter:
 
         if cfg.get("direct_only", True) and is_transcode_request(request_path, query):
             decision = self._passthrough(request_path, query, "transcode")
+            self._record(decision, item_id)
+            return decision
+
+        # The panel sits on the playback path, so it must not become a way
+        # around Emby's own authentication. Without this an unauthenticated
+        # caller could guess an item id and receive a signed media URL.
+        # Falling back to the origin (rather than 403) keeps the fail-open
+        # contract: Emby then rejects the request itself, exactly as before.
+        if require_auth and not await self._authorised(item_id, caller_token):
+            decision = self._passthrough(request_path, query, "unauthorised")
             self._record(decision, item_id)
             return decision
 

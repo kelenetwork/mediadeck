@@ -371,6 +371,19 @@ def test_dispatch_policy_switch() -> None:
 
 
 # ---- playback interception -------------------------------------------------
+def _play(token: str = "client-emby-token") -> dict[str, str]:
+    """Headers for a *playback* request.
+
+    The stream edge is public (a reverse proxy sends real clients there), so it
+    verifies the caller's own Emby token before issuing a signed node URL.
+    Panel Basic auth is irrelevant to it.
+    """
+    headers = _basic()
+    if token:
+        headers["X-Emby-Token"] = token
+    return headers
+
+
 def _pools(*specs):
     return [{"name": n, "emby_prefix": e, "url_prefix": u,
              "node_path": np, "rclone_remote": r}
@@ -421,7 +434,7 @@ def test_playback_redirects_and_is_path_affine() -> None:
     with TestClient(app) as client:
         client.put("/api/settings/playback", headers=_basic(), json={"enabled": True})
         r = client.get("/emby/Videos/item42/stream.mkv?Static=true",
-                       headers=_basic(), follow_redirects=False)
+                       headers=_play(), follow_redirects=False)
         assert r.status_code == 302
         location = r.headers["location"]
         assert "/s/main/Movies/Demo/item42.mkv" in location
@@ -429,7 +442,7 @@ def test_playback_redirects_and_is_path_affine() -> None:
         # same item must keep resolving to the same node (cache locality)
         targets = {
             client.get("/emby/Videos/item42/stream.mkv?Static=true",
-                       headers=_basic(), follow_redirects=False).headers["location"]
+                       headers=_play(), follow_redirects=False).headers["location"]
             for _ in range(8)
         }
         assert len(targets) == 1
@@ -441,24 +454,24 @@ def test_playback_fails_open() -> None:
         client.put("/api/settings/playback", headers=_basic(), json={"enabled": True})
 
         # transcode output is produced on the Emby host, not on a node
-        r = client.get("/emby/Videos/item42/master.m3u8", headers=_basic(),
+        r = client.get("/emby/Videos/item42/master.m3u8", headers=_play(),
                        follow_redirects=False)
         assert r.status_code == 302 and "mock-" not in r.headers["location"]
 
         # missing Static=true means Emby intends to remux/transcode
-        r = client.get("/emby/Videos/item42/stream.mkv", headers=_basic(),
+        r = client.get("/emby/Videos/item42/stream.mkv", headers=_play(),
                        follow_redirects=False)
         assert "mock-" not in r.headers["location"]
 
         # unknown item -> cannot resolve a file -> origin
         r = client.get("/emby/Videos/unknown/stream.mkv?Static=true",
-                       headers=_basic(), follow_redirects=False)
+                       headers=_play(), follow_redirects=False)
         assert "mock-" not in r.headers["location"]
 
         # disabled -> origin
         client.put("/api/settings/playback", headers=_basic(), json={"enabled": False})
         r = client.get("/emby/Videos/item42/stream.mkv?Static=true",
-                       headers=_basic(), follow_redirects=False)
+                       headers=_play(), follow_redirects=False)
         assert "mock-" not in r.headers["location"]
 
         reasons = {e["reason"] for e in client.get("/api/playback/log", headers=_basic()).json()}
@@ -575,7 +588,7 @@ def test_signed_urls_used_for_playback_and_arg_names_are_per_node() -> None:
               sign_arg_digest="k", sign_arg_expires="e")
         client.put("/api/settings/playback", headers=_basic(), json={"enabled": True})
         r = client.get("/emby/Videos/item42/stream.mkv?Static=true",
-                       headers=_basic(), follow_redirects=False)
+                       headers=_play(), follow_redirects=False)
         location = r.headers["location"]
         assert "k=" in location and "e=" in location
         assert "md5=" not in location and "expires=" not in location
@@ -696,3 +709,48 @@ def test_agent_is_downloadable() -> None:
         r = client.get("/agent/loadprobe.py")
         assert r.status_code == 200
         assert "active_streams" in r.text
+
+
+# ---- stream edge authentication --------------------------------------------
+def test_stream_edge_does_not_bypass_emby_auth() -> None:
+    """The panel sits on the playback path and must not weaken Emby's auth.
+
+    A reverse proxy makes this endpoint public, so without verifying the
+    caller's own Emby token anyone could guess an item id and be handed a
+    signed media URL with no login at all -- turning the library into an open
+    download site. Unverified callers fall through to Emby (fail-open), which
+    then applies its own decision.
+    """
+    with TestClient(app) as client:
+        client.put("/api/settings/playback", headers=_basic(), json={"enabled": True})
+
+        # no credential at all -> must not receive a node URL
+        r = client.get("/emby/Videos/item42/stream.mkv?Static=true",
+                       follow_redirects=False)
+        assert r.status_code == 302
+        assert "mock-" not in r.headers["location"]
+
+        # a rejected credential -> same
+        r = client.get("/emby/Videos/item42/stream.mkv?Static=true",
+                       headers=_play("invalid-token"), follow_redirects=False)
+        assert "mock-" not in r.headers["location"]
+
+        # a valid credential -> accelerated
+        r = client.get("/emby/Videos/item42/stream.mkv?Static=true",
+                       headers=_play(), follow_redirects=False)
+        assert "mock-" in r.headers["location"]
+
+        reasons = {e["reason"] for e in client.get("/api/playback/log",
+                                                   headers=_basic()).json()}
+        assert "unauthorised" in reasons
+
+
+def test_client_token_is_read_from_every_shape_emby_uses() -> None:
+    """Missing one of these would silently disable acceleration for a client."""
+    from app.modules.playback import caller_token
+    assert caller_token({"x-emby-token": "a"}, {}) == "a"
+    assert caller_token({"x-mediabrowser-token": "b"}, {}) == "b"
+    assert caller_token(
+        {"authorization": 'MediaBrowser Client="Emby", Token="c"'}, {}) == "c"
+    assert caller_token({}, {"api_key": "d"}) == "d"
+    assert caller_token({}, {}) == ""

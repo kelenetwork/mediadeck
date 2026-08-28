@@ -28,7 +28,7 @@ from app.modules.events import EventStream, safe_stream
 from app.modules.imports import ImportManager, JobKind, MockExecutor
 from app.modules.mounts import MockMounts, MountsReader
 from app.modules.pipeline import MockPipeline, PipelineReader
-from app.modules.playback import PlaybackRouter
+from app.modules.playback import PlaybackRouter, caller_token
 from app.modules.provisioning import (
     emby_frontend_snippet,
     enroll_command,
@@ -623,13 +623,20 @@ async def enroll_script(token: str) -> PlainTextResponse:
 async def emby_video_stream(item_id: str, rest: str, request: Request) -> RedirectResponse:
     """Emby-compatible stream edge.
 
-    Point clients (or a reverse proxy rule) at the panel for this path and
-    playback is dispatched across nodes. Anything uncertain falls through to
-    the Emby origin, so this can never be the reason playback fails.
+    A reverse proxy sends real client playback here, so this endpoint is
+    public by necessity -- and therefore must not weaken Emby's own auth.
+    The caller's Emby token is verified against Emby before any signed node
+    URL is issued; otherwise the panel would become a way to fetch media
+    without logging in at all.
+
+    Unverified callers are passed through to Emby rather than rejected, so
+    Emby applies its own decision and the fail-open contract still holds.
     """
     query = dict(request.query_params)
     decision = await app.state.playback.route(
-        item_id, f"emby/Videos/{item_id}/{rest}", query
+        item_id, f"emby/Videos/{item_id}/{rest}", query,
+        caller_token=caller_token(request.headers, query),
+        require_auth=True,
     )
     if not decision.target:
         raise HTTPException(409, "Emby origin not configured")

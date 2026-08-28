@@ -160,6 +160,37 @@ class LiveEmby:
             return pr.status_code in (200, 204)
 
     # -- playback ------------------------------------------------------------
+    async def verify_item_access(self, item_id: str, token: str) -> bool:
+        """Does the *caller's* own Emby credential grant access to this item?
+
+        The panel sits on the playback path, so it must not become a way around
+        Emby's own authentication: without this check anyone could guess an
+        item id and be handed a signed media URL with no login at all.
+
+        Asking Emby with the caller's token also covers per-user library
+        permissions -- a user who cannot see a library gets no item back, so
+        they cannot obtain a link to it.
+        """
+        base, _, timeout, verify = self._conn()
+        token = (token or "").strip()
+        if not token:
+            return False
+        try:
+            async with self._client(timeout, verify) as client:
+                r = await client.get(
+                    f"{base}/emby/Items",
+                    headers={"X-Emby-Token": token},
+                    params={"Ids": item_id, "Limit": "1"},
+                )
+        except httpx.HTTPError:
+            return False
+        if r.status_code != 200:
+            return False
+        try:
+            return bool((r.json() or {}).get("Items"))
+        except ValueError:
+            return False
+
     async def item_media_paths(self, item_id: str) -> dict[str, str]:
         """Map MediaSourceId -> on-disk file path for one item.
 
