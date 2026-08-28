@@ -23,6 +23,7 @@ class LiveMoviePilot:
         self._base = cfg.mp_url.rstrip("/")
         self._user = cfg.mp_username
         self._password = cfg.mp_password
+        self._api_token = cfg.mp_api_token
         self._token = ""
         self._token_ts = 0.0
 
@@ -40,6 +41,15 @@ class LiveMoviePilot:
 
     async def _request(self, method: str, path: str, **kw: Any) -> Any:
         async with httpx.AsyncClient(timeout=30) as client:
+            if self._api_token:
+                # Static API-token mode: MoviePilot accepts ?token= on /api/v1.
+                params = dict(kw.pop("params", {}) or {})
+                params["token"] = self._api_token
+                r = await client.request(method, f"{self._base}{path}",
+                                         params=params, **kw)
+                if r.status_code >= 400:
+                    raise MPError(f"{method} {path}: HTTP {r.status_code}")
+                return r.json()
             if not self._token or time.time() - self._token_ts > 3600:
                 await self._login(client)
             headers = {"Authorization": f"Bearer {self._token}"}
