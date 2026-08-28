@@ -10,6 +10,7 @@ from typing import Any
 from fastapi import Body, Depends, FastAPI, HTTPException, status
 from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from fastapi.staticfiles import StaticFiles
 
 from app.adapters.live import LiveEmby, LiveProbe
 from app.adapters.mock import MockEmby, MockProbe
@@ -76,6 +77,12 @@ def _mock_nodes(cfg: Any):
 
 
 STATIC_DIR = FilePath(__file__).parent / "static"
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+@app.get("/api/whoami", dependencies=[Depends(_auth)])
+async def whoami() -> dict[str, str]:
+    return {"user": settings().mediadeck_admin_user}
 
 
 @app.get("/", include_in_schema=False)

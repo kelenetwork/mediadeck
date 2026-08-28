@@ -160,7 +160,9 @@ def test_root_serves_panel() -> None:
         assert client.get("/", follow_redirects=False).status_code == 401
         r = client.get("/", headers=_basic())
         assert r.status_code == 200
-        assert "mediadeck" in r.text and "推流节点" in r.text and "搜索/订阅" in r.text
+        assert "mediadeck" in r.text and "/static/app.js" in r.text
+        assert client.get("/static/app.js", headers=_basic()).status_code == 200
+        assert client.get("/api/whoami", headers=_basic()).json()["user"] == "admin"
 
 
 def test_mp_mock_flow() -> None:
