@@ -29,10 +29,6 @@ class Settings(BaseSettings):
     emby_url: str = "http://127.0.0.1:8096"
     emby_api_key: str = ""
 
-    mp_url: str = ""
-    mp_username: str = ""
-    mp_password: str = ""
-    mp_api_token: str = ""
 
     stream_nodes: str = "[]"
 

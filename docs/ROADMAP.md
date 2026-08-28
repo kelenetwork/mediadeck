@@ -15,7 +15,8 @@
 - [x] Emby user management: create/disable/password/policy (invite codes pending)
 
 ## Phase 3 — acquisition shell + review
-- [x] MoviePilot adapter (search/subscribe/download/downloading) behind thin API shim
+- [~] Acquisition shell dropped by owner decision (2026-08-29): downloads stay in the existing external tool
+- [x] Media library overview (libraries, item counts, storage locations)
 - [ ] Identify/scrape review queue (AI verdicts, manual metadata correction)
 - [ ] Notification center with routing rules
 

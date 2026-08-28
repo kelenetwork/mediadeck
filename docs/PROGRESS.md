@@ -4,6 +4,23 @@ Newest entries first. Every working session appends one entry.
 
 ---
 
+## 2026-08-29 (4) — drop acquisition module, add media library page (v0.5.0)
+**Done**
+- Owner decision: download/acquisition management stays out of scope. Removed
+  the MoviePilot adapter, all /api/mp/* routes, its settings fields, env
+  placeholders, tests and the two panel pages that used it.
+- New media library module: EmbyAdapter.libraries() (mock + live via
+  VirtualFolders + per-library item counts), GET /api/emby/libraries, and a
+  媒体库 page with stat cards + library table. Dashboard now shows library
+  counts instead of subscription/download counts.
+- Tests 13/13, ruff clean.
+
+**Next**
+- Fill remaining pages step by step (invites, scheduled tasks, playback
+  reports, mount management) per owner priority.
+
+---
+
 ## 2026-08-29 (3) — panel shell redesign (v0.4.0)
 **Done**
 - Replaced the flat tab page with a proper admin shell: grouped left sidebar

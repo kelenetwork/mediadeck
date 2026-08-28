@@ -14,7 +14,6 @@ from fastapi.staticfiles import StaticFiles
 
 from app.adapters.live import LiveEmby, LiveProbe
 from app.adapters.mock import MockEmby, MockProbe
-from app.adapters.mp import LiveMoviePilot, MockMoviePilot, MPError
 from app.core.config import settings
 from app.modules.imports import ImportManager, JobKind, MockExecutor
 from app.modules.pipeline import MockPipeline, PipelineReader
@@ -51,10 +50,6 @@ async def _startup() -> None:
         app.state.updater = MockUpdater()
     else:
         app.state.updater = Updater(cfg.repo_root, cfg.service_name)
-    if cfg.mediadeck_mock or not cfg.mp_url:
-        app.state.mp = MockMoviePilot()
-    else:
-        app.state.mp = LiveMoviePilot(cfg)
     app.state.scheduler = Scheduler(cfg.nodes() or _mock_nodes(cfg), probe)
 
     async def probe_loop() -> None:
@@ -210,76 +205,15 @@ async def imports_cancel(job_id: str) -> dict[str, bool]:
     return {"cancelled": True}
 
 
-# ---- acquisition (MoviePilot) ----------------------------------------------
-@app.get("/api/mp/media/search", dependencies=[Depends(_auth)])
-async def mp_media_search(keyword: str) -> list[dict[str, Any]]:
-    try:
-        return await app.state.mp.search_media(keyword)
-    except MPError as exc:
-        raise HTTPException(502, str(exc)) from None
-
-
-@app.get("/api/mp/torrents/search", dependencies=[Depends(_auth)])
-async def mp_torrent_search(keyword: str) -> list[dict[str, Any]]:
-    try:
-        return await app.state.mp.search_torrents(keyword)
-    except MPError as exc:
-        raise HTTPException(502, str(exc)) from None
-
-
-@app.get("/api/mp/subscribes", dependencies=[Depends(_auth)])
-async def mp_subscribes() -> list[dict[str, Any]]:
-    try:
-        return await app.state.mp.list_subscribes()
-    except MPError as exc:
-        raise HTTPException(502, str(exc)) from None
-
-
-@app.post("/api/mp/subscribes", dependencies=[Depends(_auth)])
-async def mp_add_subscribe(
-    tmdb_id: int = Body(...),
-    media_type: str = Body(...),
-    season: int | None = Body(None),
-) -> dict[str, Any]:
-    try:
-        return await app.state.mp.add_subscribe(tmdb_id, media_type, season)
-    except MPError as exc:
-        raise HTTPException(502, str(exc)) from None
-
-
-@app.delete("/api/mp/subscribes/{subscribe_id}", dependencies=[Depends(_auth)])
-async def mp_del_subscribe(subscribe_id: int) -> dict[str, bool]:
-    try:
-        if not await app.state.mp.delete_subscribe(subscribe_id):
-            raise HTTPException(404, "unknown subscription")
-    except MPError as exc:
-        raise HTTPException(502, str(exc)) from None
-    return {"deleted": True}
-
-
-@app.post("/api/mp/download", dependencies=[Depends(_auth)])
-async def mp_download(
-    enclosure: str = Body(...),
-    title: str = Body(...),
-) -> dict[str, Any]:
-    try:
-        return await app.state.mp.download_torrent(enclosure, title)
-    except MPError as exc:
-        raise HTTPException(502, str(exc)) from None
-
-
-@app.get("/api/mp/downloading", dependencies=[Depends(_auth)])
-async def mp_downloading() -> list[dict[str, Any]]:
-    try:
-        return await app.state.mp.downloading()
-    except MPError as exc:
-        raise HTTPException(502, str(exc)) from None
-
-
 # ---- emby ------------------------------------------------------------------
 @app.get("/api/emby/users", dependencies=[Depends(_auth)])
 async def emby_users() -> list[dict[str, Any]]:
     return await app.state.emby.list_users()
+
+
+@app.get("/api/emby/libraries", dependencies=[Depends(_auth)])
+async def emby_libraries() -> list[dict[str, Any]]:
+    return await app.state.emby.libraries()
 
 
 @app.get("/api/emby/sessions", dependencies=[Depends(_auth)])

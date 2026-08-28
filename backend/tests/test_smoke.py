@@ -165,21 +165,8 @@ def test_root_serves_panel() -> None:
         assert client.get("/api/whoami", headers=_basic()).json()["user"] == "admin"
 
 
-def test_mp_mock_flow() -> None:
+def test_emby_libraries() -> None:
     with TestClient(app) as client:
-        media = client.get("/api/mp/media/search?keyword=demo", headers=_basic()).json()
-        assert media and media[0]["tmdb_id"] == 12345
-        torrents = client.get("/api/mp/torrents/search?keyword=demo", headers=_basic()).json()
-        assert torrents and torrents[0]["enclosure"] == "mock://torrent/1"
-        sub = client.post("/api/mp/subscribes", headers=_basic(),
-                          json={"tmdb_id": 12345, "media_type": "电视剧", "season": 1}).json()
-        assert sub["ok"]
-        subs = client.get("/api/mp/subscribes", headers=_basic()).json()
-        assert subs and subs[0]["name"] == "Demo Show"
-        assert client.delete("/api/mp/subscribes/1", headers=_basic()).json()["deleted"]
-        assert client.delete("/api/mp/subscribes/999", headers=_basic()).status_code == 404
-        dl = client.post("/api/mp/download", headers=_basic(),
-                         json={"enclosure": "mock://torrent/1", "title": "t"}).json()
-        assert dl["ok"]
-        active = client.get("/api/mp/downloading", headers=_basic()).json()
-        assert active and active[0]["state"] == "downloading"
+        libs = client.get("/api/emby/libraries", headers=_basic()).json()
+        assert libs and libs[0]["name"] == "demo-movies"
+        assert {"name", "type", "items", "locations"} <= set(libs[0])
