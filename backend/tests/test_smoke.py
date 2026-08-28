@@ -795,3 +795,42 @@ def test_original_is_direct_play_without_static_flag() -> None:
     assert is_transcode_request("emby/videos/1/hls/segment1.ts", {}) is True
     assert is_transcode_request("emby/videos/1/manifest.mpd", {}) is True
     assert is_transcode_request("emby/Videos/1/AdditionalParts", {}) is True
+
+
+def test_proxy_mode_answers_204_instead_of_looping() -> None:
+    """Behind a front door, "go to Emby instead" must not be a redirect.
+
+    The proxy rule matches the Emby URL too, so a 302 fallback would come
+    straight back here and the client would loop forever -- turning fail-open
+    into total failure. In proxy mode the panel answers 204 and the proxy
+    serves the origin itself.
+    """
+    with TestClient(app) as client:
+        client.put("/api/settings/playback", headers=_basic(), json={"enabled": True})
+        proxy = {"X-Mediadeck-Proxy": "1"}
+
+        # transcode -> not accelerable -> 204, no Location back to Emby
+        r = client.get("/emby/videos/item42/master.m3u8",
+                       headers={**_play(), **proxy}, follow_redirects=False)
+        assert r.status_code == 204
+        assert "location" not in r.headers
+        assert r.headers["x-mediadeck-fallback"] == "transcode"
+
+        # unauthenticated -> 204 as well, never a signed URL
+        r = client.get("/emby/videos/item42/original.mkv",
+                       headers=proxy, follow_redirects=False)
+        assert r.status_code == 204
+        assert r.headers["x-mediadeck-fallback"] == "unauthorised"
+
+        # accelerable -> still a real 302 to the node
+        r = client.get("/emby/videos/item42/original.mkv",
+                       headers={**_play(), **proxy}, follow_redirects=False)
+        assert r.status_code == 302
+        assert "mock-" in r.headers["location"]
+        assert r.headers["x-mediadeck-node"]
+
+        # without the proxy marker, standalone callers keep the plain redirect
+        r = client.get("/emby/videos/item42/master.m3u8",
+                       headers=_play(), follow_redirects=False)
+        assert r.status_code == 302
+        assert "mock-" not in r.headers["location"]

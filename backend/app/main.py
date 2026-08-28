@@ -7,7 +7,7 @@ import secrets
 from pathlib import Path as FilePath
 from typing import Any
 
-from fastapi import Body, Depends, FastAPI, HTTPException, Request, status
+from fastapi import Body, Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.responses import (
     FileResponse,
     JSONResponse,
@@ -639,9 +639,23 @@ async def emby_video_stream(item_id: str, rest: str, request: Request) -> Redire
         caller_token=caller_token(request.headers, query),
         require_auth=True,
     )
+
+    # Behind a front-door proxy, a "go to Emby instead" answer must not be a
+    # redirect: the proxy matches that URL too, sends it back here, and the
+    # client loops forever -- turning fail-open into total failure. Answer 204
+    # instead so the proxy serves the origin itself and the client never sees
+    # the extra hop. Standalone callers still get the plain redirect.
+    if not decision.redirected and request.headers.get("x-mediadeck-proxy"):
+        return Response(status_code=204, headers={
+            "X-Mediadeck-Fallback": decision.reason,
+        })
+
     if not decision.target:
         raise HTTPException(409, "Emby origin not configured")
-    return RedirectResponse(decision.target, status_code=302)
+    return RedirectResponse(decision.target, status_code=302, headers={
+        "X-Mediadeck-Node": decision.node or "",
+        "X-Mediadeck-Decision": decision.reason,
+    })
 
 
 # Real client traffic uses several shapes for this path. Observed in this
