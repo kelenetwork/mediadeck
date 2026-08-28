@@ -32,6 +32,7 @@ class Settings(BaseSettings):
     mp_url: str = ""
     mp_username: str = ""
     mp_password: str = ""
+    mp_api_token: str = ""
 
     stream_nodes: str = "[]"
 
