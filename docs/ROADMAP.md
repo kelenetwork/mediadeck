@@ -10,8 +10,8 @@
 - [x] Scheduler: probe history + dispatch log
 
 ## Phase 2 — import lanes + user management
-- [ ] Cloud-drive import module (port of existing internal dashboard)
-- [ ] Drive-link import module
+- [x] Cloud-drive import module skeleton (job lifecycle + API; live executor pending)
+- [x] Drive-link import kind (same lifecycle; live executor pending)
 - [x] Emby user management: create/disable/password/policy (invite codes pending)
 
 ## Phase 3 — acquisition shell + review

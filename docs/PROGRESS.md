@@ -4,6 +4,21 @@ Newest entries first. Every working session appends one entry.
 
 ---
 
+## 2026-08-28 (5) — import lane module skeleton
+**Done**
+- `app/modules/imports.py`: unified ImportJob lifecycle (queued/running/done/
+  failed), ImportManager registry with executor delegation, MockExecutor
+  simulating progress. Kinds: cloud-drive, drive-link.
+- Endpoints: POST /api/imports, GET /api/imports (+state filter),
+  GET /api/imports/{id}, POST /api/imports/{id}/cancel.
+- +1 test (9 passing), ruff clean.
+
+**Next**
+- Live executor adapter bridging host-side import workers (sanitized IPC).
+- Invite-code system.
+
+---
+
 ## 2026-08-28 (4) — Emby user management (write ops)
 **Done**
 - EmbyAdapter contract extended: create_user, set_user_disabled,
