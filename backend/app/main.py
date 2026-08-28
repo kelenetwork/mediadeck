@@ -8,17 +8,20 @@ from pathlib import Path as FilePath
 from typing import Any
 
 from fastapi import Body, Depends, FastAPI, HTTPException, status
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 
-from app.adapters.live import LiveEmby, LiveProbe
+from app.adapters.live import LiveEmby, LiveProbe, probe_emby
 from app.adapters.mock import MockEmby, MockProbe
 from app.core.config import settings
+from app.core.errors import ConfigError, NotConfigured, UpstreamError
+from app.core.store import SettingsStore
 from app.modules.imports import ImportManager, JobKind, MockExecutor
 from app.modules.mounts import MockMounts, MountsReader
 from app.modules.pipeline import MockPipeline, PipelineReader
 from app.modules.scheduler import Scheduler
+from app.modules.settings import SettingsService
 from app.modules.storage import MockStorage, StorageManager
 from app.modules.tasks import MockTasks, TasksReader
 from app.modules.updater import MockUpdater, Updater
@@ -45,14 +48,40 @@ def _storage_call(fn: Any, *args: Any, **kwargs: Any) -> Any:
         raise HTTPException(409, str(exc)) from None
 
 
+@app.exception_handler(ConfigError)
+async def _config_error_handler(_: Any, exc: ConfigError) -> JSONResponse:
+    """Invalid operator input: answer with the message the UI should show."""
+    return JSONResponse(status_code=422, content={"detail": str(exc)})
+
+
+@app.exception_handler(NotConfigured)
+async def _not_configured_handler(_: Any, exc: NotConfigured) -> JSONResponse:
+    """An integration has not been connected yet — surfaced as a setup prompt."""
+    return JSONResponse(
+        status_code=409, content={"detail": str(exc), "needs_setup": True}
+    )
+
+
+@app.exception_handler(UpstreamError)
+async def _upstream_error_handler(_: Any, exc: UpstreamError) -> JSONResponse:
+    return JSONResponse(status_code=502, content={"detail": str(exc)})
+
+
 @app.on_event("startup")
 async def _startup() -> None:
     cfg = settings()
+    store = SettingsStore(cfg.settings_file)
+    app.state.store = store
+    app.state.settings_service = SettingsService(store)
+    # First run: migrate .env values into the editable settings document so
+    # existing deployments keep working, then never read them again.
+    app.state.settings_service.bootstrap_from_env(cfg)
+
     if cfg.mediadeck_mock:
         app.state.emby = MockEmby()
         probe = MockProbe()
     else:
-        app.state.emby = LiveEmby(cfg)
+        app.state.emby = LiveEmby(app.state.settings_service.emby_config)
         probe = LiveProbe()
     app.state.pipeline = (
         MockPipeline() if cfg.mediadeck_mock else PipelineReader(cfg.pipeline_snapshot_path)
@@ -69,7 +98,16 @@ async def _startup() -> None:
         app.state.updater = MockUpdater()
     else:
         app.state.updater = Updater(cfg.repo_root, cfg.service_name)
-    app.state.scheduler = Scheduler(cfg.nodes() or _mock_nodes(cfg), probe)
+
+    dispatch = app.state.settings_service.dispatch_config()
+    app.state.scheduler = Scheduler(
+        app.state.settings_service.nodes() or _mock_nodes(cfg),
+        probe,
+        policy=dispatch["policy"],
+        load_threshold=dispatch["load_threshold"],
+    )
+    # Node/policy edits in the UI reconfigure this scheduler in place.
+    app.state.settings_service.bind_scheduler(app.state.scheduler)
 
     async def probe_loop() -> None:
         while True:
@@ -85,8 +123,10 @@ def _mock_nodes(cfg: Any):
     if not cfg.mediadeck_mock:
         return []
     return [
-        StreamNode(name="mock-a", base_url="https://mock-a.example", probe_url="mock://a", weight=1),
-        StreamNode(name="mock-b", base_url="https://mock-b.example", probe_url="mock://b", weight=2),
+        StreamNode(name="mock-a", base_url="https://mock-a.example",
+                   probe_url="mock://a", capacity=20),
+        StreamNode(name="mock-b", base_url="https://mock-b.example",
+                   probe_url="mock://b", capacity=40),
     ]
 
 
@@ -109,10 +149,74 @@ async def healthz() -> dict[str, str]:
     return {"status": "ok"}
 
 
+# ---- settings --------------------------------------------------------------
+@app.get("/api/settings", dependencies=[Depends(_auth)])
+async def settings_overview() -> dict[str, Any]:
+    """Everything the settings page renders, in one round trip."""
+    service = app.state.settings_service
+    return {
+        "mock_mode": settings().mediadeck_mock,
+        "emby": service.emby_public(),
+        "dispatch": service.dispatch_config(),
+        "nodes": service.nodes_public(),
+    }
+
+
+@app.get("/api/settings/emby", dependencies=[Depends(_auth)])
+async def settings_emby_get() -> dict[str, Any]:
+    return app.state.settings_service.emby_public()
+
+
+@app.put("/api/settings/emby", dependencies=[Depends(_auth)])
+async def settings_emby_save(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:  # noqa: B008
+    return app.state.settings_service.save_emby(payload)
+
+
+@app.post("/api/settings/emby/test", dependencies=[Depends(_auth)])
+async def settings_emby_test(payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:  # noqa: B008
+    """Validate a connection before saving it, so setup is not trial and error."""
+    if settings().mediadeck_mock:
+        return await app.state.emby.system_info()
+    url, api_key, timeout, verify = app.state.settings_service.resolve_probe_target(payload)
+    return await probe_emby(url, api_key, timeout, verify)
+
+
+@app.get("/api/settings/dispatch", dependencies=[Depends(_auth)])
+async def settings_dispatch_get() -> dict[str, Any]:
+    return app.state.settings_service.dispatch_config()
+
+
+@app.put("/api/settings/dispatch", dependencies=[Depends(_auth)])
+async def settings_dispatch_save(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:  # noqa: B008
+    return app.state.settings_service.save_dispatch(payload)
+
+
 # ---- streaming nodes -------------------------------------------------------
 @app.get("/api/nodes", dependencies=[Depends(_auth)])
 async def nodes() -> list[dict[str, Any]]:
     return app.state.scheduler.snapshot()
+
+
+@app.post("/api/nodes", dependencies=[Depends(_auth)])
+async def create_node(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:  # noqa: B008
+    return app.state.settings_service.add_node(payload)
+
+
+@app.put("/api/nodes/{name}", dependencies=[Depends(_auth)])
+async def update_node(name: str, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:  # noqa: B008
+    try:
+        return app.state.settings_service.update_node(name, payload)
+    except KeyError:
+        raise HTTPException(404, "unknown node") from None
+
+
+@app.delete("/api/nodes/{name}", dependencies=[Depends(_auth)])
+async def delete_node(name: str) -> dict[str, bool]:
+    try:
+        app.state.settings_service.delete_node(name)
+    except KeyError:
+        raise HTTPException(404, "unknown node") from None
+    return {"deleted": True}
 
 
 @app.post("/api/nodes/{name}/disable", dependencies=[Depends(_auth)])
@@ -143,13 +247,18 @@ async def dispatch_log(limit: int = 100) -> list[dict[str, Any]]:
 
 
 @app.get("/api/dispatch/pick", dependencies=[Depends(_auth)])
-async def dispatch_pick() -> dict[str, Any]:
-    """Dry-run of the 302 target selection (no redirect issued)."""
-    chosen = app.state.scheduler.pick(record=False)
+async def dispatch_pick(path: str = "") -> dict[str, Any]:
+    """Dry-run of the 302 target selection (no redirect issued).
+
+    Accepts a path so an operator can verify affinity: the same path must
+    keep resolving to the same node while that node stays healthy.
+    """
+    chosen = app.state.scheduler.pick(record=False, context=path)
     if not chosen:
         raise HTTPException(503, "no available streaming node")
     return {"node": chosen.node.name, "base_url": chosen.node.base_url,
-            "normalized_load": chosen.normalized_load()}
+            "utilisation": round(chosen.utilisation(), 3),
+            "policy": app.state.scheduler.policy}
 
 
 @app.get("/stream/{path:path}")

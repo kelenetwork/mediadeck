@@ -14,6 +14,15 @@ class MockEmby:
         }
         self._next = 3
 
+    async def system_info(self) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "server_name": "demo-emby",
+            "version": "4.8.0.0",
+            "operating_system": "Linux",
+            "id": "mock-server",
+        }
+
     async def list_users(self) -> list[dict[str, Any]]:
         return list(self._users.values())
 
@@ -23,6 +32,9 @@ class MockEmby:
         user = {"Id": uid, "Name": name, "Policy": {"IsDisabled": False}}
         self._users[uid] = user
         return user
+
+    async def delete_user(self, user_id: str) -> bool:
+        return self._users.pop(user_id, None) is not None
 
     async def set_user_disabled(self, user_id: str, disabled: bool) -> bool:
         user = self._users.get(user_id)

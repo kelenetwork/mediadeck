@@ -264,3 +264,107 @@ def test_storage_mock() -> None:
             },
         )
         assert bad_target.status_code == 422
+
+
+# ---- settings center -------------------------------------------------------
+def test_settings_overview_and_masking() -> None:
+    with TestClient(app) as client:
+        overview = client.get("/api/settings", headers=_basic()).json()
+        assert overview["mock_mode"] is True
+        assert {"emby", "dispatch", "nodes"} <= set(overview)
+        # secrets are never returned in cleartext
+        assert "api_key" not in overview["emby"]
+        assert overview["dispatch"]["policy"] == "affinity"
+
+
+def test_settings_emby_save_and_secret_retention() -> None:
+    with TestClient(app) as client:
+        saved = client.put("/api/settings/emby", headers=_basic(), json={
+            "enabled": True, "url": "http://emby.test:8096/",
+            "api_key": "supersecretkey123456", "timeout_seconds": 20,
+        })
+        assert saved.status_code == 200
+        body = saved.json()
+        assert body["url"] == "http://emby.test:8096"      # trailing slash normalised
+        assert body["api_key_set"] is True
+        assert body["api_key_masked"] == "supe********3456"
+        assert "supersecretkey123456" not in saved.text     # never leaks
+
+        # editing the URL without resubmitting the key keeps the stored secret
+        again = client.put("/api/settings/emby", headers=_basic(), json={
+            "url": "http://emby.test:9096", "api_key": "__KEEP__",
+        }).json()
+        assert again["api_key_set"] is True
+        assert again["url"] == "http://emby.test:9096"
+
+        # settings survive as a persisted document
+        assert client.get("/api/settings/emby", headers=_basic()).json()["api_key_set"]
+
+
+def test_settings_emby_validation() -> None:
+    with TestClient(app) as client:
+        bad_url = client.put("/api/settings/emby", headers=_basic(),
+                             json={"url": "emby.test:8096", "api_key": "k"})
+        assert bad_url.status_code == 422
+        assert "http" in bad_url.json()["detail"]
+        assert client.put("/api/settings/emby", headers=_basic(),
+                          json={"url": "", "api_key": "k"}).status_code == 422
+        # enabling without a key is rejected rather than silently half-configured
+        assert client.put("/api/settings/emby", headers=_basic(), json={
+            "enabled": True, "url": "http://emby.test:8096", "api_key": "",
+        }).status_code == 422
+        assert client.put("/api/settings/emby", headers=_basic(), json={
+            "url": "http://emby.test:8096", "api_key": "k", "timeout_seconds": 999,
+        }).status_code == 422
+
+
+def test_settings_emby_test_connection() -> None:
+    with TestClient(app) as client:
+        r = client.post("/api/settings/emby/test", headers=_basic(), json={})
+        assert r.status_code == 200 and r.json()["ok"] is True
+        assert r.json()["server_name"] == "demo-emby"
+
+
+def test_node_crud_reconfigures_scheduler() -> None:
+    with TestClient(app) as client:
+        created = client.post("/api/nodes", headers=_basic(), json={
+            "name": "edge-1", "base_url": "https://edge1.test",
+            "probe_url": "http://10.0.0.9:9800/load", "capacity": 30,
+        })
+        assert created.status_code == 200 and created.json()["capacity"] == 30
+        names = {n["name"] for n in client.get("/api/nodes", headers=_basic()).json()}
+        assert "edge-1" in names          # live scheduler picked it up, no restart
+
+        updated = client.put("/api/nodes/edge-1", headers=_basic(),
+                             json={"capacity": 50}).json()
+        assert updated["capacity"] == 50 and updated["base_url"] == "https://edge1.test"
+
+        assert client.post("/api/nodes", headers=_basic(), json={
+            "name": "edge-1", "base_url": "https://x.test",
+            "probe_url": "http://x.test/load"}).status_code == 422   # duplicate
+        assert client.post("/api/nodes", headers=_basic(), json={
+            "name": "bad name!", "base_url": "https://x.test",
+            "probe_url": "http://x.test/load"}).status_code == 422
+        assert client.post("/api/nodes", headers=_basic(), json={
+            "name": "edge-2", "base_url": "ftp://x.test",
+            "probe_url": "http://x.test/load"}).status_code == 422
+        assert client.put("/api/nodes/ghost", headers=_basic(),
+                          json={"capacity": 20}).status_code == 404
+
+        assert client.delete("/api/nodes/edge-1", headers=_basic()).json()["deleted"]
+        names = {n["name"] for n in client.get("/api/nodes", headers=_basic()).json()}
+        assert "edge-1" not in names
+        assert client.delete("/api/nodes/edge-1", headers=_basic()).status_code == 404
+
+
+def test_dispatch_policy_switch() -> None:
+    with TestClient(app) as client:
+        saved = client.put("/api/settings/dispatch", headers=_basic(),
+                           json={"policy": "least-load", "load_threshold": 0.5}).json()
+        assert saved == {"policy": "least-load", "load_threshold": 0.5}
+        pick = client.get("/api/dispatch/pick?path=a/b.mkv", headers=_basic()).json()
+        assert pick["policy"] == "least-load"
+        assert client.put("/api/settings/dispatch", headers=_basic(),
+                          json={"policy": "random"}).status_code == 422
+        assert client.put("/api/settings/dispatch", headers=_basic(),
+                          json={"policy": "affinity", "load_threshold": 0}).status_code == 422

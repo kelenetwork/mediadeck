@@ -1,16 +1,35 @@
 """Load-aware streaming node scheduler (302 dispatch core).
 
-Selection: among enabled+healthy nodes, pick the one with the lowest
-normalized load = active_streams / weight.  Ties broken by egress headroom.
+Two selection policies, chosen by the operator at runtime:
+
+``least-load``
+    Pick the enabled+healthy node with the lowest utilisation
+    (``active_streams / capacity``).  Simple, but with multiple nodes the same
+    title gets served from different nodes on every request, so each node
+    pulls and caches its own copy of the file from the origin.
+
+``affinity`` (default)
+    Hash the requested path onto the ring of healthy nodes so a given file is
+    always served by the same node.  That node caches it once; repeat viewers
+    hit a warm cache instead of re-pulling tens of GB from the origin.  If the
+    preferred node is overloaded (utilisation above ``load_threshold``) or
+    unhealthy, the request walks the ring to the next candidate, so affinity
+    never wins over availability.
+
+Popular titles distribute naturally across the ring, so load stays balanced
+without giving up cache locality.
 """
 from __future__ import annotations
 
+import hashlib
 import time
 from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
 from app.core.config import StreamNode
+
+POLICIES = ("affinity", "least-load")
 
 
 @dataclass
@@ -23,9 +42,14 @@ class NodeState:
     consecutive_failures: int = 0
     manually_disabled: bool = False
 
-    def normalized_load(self) -> float:
-        w = max(self.node.weight, 0.01)
-        return self.active_streams / w
+    def utilisation(self) -> float:
+        """Fraction of this node's capacity currently in use (0.0 - 1.0+).
+
+        Absolute, not relative: 0.8 means "80% full" on a 20-stream node and
+        on a 500-stream node alike, so one threshold works for a mixed fleet.
+        """
+        capacity = max(self.node.capacity, 1.0)
+        return self.active_streams / capacity
 
     def available(self) -> bool:
         return (
@@ -40,14 +64,57 @@ class Scheduler:
     HISTORY_MAX = 720      # probe snapshots kept per node (~3h at 15s interval)
     DISPATCH_MAX = 1000    # recent dispatch decisions kept
 
-    def __init__(self, nodes: list[StreamNode], probe: Any) -> None:
-        self._states: dict[str, NodeState] = {n.name: NodeState(node=n) for n in nodes}
+    def __init__(
+        self,
+        nodes: list[StreamNode],
+        probe: Any,
+        policy: str = "affinity",
+        load_threshold: float = 0.8,
+    ) -> None:
         self._probe = probe
-        self._history: dict[str, deque[dict[str, Any]]] = {
-            n.name: deque(maxlen=self.HISTORY_MAX) for n in nodes
-        }
+        self._policy = policy if policy in POLICIES else "affinity"
+        self._load_threshold = load_threshold
+        self._states: dict[str, NodeState] = {}
+        self._history: dict[str, deque[dict[str, Any]]] = {}
         self._dispatch_log: deque[dict[str, Any]] = deque(maxlen=self.DISPATCH_MAX)
+        self.reconfigure(nodes)
 
+    # -- runtime reconfiguration --------------------------------------------
+    def reconfigure(self, nodes: list[StreamNode]) -> None:
+        """Apply a new node list without dropping live probe state.
+
+        Called whenever the operator edits nodes in the UI, so changes take
+        effect on the next dispatch instead of requiring a restart.
+        """
+        seen: set[str] = set()
+        for node in nodes:
+            seen.add(node.name)
+            existing = self._states.get(node.name)
+            if existing:
+                existing.node = node        # keep probe history/health
+            else:
+                self._states[node.name] = NodeState(node=node)
+                self._history[node.name] = deque(maxlen=self.HISTORY_MAX)
+        for name in list(self._states):
+            if name not in seen:
+                self._states.pop(name, None)
+                self._history.pop(name, None)
+
+    def set_policy(self, policy: str, load_threshold: float | None = None) -> None:
+        if policy in POLICIES:
+            self._policy = policy
+        if load_threshold is not None:
+            self._load_threshold = max(0.0, float(load_threshold))
+
+    @property
+    def policy(self) -> str:
+        return self._policy
+
+    @property
+    def load_threshold(self) -> float:
+        return self._load_threshold
+
+    # -- probing -------------------------------------------------------------
     async def refresh(self) -> None:
         for st in self._states.values():
             data = await self._probe.load(st.node.probe_url)
@@ -67,21 +134,57 @@ class Scheduler:
                 "egress_mbps": st.egress_mbps if st.ok else None,
             })
 
+    # -- selection -----------------------------------------------------------
+    @staticmethod
+    def _ring_key(path: str, node_name: str) -> str:
+        return hashlib.sha256(f"{path}\x00{node_name}".encode()).hexdigest()
+
+    def _affinity_order(self, path: str, candidates: list[NodeState]) -> list[NodeState]:
+        """Rendezvous (highest-random-weight) hashing.
+
+        Unlike a modulo ring, adding or removing a node only remaps the files
+        that belonged to it — everything else keeps its current node, so cache
+        churn on topology changes stays proportional to the change.
+        """
+        return sorted(
+            candidates,
+            key=lambda s: self._ring_key(path, s.node.name),
+            reverse=True,
+        )
+
     def pick(self, record: bool = True, context: str = "") -> NodeState | None:
         candidates = [s for s in self._states.values() if s.available()]
-        chosen = None
+        chosen: NodeState | None = None
+        reason = "none-available"
+
         if candidates:
-            chosen = min(candidates, key=lambda s: (s.normalized_load(), s.egress_mbps))
+            if self._policy == "affinity" and context:
+                ordered = self._affinity_order(context, candidates)
+                for state in ordered:
+                    if state.utilisation() <= self._load_threshold:
+                        chosen, reason = state, "affinity"
+                        break
+                if chosen is None:
+                    # Every preferred node is over threshold: availability wins.
+                    chosen = min(candidates, key=lambda s: (s.utilisation(), s.egress_mbps))
+                    reason = "affinity-overflow"
+            else:
+                chosen = min(candidates, key=lambda s: (s.utilisation(), s.egress_mbps))
+                reason = "least-load"
+
         if record:
             self._dispatch_log.append({
                 "ts": time.time(),
                 "node": chosen.node.name if chosen else None,
-                "normalized_load": chosen.normalized_load() if chosen else None,
+                "utilisation": round(chosen.utilisation(), 3) if chosen else None,
                 "candidates": len(candidates),
+                "policy": self._policy,
+                "reason": reason,
                 "context": context[:200],
             })
         return chosen
 
+    # -- introspection -------------------------------------------------------
     def history(self, name: str, limit: int = 240) -> list[dict[str, Any]]:
         entries = self._history.get(name)
         if entries is None:
@@ -103,13 +206,15 @@ class Scheduler:
             {
                 "name": s.node.name,
                 "base_url": s.node.base_url,
-                "weight": s.node.weight,
+                "probe_url": s.node.probe_url,
+                "capacity": s.node.capacity,
+                "enabled": s.node.enabled,
                 "ok": s.ok,
                 "available": s.available(),
                 "manually_disabled": s.manually_disabled,
                 "active_streams": s.active_streams,
                 "egress_mbps": s.egress_mbps,
-                "normalized_load": round(s.normalized_load(), 2),
+                "utilisation": round(s.utilisation(), 3),
                 "last_probe_ts": s.last_probe_ts,
             }
             for s in self._states.values()

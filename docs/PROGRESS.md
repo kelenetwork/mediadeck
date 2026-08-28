@@ -185,6 +185,52 @@ Newest entries first. Every working session appends one entry.
 
 ---
 
+## 2026-08-29 — settings center + affinity dispatch
+**Done**
+- `app/core/store.py`: JSON-backed runtime settings document (atomic write,
+  mode 600, gitignored data dir). Operator config no longer lives in `.env`.
+- `app/modules/settings.py`: settings service — Emby connection, dispatch
+  policy and streaming nodes are all editable via API/UI and applied to the
+  running process immediately (scheduler is reconfigured in place, no restart).
+  API keys are returned masked only; a `__KEEP__` sentinel lets the operator
+  edit a URL without re-typing the secret.
+- `LiveEmby` now resolves its connection per call from the settings store
+  instead of frozen env vars; added `system_info()` + standalone `probe_emby()`
+  so the UI can test a connection before saving it.
+- Typed domain errors (`ConfigError` / `NotConfigured` / `UpstreamError`) with
+  FastAPI handlers -> 422 / 409+needs_setup / 502, so the UI can distinguish
+  "you typed something wrong" from "not connected yet" from "Emby is down".
+- Scheduler: added `affinity` policy (rendezvous hashing) alongside
+  `least-load`. Same path always resolves to the same node, so a title is
+  cached once instead of pulled from origin by every node; falls through to the
+  next candidate when the preferred node is unhealthy or above the utilisation
+  threshold. Dispatch log records policy + reason.
+- **Fixed a real modelling bug found during verification**: the old `weight`
+  field made "normalized load" an absolute stream count, so comparing it to a
+  0-1 threshold always overflowed and every request fell back to least-load
+  (60 distinct files all landed on one node). Replaced `weight` with absolute
+  `capacity`; load is now `active_streams / capacity`, so one threshold is
+  meaningful across a heterogeneous fleet.
+- Panel: new 系统设置 page (Emby connect + test, dispatch policy, node summary);
+  node page gained add/edit-capacity/delete and shows utilisation %.
+- Tests isolated per-test via `conftest.py` (own data dir), +6 tests (22 total),
+  ruff clean.
+
+**Verified**
+- Live mock instance: same path -> same node 20/20; 60 distinct paths spread
+  19/22/19 across three nodes. Secret persisted with mode 600, never returned
+  in cleartext; URL-only edit retains the stored key.
+
+**Next**
+- Node agent config distribution (push rclone/mount config from the panel).
+- Emby PlaybackInfo middleware so real playback uses the 302 scheduler.
+
+**Open questions**
+- Panel auth is still a single HTTP-Basic admin; multi-operator accounts and
+  audit logging are needed before this is commercially usable.
+
+---
+
 ## 2026-08-28 (3) — scheduler dispatch log + probe history
 **Done**
 - Scheduler keeps per-node probe history (deque, ~3h at 15s interval) and a

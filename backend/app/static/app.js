@@ -22,9 +22,14 @@ const NAV = [
     { id: 'tasks', icon: '⏱', label: '调度中心', sub: '定时任务运行状态与失败追踪' },
   ]},
   { group: '系统管理', items: [
+    { id: 'settings', icon: '⚙', label: '系统设置', sub: '对接 Emby、调度策略与节点配置' },
     { id: 'update', icon: '⟳', label: '版本更新', sub: '检查并应用新版本' },
   ]},
 ];
+
+/* Sentinel understood by the backend as "keep the stored secret". Lets the
+   operator edit a URL without re-typing the API key. */
+const SECRET_KEEP = '__KEEP__';
 
 const PAGES = {};
 
@@ -265,35 +270,83 @@ async function resetPw(id, name) {
 }
 
 PAGES.nodes = async () => {
-  const [ns, log] = await Promise.all([
+  const [ns, log, dispatch] = await Promise.all([
     api('/api/nodes').catch(() => []),
     api('/api/dispatch/log?limit=20').catch(() => []),
+    api('/api/settings/dispatch').catch(() => ({ policy: '-', load_threshold: 0 })),
   ]);
   const online = ns.filter((n) => n.available).length;
   const streams = ns.reduce((a, n) => a + (n.active_streams || 0), 0);
   const egress = ns.reduce((a, n) => a + (n.egress_mbps || 0), 0);
+  const policyLabel = dispatch.policy === 'affinity' ? '文件亲和' : '最低负载';
   $('#view').innerHTML = `
     <div class="stat-grid">
       ${stat('⛁', `${online} / ${ns.length}`, '在线节点', '可用于分发')}
       ${stat('▶', streams, '活跃流', '所有节点合计')}
       ${stat('⇅', egress.toFixed(1), '出口 Mbps', '实时带宽')}
+      ${stat('⚖', policyLabel, '调度策略', dispatch.policy === 'affinity'
+        ? `占用率阈值 ${Math.round(dispatch.load_threshold * 100)}%` : '按容量占用率择优')}
     </div>
-    ${tableCard('推流节点', '按归一化负载分发', ['节点', '状态', '活跃流', '出口', '权重', '负载', ''],
+    ${card('新增节点', '节点上需运行 loadprobe 探针',
+      `<div class="card-body"><div class="toolbar">
+        <input id="nd-name" placeholder="节点名称" style="width:140px">
+        <input id="nd-base" placeholder="对外地址 https://node.example.com" style="flex:1;min-width:220px">
+        <input id="nd-probe" placeholder="探针地址 http://10.0.0.2:9800/load" style="flex:1;min-width:220px">
+        <input id="nd-capacity" type="number" step="1" min="1" value="100" placeholder="并发容量" style="width:110px">
+        <button class="btn primary" id="nd-go">添加</button>
+      </div></div>`)}
+    ${tableCard('推流节点', '按容量占用率分发', ['节点', '状态', '活跃流', '出口', '占用率', ''],
       ns.map((n) => `<tr><td>${esc(n.name)}</td>
         <td><span class="tag ${n.available ? 'ok' : 'bad'}">${n.available ? '可用' : (n.manually_disabled ? '已下线' : '不健康')}</span></td>
-        <td>${n.active_streams}</td><td>${n.egress_mbps} Mbps</td><td>${n.weight}</td><td>${n.normalized_load}</td>
+        <td>${n.active_streams} / ${esc(n.capacity)}</td><td>${n.egress_mbps} Mbps</td>
+        <td>${Math.round((n.utilisation || 0) * 100)}%</td>
         <td><button class="btn sm ${n.manually_disabled ? '' : 'danger'}"
             onclick="nodeCtl('${esc(n.name)}','${n.manually_disabled ? 'enable' : 'disable'}')">
-            ${n.manually_disabled ? '上线' : '下线'}</button></td></tr>`).join(''))}
-    ${tableCard('最近分发', '302 调度记录', ['时间', '节点', '负载', '候选', '请求'],
+            ${n.manually_disabled ? '上线' : '下线'}</button>
+            <button class="btn sm" onclick="editNodeCapacity('${esc(n.name)}',${n.capacity})">改容量</button>
+            <button class="btn sm danger" onclick="deleteNode('${esc(n.name)}')">删除</button></td></tr>`).join(''))}
+    ${tableCard('最近分发', '302 调度记录', ['时间', '节点', '负载', '候选', '策略', '请求'],
       log.slice().reverse().map((e) => `<tr><td>${new Date(e.ts * 1000).toLocaleTimeString()}</td>
-        <td>${esc(e.node || '-')}</td><td>${esc(e.normalized_load ?? '-')}</td>
-        <td>${esc(e.candidates)}</td><td>${esc((e.context || '').slice(0, 48))}</td></tr>`).join(''))}`;
+        <td>${esc(e.node || '-')}</td>
+        <td>${e.utilisation == null ? '-' : Math.round(e.utilisation * 100) + '%'}</td>
+        <td>${esc(e.candidates)}</td>
+        <td><span class="tag idle">${esc(e.reason || e.policy || '-')}</span></td>
+        <td>${esc((e.context || '').slice(0, 48))}</td></tr>`).join(''))}`;
+  $('#nd-go').onclick = addNode;
 };
 async function nodeCtl(name, action) {
   try { await api(`/api/nodes/${encodeURIComponent(name)}/${action}`, { method: 'POST' });
     toast(action === 'disable' ? '已下线' : '已上线'); renderPage('nodes');
   } catch (e) { toast('操作失败: ' + e.message, 1); }
+}
+async function addNode() {
+  const body = {
+    name: $('#nd-name').value.trim(),
+    base_url: $('#nd-base').value.trim(),
+    probe_url: $('#nd-probe').value.trim(),
+    capacity: parseFloat($('#nd-capacity').value) || 100,
+  };
+  if (!body.name || !body.base_url || !body.probe_url) return toast('请填写完整节点信息', 1);
+  try {
+    await api('/api/nodes', { method: 'POST', body: JSON.stringify(body) });
+    toast('节点已添加'); renderPage('nodes');
+  } catch (e) { toast('添加失败: ' + e.message, 1); }
+}
+async function editNodeCapacity(name, current) {
+  const value = prompt(`设置 ${name} 的并发容量（该节点最多同时承载多少路播放）`, current);
+  if (value === null) return;
+  try {
+    await api(`/api/nodes/${encodeURIComponent(name)}`, {
+      method: 'PUT', body: JSON.stringify({ capacity: parseFloat(value) }) });
+    toast('容量已更新'); renderPage('nodes');
+  } catch (e) { toast('更新失败: ' + e.message, 1); }
+}
+async function deleteNode(name) {
+  if (!confirm(`确认删除节点 ${name}？该节点将不再参与播放分发。`)) return;
+  try {
+    await api(`/api/nodes/${encodeURIComponent(name)}`, { method: 'DELETE' });
+    toast('节点已删除'); renderPage('nodes');
+  } catch (e) { toast('删除失败: ' + e.message, 1); }
 }
 
 PAGES.pipeline = async () => {
@@ -396,6 +449,100 @@ PAGES.tasks = async () => {
            <span class="tag ${a.level === 'warn' ? 'warn' : 'bad'}">${esc(a.level)}</span></div>`).join('')}</div>`
       : `<div class="empty">无告警</div>`)}`;
 };
+
+PAGES.settings = async () => {
+  const s = await api('/api/settings').catch(() => null);
+  if (!s) { $('#view').innerHTML = `<div class="card"><div class="empty">设置加载失败</div></div>`; return; }
+  const e = s.emby, d = s.dispatch;
+  const connected = e.enabled && e.api_key_set;
+  $('#view').innerHTML = `
+    ${s.mock_mode ? card('演示模式', '当前以 MEDIADECK_MOCK=1 运行',
+      `<div class="card-body"><div class="muted">所有数据均为模拟值，保存的配置不会连接真实服务。</div></div>`) : ''}
+    ${card('Emby 对接', connected ? '已连接' : '尚未连接 — 面板的用户管理与媒体库依赖此配置',
+      `<div class="card-body">
+        <div class="form-row"><label>服务器地址</label>
+          <input id="em-url" value="${esc(e.url)}" placeholder="http://127.0.0.1:8096"></div>
+        <div class="form-row"><label>API Key</label>
+          <input id="em-key" type="password" placeholder="${e.api_key_set ? esc(e.api_key_masked) + '（留空则不修改）' : '在 Emby 后台「高级 → API 密钥」创建'}"></div>
+        <div class="form-row"><label>请求超时</label>
+          <input id="em-timeout" type="number" min="1" max="120" value="${esc(e.timeout_seconds)}" style="width:110px"> <span class="muted">秒</span></div>
+        <div class="form-row"><label>启用集成</label>
+          <input id="em-enabled" type="checkbox" ${e.enabled ? 'checked' : ''}>
+          <span class="muted">关闭后面板不再调用 Emby</span></div>
+        <div class="form-row"><label>校验证书</label>
+          <input id="em-verify" type="checkbox" ${e.verify_ssl ? 'checked' : ''}>
+          <span class="muted">自签名证书请取消勾选</span></div>
+        <div class="toolbar">
+          <button class="btn" id="em-test">测试连接</button>
+          <button class="btn primary" id="em-save">保存</button>
+          <span id="em-result" class="muted">${connected ? '已配置' : '未配置'}</span>
+        </div>
+      </div>`)}
+    ${card('播放调度策略', '决定同一个文件由哪个推流节点承载',
+      `<div class="card-body">
+        <div class="form-row"><label>策略</label>
+          <select id="dp-policy" style="min-width:220px">
+            <option value="affinity" ${d.policy === 'affinity' ? 'selected' : ''}>文件亲和（推荐）</option>
+            <option value="least-load" ${d.policy === 'least-load' ? 'selected' : ''}>最低负载</option>
+          </select></div>
+        <div class="form-row"><label>负载阈值</label>
+          <input id="dp-threshold" type="number" step="0.05" min="0.05" max="1" value="${esc(d.load_threshold)}" style="width:110px">
+          <span class="muted">节点容量占用率超过此值时改派其他节点（0.8 = 80%）</span></div>
+        <div class="muted" style="margin:6px 0 10px">
+          文件亲和：同一个文件固定由同一节点服务，只需缓存一份，回源流量不翻倍；
+          节点故障或过载时自动顺延。最低负载：每次都挑当前最闲的节点，会导致多节点重复缓存同一文件。
+        </div>
+        <div class="toolbar"><button class="btn primary" id="dp-save">保存策略</button>
+          <span id="dp-result" class="muted"></span></div>
+      </div>`)}
+    ${tableCard('推流节点', `${s.nodes.length} 个已配置 · 在「节点管理」中新增与监控`,
+      ['名称', '对外地址', '探针地址', '并发容量', '状态'],
+      s.nodes.map((n) => `<tr><td>${esc(n.name)}</td><td>${esc(n.base_url)}</td>
+        <td>${esc(n.probe_url)}</td><td>${esc(n.capacity)}</td>
+        <td><span class="tag ${n.enabled ? 'ok' : 'idle'}">${n.enabled ? '启用' : '停用'}</span></td></tr>`).join(''))}`;
+  $('#em-save').onclick = saveEmby;
+  $('#em-test').onclick = testEmby;
+  $('#dp-save').onclick = saveDispatch;
+};
+function embyPayload() {
+  const key = $('#em-key').value;
+  return {
+    url: $('#em-url').value.trim(),
+    // Empty field means "keep what is stored", so editing the URL alone is safe.
+    api_key: key === '' ? SECRET_KEEP : key,
+    timeout_seconds: parseFloat($('#em-timeout').value) || 15,
+    enabled: $('#em-enabled').checked,
+    verify_ssl: $('#em-verify').checked,
+  };
+}
+async function saveEmby() {
+  try {
+    await api('/api/settings/emby', { method: 'PUT', body: JSON.stringify(embyPayload()) });
+    toast('Emby 配置已保存，立即生效');
+    renderPage('settings');
+  } catch (e) { toast('保存失败: ' + e.message, 1); }
+}
+async function testEmby() {
+  const el = $('#em-result');
+  el.textContent = '正在测试…';
+  try {
+    const r = await api('/api/settings/emby/test', {
+      method: 'POST', body: JSON.stringify(embyPayload()) });
+    el.innerHTML = `<span class="tag ok">连接成功</span> ${esc(r.server_name || '')} ${esc(r.version || '')}`;
+  } catch (e) {
+    el.innerHTML = `<span class="tag bad">连接失败</span> ${esc(e.message)}`;
+  }
+}
+async function saveDispatch() {
+  try {
+    await api('/api/settings/dispatch', { method: 'PUT', body: JSON.stringify({
+      policy: $('#dp-policy').value,
+      load_threshold: parseFloat($('#dp-threshold').value) || 0.8,
+    }) });
+    $('#dp-result').innerHTML = '<span class="tag ok">已保存</span>';
+    toast('调度策略已生效');
+  } catch (e) { toast('保存失败: ' + e.message, 1); }
+}
 
 PAGES.update = async () => {
   const v = await api('/api/update/version').catch(() => ({ version: '?', commit: '?' }));
