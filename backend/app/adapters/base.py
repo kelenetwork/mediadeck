@@ -1,0 +1,17 @@
+"""Adapter contracts. Every external system is reachable only through one of
+these interfaces, and every interface has a mock implementation so the whole
+panel runs with zero credentials (MEDIADECK_MOCK=1)."""
+from __future__ import annotations
+
+from typing import Any, Protocol
+
+
+class EmbyAdapter(Protocol):
+    async def list_users(self) -> list[dict[str, Any]]: ...
+    async def active_sessions(self) -> list[dict[str, Any]]: ...
+
+
+class NodeProbe(Protocol):
+    async def load(self, probe_url: str) -> dict[str, Any]:
+        """Return {"active_streams": int, "egress_mbps": float, "ok": bool}."""
+        ...

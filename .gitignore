@@ -1,0 +1,16 @@
+# --- secrets / local data: NEVER commit ---
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+config.local.*
+data/
+*.sqlite3
+*.db
+__pycache__/
+*.pyc
+.venv/
+node_modules/
+dist/
+.pytest_cache/

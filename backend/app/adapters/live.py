@@ -1,0 +1,55 @@
+"""Live adapters. All endpoints/credentials come from Settings (env)."""
+from __future__ import annotations
+
+from typing import Any
+
+import httpx
+
+from app.core.config import Settings
+
+
+class LiveEmby:
+    def __init__(self, cfg: Settings) -> None:
+        self._base = cfg.emby_url.rstrip("/")
+        self._headers = {"X-Emby-Token": cfg.emby_api_key}
+
+    async def list_users(self) -> list[dict[str, Any]]:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(f"{self._base}/emby/Users", headers=self._headers)
+            r.raise_for_status()
+            return r.json()
+
+    async def active_sessions(self) -> list[dict[str, Any]]:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(f"{self._base}/emby/Sessions", headers=self._headers)
+            r.raise_for_status()
+            out = []
+            for s in r.json():
+                item = s.get("NowPlayingItem")
+                if not item:
+                    continue
+                bitrate = (s.get("TranscodingInfo") or {}).get("Bitrate") or item.get("Bitrate") or 0
+                out.append({
+                    "UserName": s.get("UserName"),
+                    "Client": s.get("Client"),
+                    "PlayMethod": (s.get("PlayState") or {}).get("PlayMethod"),
+                    "BitrateMbps": round(bitrate / 1e6, 1),
+                    "Item": item.get("Name"),
+                })
+            return out
+
+
+class LiveProbe:
+    async def load(self, probe_url: str) -> dict[str, Any]:
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                r = await client.get(probe_url)
+                r.raise_for_status()
+                data = r.json()
+                return {
+                    "ok": True,
+                    "active_streams": int(data.get("active_streams", 0)),
+                    "egress_mbps": float(data.get("egress_mbps", 0.0)),
+                }
+        except Exception:
+            return {"ok": False, "active_streams": 0, "egress_mbps": 0.0}
