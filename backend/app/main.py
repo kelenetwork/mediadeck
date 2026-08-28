@@ -13,6 +13,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from app.adapters.live import LiveEmby, LiveProbe
 from app.adapters.mock import MockEmby, MockProbe
 from app.core.config import settings
+from app.modules.imports import ImportManager, JobKind, MockExecutor
 from app.modules.pipeline import MockPipeline, PipelineReader
 from app.modules.scheduler import Scheduler
 
@@ -41,6 +42,7 @@ async def _startup() -> None:
     app.state.pipeline = (
         MockPipeline() if cfg.mediadeck_mock else PipelineReader(cfg.pipeline_snapshot_path)
     )
+    app.state.imports = ImportManager(MockExecutor() if cfg.mediadeck_mock else None)
     app.state.scheduler = Scheduler(cfg.nodes() or _mock_nodes(cfg), probe)
 
     async def probe_loop() -> None:
@@ -123,6 +125,44 @@ async def stream_redirect(path: str) -> RedirectResponse:
 @app.get("/api/pipeline", dependencies=[Depends(_auth)])
 async def pipeline() -> dict[str, Any]:
     return app.state.pipeline.snapshot()
+
+
+# ---- import lanes ----------------------------------------------------------
+@app.post("/api/imports", dependencies=[Depends(_auth)])
+async def imports_submit(
+    kind: str = Body(...),
+    source_ref: str = Body(...),
+    category: str = Body(""),
+) -> dict[str, Any]:
+    try:
+        job_kind = JobKind(kind)
+    except ValueError:
+        raise HTTPException(422, f"unknown kind: {kind}") from None
+    try:
+        job = app.state.imports.submit(job_kind, source_ref, category)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from None
+    return job.to_dict()
+
+
+@app.get("/api/imports", dependencies=[Depends(_auth)])
+async def imports_list(state: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+    return [j.to_dict() for j in app.state.imports.list(state, limit)]
+
+
+@app.get("/api/imports/{job_id}", dependencies=[Depends(_auth)])
+async def imports_get(job_id: str) -> dict[str, Any]:
+    job = app.state.imports.get(job_id)
+    if not job:
+        raise HTTPException(404, "unknown job")
+    return job.to_dict()
+
+
+@app.post("/api/imports/{job_id}/cancel", dependencies=[Depends(_auth)])
+async def imports_cancel(job_id: str) -> dict[str, bool]:
+    if not app.state.imports.cancel(job_id):
+        raise HTTPException(409, "job not cancellable")
+    return {"cancelled": True}
 
 
 # ---- emby ------------------------------------------------------------------

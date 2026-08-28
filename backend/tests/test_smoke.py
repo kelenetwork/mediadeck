@@ -103,3 +103,35 @@ def test_emby_user_management() -> None:
         assert client.post("/api/emby/users/nope/disable", headers=_basic()).status_code == 404
         assert client.post(f"/api/emby/users/{uid}/policy", headers=_basic(),
                            json={"Whatever": 1}).status_code == 422
+
+
+def test_import_lane_lifecycle() -> None:
+    with TestClient(app) as client:
+        job = client.post("/api/imports", headers=_basic(),
+                          json={"kind": "drive-link", "source_ref": "mock://share/abc",
+                                "category": "tv"}).json()
+        jid = job["id"]
+        assert job["state"] == "running"
+        # progress advances on each refresh until done
+        last = 0.0
+        for _ in range(6):
+            j = client.get(f"/api/imports/{jid}", headers=_basic()).json()
+            assert j["progress"] >= last
+            last = j["progress"]
+            if j["state"] == "done":
+                break
+        assert j["state"] == "done" and j["items_done"] == j["items_total"] == 5
+        # done job is not cancellable
+        assert client.post(f"/api/imports/{jid}/cancel", headers=_basic()).status_code == 409
+        # validation errors
+        assert client.post("/api/imports", headers=_basic(),
+                           json={"kind": "nope", "source_ref": "x"}).status_code == 422
+        assert client.post("/api/imports", headers=_basic(),
+                           json={"kind": "cloud-drive", "source_ref": "  "}).status_code == 422
+        assert client.get("/api/imports/zzz", headers=_basic()).status_code == 404
+        # list + filter
+        cancellable = client.post("/api/imports", headers=_basic(),
+                                  json={"kind": "cloud-drive", "source_ref": "mock://folder/1"}).json()
+        assert client.post(f"/api/imports/{cancellable['id']}/cancel", headers=_basic()).json()["cancelled"]
+        failed = client.get("/api/imports?state=failed", headers=_basic()).json()
+        assert any(j["id"] == cancellable["id"] for j in failed)
