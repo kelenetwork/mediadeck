@@ -41,6 +41,12 @@ class MockEmby:
         user["Policy"].update(policy_patch)
         return True
 
+    async def libraries(self) -> list[dict[str, Any]]:
+        return [
+            {"name": "demo-movies", "type": "movies", "items": 120, "locations": 2},
+            {"name": "demo-series", "type": "tvshows", "items": 340, "locations": 3},
+        ]
+
     async def active_sessions(self) -> list[dict[str, Any]]:
         return [
             {

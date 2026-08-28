@@ -11,8 +11,7 @@ const NAV = [
     { id: 'dashboard', icon: '▦', label: '仪表盘', sub: '集中查看系统运行、播放使用和待处理事项' },
   ]},
   { group: '工作台', items: [
-    { id: 'acquire', icon: '⌕', label: '搜索订阅', sub: '识别媒体、搜索站点资源、管理订阅' },
-    { id: 'downloads', icon: '↓', label: '下载任务', sub: '当前下载队列与进度' },
+    { id: 'library', icon: '▤', label: '媒体库', sub: '媒体库分布与条目统计' },
     { id: 'imports', icon: '⇪', label: '网盘上片', sub: '网盘链接与云盘目录导入' },
     { id: 'users', icon: '☺', label: '用户管理', sub: '账号、状态与密码' },
   ]},
@@ -121,12 +120,11 @@ async function renderPage(page, manual) {
 
 /* ---------------- pages ---------------- */
 PAGES.dashboard = async () => {
-  const [sessions, pipe, nodes, subs, dls] = await Promise.all([
+  const [sessions, pipe, nodes, libs] = await Promise.all([
     api('/api/emby/sessions').catch(() => []),
     api('/api/pipeline').catch(() => ({ available: false })),
     api('/api/nodes').catch(() => []),
-    api('/api/mp/subscribes').catch(() => []),
-    api('/api/mp/downloading').catch(() => []),
+    api('/api/emby/libraries').catch(() => []),
   ]);
   const online = nodes.filter((n) => n.available).length;
   const d = pipe.available ? pipe.data : {};
@@ -139,8 +137,7 @@ PAGES.dashboard = async () => {
     <div class="stat-grid">
       ${stat('⛁', `${online} / ${nodes.length}`, '在线节点', nodes.length ? '推流节点健康状态' : '尚未配置节点')}
       ${stat('▶', sessions.length, '当前播放', sessions.length ? '正在进行的会话' : '暂无活跃会话')}
-      ${stat('⌕', subs.length, '媒体订阅', '追更与补全中')}
-      ${stat('↓', dls.length, '下载任务', '下载器活动任务')}
+      ${stat('▤', libs.length, '媒体库', libs.reduce((a, l) => a + (l.items || 0), 0) + ' 个条目')}
       ${stat('⇄', queued, '管线待处理', pipe.available ? '整理与上传队列' : '快照不可用')}
       ${stat('⚠', alerts.length + limited, '待处理事项', limited ? `${limited} 个上传身份受限` : '系统关键状态')}
     </div>
@@ -168,89 +165,21 @@ PAGES.dashboard = async () => {
     </div>`;
 };
 
-PAGES.acquire = async () => {
-  const subs = await api('/api/mp/subscribes').catch(() => []);
+PAGES.library = async () => {
+  const libs = await api('/api/emby/libraries').catch(() => []);
+  const total = libs.reduce((a, l) => a + (l.items || 0), 0);
+  const kinds = new Set(libs.map((l) => l.type)).size;
   $('#view').innerHTML = `
-    ${card('资源搜索', '识别媒体后订阅，或直接搜索站点资源推送下载',
-      `<div class="card-body"><div class="toolbar">
-         <input id="kw" placeholder="片名 / 关键词" style="flex:1;min-width:260px">
-         <button class="btn primary" id="btn-media">识别媒体</button>
-         <button class="btn" id="btn-tor">搜索站点资源</button>
-       </div></div>`)}
-    <div id="search-result"></div>
-    ${tableCard('当前订阅', `${subs.length} 个`, ['名称', '年份', '类型', '季', '缺集', '状态', ''],
-      subs.map((s) => `<tr><td>${esc(s.name)}</td><td>${esc(s.year)}</td><td>${esc(s.type)}</td>
-        <td>${esc(s.season ?? '')}</td><td>${esc(s.lack_episode ?? '')}/${esc(s.total_episode ?? '')}</td>
-        <td><span class="tag idle">${esc(s.state)}</span></td>
-        <td><button class="btn sm danger" onclick="delSub(${s.id})">退订</button></td></tr>`).join(''))}`;
-  $('#btn-media').onclick = searchMedia;
-  $('#btn-tor').onclick = searchTorrents;
-  $('#kw').addEventListener('keydown', (e) => { if (e.key === 'Enter') searchMedia(); });
-};
-async function searchMedia() {
-  const kw = $('#kw').value.trim();
-  if (!kw) return toast('请输入关键词', 1);
-  toast('识别中…');
-  try {
-    const ms = await api('/api/mp/media/search?keyword=' + encodeURIComponent(kw));
-    $('#search-result').innerHTML = tableCard('识别结果', `${ms.length} 个候选`,
-      ['标题', '年份', '类型', 'TMDB', ''],
-      ms.map((m) => `<tr><td>${esc(m.title)}</td><td>${esc(m.year)}</td><td>${esc(m.type)}</td>
-        <td>${esc(m.tmdb_id)}</td>
-        <td><button class="btn sm primary" onclick="subscribe(${m.tmdb_id},'${esc(m.type)}')">订阅</button></td></tr>`).join(''));
-  } catch (e) { toast('识别失败: ' + e.message, 1); }
-}
-async function searchTorrents() {
-  const kw = $('#kw').value.trim();
-  if (!kw) return toast('请输入关键词', 1);
-  toast('站点搜索中，可能需要十几秒…');
-  try {
-    const ts = await api('/api/mp/torrents/search?keyword=' + encodeURIComponent(kw));
-    $('#search-result').innerHTML = tableCard('站点资源', `${ts.length} 条`,
-      ['标题', '站点', '清晰度', '体积', '做种', ''],
-      ts.map((t) => `<tr><td>${esc((t.title || '').slice(0, 64))}</td><td>${esc(t.site)}</td>
-        <td>${esc(t.resolution)}</td><td>${fmtBytes(t.size)}</td><td>${esc(t.seeders ?? '')}</td>
-        <td><button class="btn sm primary" data-enc="${esc(t.enclosure)}" data-title="${esc(t.title)}"
-             onclick="downloadTorrent(this)">下载</button></td></tr>`).join(''));
-  } catch (e) { toast('搜索失败: ' + e.message, 1); }
-}
-async function subscribe(tmdbId, mediaType) {
-  let season = null;
-  if (mediaType && mediaType.includes('剧')) {
-    const s = prompt('订阅第几季？（留空为默认）');
-    if (s) season = parseInt(s, 10);
-  }
-  try {
-    const r = await api('/api/mp/subscribes', { method: 'POST',
-      body: JSON.stringify({ tmdb_id: tmdbId, media_type: mediaType, season }) });
-    toast(r.ok ? '已订阅' : '订阅失败: ' + r.message, !r.ok);
-    if (r.ok) renderPage('acquire');
-  } catch (e) { toast('订阅失败: ' + e.message, 1); }
-}
-async function delSub(id) {
-  if (!confirm('确认退订？')) return;
-  try { await api('/api/mp/subscribes/' + id, { method: 'DELETE' }); toast('已退订'); renderPage('acquire'); }
-  catch (e) { toast('退订失败: ' + e.message, 1); }
-}
-async function downloadTorrent(btn) {
-  const enclosure = btn.dataset.enc, title = btn.dataset.title;
-  if (!confirm('推送下载：' + title + '？')) return;
-  try {
-    const r = await api('/api/mp/download', { method: 'POST', body: JSON.stringify({ enclosure, title }) });
-    toast(r.ok ? '已推送下载' : '失败: ' + r.message, !r.ok);
-  } catch (e) { toast('下载失败: ' + e.message, 1); }
-}
-
-PAGES.downloads = async () => {
-  const ds = await api('/api/mp/downloading').catch(() => []);
-  $('#view').innerHTML = tableCard('下载任务', `${ds.length} 个进行中`,
-    ['任务', '进度', '状态', '剩余'],
-    ds.map((x) => {
-      const p = Math.max(0, Math.min(100, x.progress || 0));
-      return `<tr><td>${esc((x.title || '').slice(0, 70))}</td>
-        <td><span class="bar"><i style="width:${p}%"></i></span> ${p.toFixed(1)}%</td>
-        <td><span class="tag idle">${esc(x.state)}</span></td><td>${esc(x.left_time || '')}</td></tr>`;
-    }).join(''));
+    <div class="stat-grid">
+      ${stat('▤', libs.length, '媒体库数量', '已配置的库')}
+      ${stat('≡', total.toLocaleString(), '媒体条目', '电影与剧集合计')}
+      ${stat('⛁', kinds, '库类型', '按内容类型划分')}
+    </div>
+    ${tableCard('媒体库', `${libs.length} 个库`, ['名称', '类型', '条目数', '存储位置'],
+      libs.map((l) => `<tr><td>${esc(l.name)}</td>
+        <td><span class="tag idle">${esc(l.type)}</span></td>
+        <td>${l.items == null ? '<span class="muted">-</span>' : Number(l.items).toLocaleString()}</td>
+        <td>${esc(l.locations)} 个路径</td></tr>`).join(''))}`;
 };
 
 PAGES.imports = async () => {

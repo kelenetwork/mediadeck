@@ -57,6 +57,33 @@ class LiveEmby:
                                    headers=self._headers, json=policy)
             return pr.status_code in (200, 204)
 
+    async def libraries(self) -> list[dict[str, Any]]:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.get(f"{self._base}/emby/Library/VirtualFolders",
+                                 headers=self._headers)
+            r.raise_for_status()
+            folders = r.json()
+            out = []
+            for f in folders:
+                item_id = f.get("ItemId") or f.get("Id")
+                count = None
+                if item_id:
+                    cr = await client.get(
+                        f"{self._base}/emby/Items",
+                        headers=self._headers,
+                        params={"ParentId": item_id, "Recursive": "true",
+                                "IncludeItemTypes": "Movie,Series", "Limit": "0"},
+                    )
+                    if cr.status_code == 200:
+                        count = cr.json().get("TotalRecordCount")
+                out.append({
+                    "name": f.get("Name"),
+                    "type": f.get("CollectionType") or "mixed",
+                    "items": count,
+                    "locations": len(f.get("Locations") or []),
+                })
+            return out
+
     async def active_sessions(self) -> list[dict[str, Any]]:
         async with httpx.AsyncClient(timeout=15) as client:
             r = await client.get(f"{self._base}/emby/Sessions", headers=self._headers)
