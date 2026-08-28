@@ -4,38 +4,44 @@ Without this module the scheduler is decorative: it can pick a node, but no
 actual Emby client ever asks it.  Emby hands clients a stream URL pointing at
 the Emby host, and every byte is served from there.
 
-The flow this implements:
+Flow:
 
     client --> GET /emby/Videos/{ItemId}/stream.mkv?...  (points at us)
-      1. is this a direct play/stream request?  (transcodes must NOT move)
-      2. ask Emby which file backs this item + media source
-      3. use that *file path* as the affinity key -> scheduler picks a node
-      4. 302 the client to that node's copy of the file
+      1. is this a direct play request?  (transcodes must NOT move)
+      2. ask Emby which file backs this item
+      3. find the nodes that can actually serve that file
+      4. affinity-pick one, sign the URL, 302 the client to it
 
-Two design rules matter more than anything else here:
+Three rules matter more than anything else here.
 
 **The affinity key is the media path, not the request URL.**  Two clients
 playing the same movie send different session ids, api keys and container
 extensions.  Keying on the URL would scatter one file across every node and
 defeat the cache locality the scheduler exists to create.
 
-**Fail open, always.**  Any uncertainty — feature off, transcode, unknown
-item, no healthy node, Emby unreachable — falls back to serving from Emby
-itself.  A panel bug must never turn into "playback is broken"; the worst
-acceptable outcome is "playback did not get accelerated this time".
+**Path mapping is per node, per media root.**  A real server has more than one
+media root -- this stack has ``/media`` (union mount) and ``/media-gd3`` (a
+second Drive).  A single global "strip this prefix" rule cannot express that:
+with ``strip_prefix=/media``, ``/media-gd3/x.mkv`` becomes ``-gd3/x.mkv`` and
+the entire second library 404s.  Each node declares which roots it mirrors, and
+a node that does not mirror a file's root is never selected for it.
+
+**Fail open, always.**  Feature off, transcode, unknown item, no node that can
+serve the path, Emby unreachable -- everything falls back to the Emby origin.
+A panel bug must never turn into "playback is broken"; the worst acceptable
+outcome is "playback did not get accelerated this time".
 """
 from __future__ import annotations
 
 import time
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import quote, urlencode
+from urllib.parse import urlencode
 
-from app.modules.signing import sign_url
+from app.modules.signing import public_url, sign_url
 
 # Path fragments that mean "Emby is transcoding this".  Transcoded output is
-# produced on the Emby host and does not exist on a node, so these must always
-# be served by Emby regardless of policy.
+# produced on the Emby host and does not exist on a node.
 TRANSCODE_MARKERS = (
     "master.m3u8", "main.m3u8", "manifest", "hls", "live.m3u8",
     "transcod", "/segments/", ".ts", "dash", ".mpd",
@@ -51,6 +57,7 @@ class Decision:
     reason: str
     node: str | None = None
     media_path: str | None = None
+    pool: str | None = None
     signed: bool = False
 
 
@@ -78,7 +85,6 @@ class TTLCache:
 
     def set(self, key: str, value: Any) -> None:
         if len(self._data) >= self._max:
-            # Cheap eviction: drop whatever is already expired, else clear.
             now = time.time()
             self._data = {k: v for k, v in self._data.items() if v[0] >= now}
             if len(self._data) >= self._max:
@@ -99,36 +105,33 @@ def is_transcode_request(path: str, query: dict[str, str]) -> bool:
     return static not in ("true", "1")
 
 
-def map_media_path(media_path: str, strip_prefix: str, template: str) -> str:
-    """Translate an Emby-side file path into the node-side relative path.
+def match_pool(media_path: str, pools: list[Any]) -> tuple[Any, str] | None:
+    """Find the node pool serving this Emby path, longest prefix wins.
 
-    Emby sees ``/media/Movies/CN/title.mkv``; a node may expose the same file
-    under a different root.  The operator configures the prefix to strip and,
-    if needed, a template for what to put in front.
+    Longest-prefix matters: ``/media`` and ``/media-gd3`` both "start with"
+    ``/media``, and picking the shorter one silently mangles every gd3 path.
     """
-    path = media_path.replace("\\", "/")
-    prefix = (strip_prefix or "").replace("\\", "/").rstrip("/")
-    if prefix and path.startswith(prefix):
-        path = path[len(prefix):]
-    path = path.lstrip("/")
-    if template and template != "{path}":
-        path = template.replace("{path}", path)
-    return path.lstrip("/")
-
-
-def build_node_url(base_url: str, relative_path: str) -> str:
-    encoded = quote(relative_path, safe="/")
-    return f"{base_url.rstrip('/')}/{encoded}"
+    path = (media_path or "").replace("\\", "/")
+    best: tuple[Any, str] | None = None
+    best_len = -1
+    for pool in pools or []:
+        prefix = str(getattr(pool, "emby_prefix", "") or "").rstrip("/")
+        if not prefix:
+            continue
+        matches = path == prefix or path.startswith(prefix + "/")
+        if matches and len(prefix) > best_len:
+            rel = path[len(prefix):].lstrip("/")
+            best, best_len = (pool, rel), len(prefix)
+    return best
 
 
 class PlaybackRouter:
     def __init__(self, emby: Any, scheduler: Any, config_provider: Any,
-                 emby_config_provider: Any, delivery_provider: Any = None) -> None:
+                 emby_config_provider: Any) -> None:
         self._emby = emby
         self._scheduler = scheduler
         self._config = config_provider
         self._emby_config = emby_config_provider
-        self._delivery = delivery_provider or (dict)
         self._cache = TTLCache()
         self._log: list[dict[str, Any]] = []
 
@@ -136,7 +139,8 @@ class PlaybackRouter:
     def _origin(self) -> str:
         return (self._emby_config() or {}).get("url", "").rstrip("/")
 
-    def _passthrough(self, request_path: str, query: dict[str, str], reason: str) -> Decision:
+    def _passthrough(self, request_path: str, query: dict[str, str],
+                     reason: str) -> Decision:
         origin = self._origin()
         target = f"{origin}/{request_path.lstrip('/')}" if origin else request_path
         if query:
@@ -149,6 +153,7 @@ class PlaybackRouter:
             "item_id": item_id,
             "redirected": decision.redirected,
             "node": decision.node,
+            "pool": decision.pool,
             "reason": decision.reason,
             "media_path": decision.media_path,
             "signed": decision.signed,
@@ -186,8 +191,7 @@ class PlaybackRouter:
         cfg = self._config() or {}
 
         if not cfg.get("enabled"):
-            decision = self._passthrough(request_path, query, "disabled")
-            return decision
+            return self._passthrough(request_path, query, "disabled")
 
         if cfg.get("direct_only", True) and is_transcode_request(request_path, query):
             decision = self._passthrough(request_path, query, "transcode")
@@ -201,45 +205,46 @@ class PlaybackRouter:
             self._record(decision, item_id)
             return decision
 
-        # Affinity key: the file, so every client of this title lands together.
-        chosen = self._scheduler.pick(context=media_path)
+        # Only nodes that actually mirror this media root may serve it.
+        def can_serve(state: Any) -> bool:
+            return match_pool(media_path, getattr(state.node, "pools", [])) is not None
+
+        chosen = self._scheduler.pick(context=media_path, predicate=can_serve)
         if not chosen:
-            decision = self._passthrough(request_path, query, "no-node")
+            decision = self._passthrough(request_path, query, "no-capable-node")
             decision.media_path = media_path
             self._record(decision, item_id)
             return decision
 
-        relative = map_media_path(
-            media_path,
-            cfg.get("strip_prefix", ""),
-            cfg.get("path_template", "{path}"),
-        )
+        matched = match_pool(media_path, chosen.node.pools)
+        if not matched:  # pragma: no cover - predicate already guarantees this
+            decision = self._passthrough(request_path, query, "no-pool-match")
+            decision.media_path = media_path
+            self._record(decision, item_id)
+            return decision
+        pool, relative = matched
         if not relative:
             decision = self._passthrough(request_path, query, "empty-mapped-path")
             decision.media_path = media_path
             self._record(decision, item_id)
             return decision
 
-        # Signing turns the node URL into a short-lived credential instead of
-        # a permanent public download link.
-        delivery = self._delivery() or {}
-        signed = False
-        if delivery.get("signing_enabled") and delivery.get("secret"):
+        url_path = f"{str(pool.url_prefix).rstrip('/')}/{relative}"
+        secret = str(getattr(chosen.node, "sign_secret", "") or "")
+        if secret:
             target = sign_url(
-                chosen.node.base_url, relative,
-                str(delivery["secret"]), int(delivery.get("ttl_seconds") or 21600),
+                chosen.node.base_url, url_path, secret,
+                int(getattr(chosen.node, "sign_ttl_seconds", 21600) or 21600),
+                arg_digest=str(getattr(chosen.node, "sign_arg_digest", "md5")),
+                arg_expires=str(getattr(chosen.node, "sign_arg_expires", "expires")),
             )
-            signed = True
         else:
-            target = build_node_url(chosen.node.base_url, relative)
+            target = public_url(chosen.node.base_url, url_path)
 
         decision = Decision(
-            redirected=True,
-            target=target,
-            reason="redirected",
-            node=chosen.node.name,
-            media_path=media_path,
-            signed=signed,
+            redirected=True, target=target, reason="redirected",
+            node=chosen.node.name, media_path=media_path,
+            pool=pool.name, signed=bool(secret),
         )
         self._record(decision, item_id)
         return decision

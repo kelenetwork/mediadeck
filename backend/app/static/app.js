@@ -112,8 +112,9 @@ function go(page) {
   $('#page-sub').textContent = meta.sub;
   location.hash = '#/' + page;
   renderPage(page);
+  connectLive(page);
 }
-async function renderPage(page, manual) {
+async function renderPage(page, manual, live) {
   const fn = PAGES[page];
   if (!fn) { $('#view').innerHTML = '<div class="empty">页面不存在</div>'; return; }
   try {
@@ -121,7 +122,9 @@ async function renderPage(page, manual) {
     $('#last-updated').textContent = '最近更新: ' + new Date().toLocaleTimeString();
     if (manual) toast('已刷新');
   } catch (e) {
-    toast('加载失败: ' + e.message, 1);
+    // A push-triggered re-render must stay silent: the operator did not ask
+    // for it, so a toast on every transient failure would be noise.
+    if (!live) toast('加载失败: ' + e.message, 1);
   }
 }
 
@@ -270,15 +273,19 @@ async function resetPw(id, name) {
 }
 
 PAGES.nodes = async () => {
-  const [ns, log, dispatch] = await Promise.all([
+  const [ns, log, dispatch, st] = await Promise.all([
     api('/api/nodes').catch(() => []),
     api('/api/dispatch/log?limit=20').catch(() => []),
     api('/api/settings/dispatch').catch(() => ({ policy: '-', load_threshold: 0 })),
+    api('/api/settings').catch(() => ({ integration: {} })),
   ]);
+  state.nodes = ns;
   const online = ns.filter((n) => n.available).length;
   const streams = ns.reduce((a, n) => a + (n.active_streams || 0), 0);
   const egress = ns.reduce((a, n) => a + (n.egress_mbps || 0), 0);
   const policyLabel = dispatch.policy === 'affinity' ? '文件亲和' : '最低负载';
+  const panelSet = !!(st.integration || {}).panel_public_url;
+
   $('#view').innerHTML = `
     <div class="stat-grid">
       ${stat('⛁', `${online} / ${ns.length}`, '在线节点', '可用于分发')}
@@ -287,33 +294,167 @@ PAGES.nodes = async () => {
       ${stat('⚖', policyLabel, '调度策略', dispatch.policy === 'affinity'
         ? `占用率阈值 ${Math.round(dispatch.load_threshold * 100)}%` : '按容量占用率择优')}
     </div>
-    ${card('新增节点', '节点上需运行 loadprobe 探针',
+    ${panelSet ? '' : card('⚠ 尚未填写面板对外地址', '节点安装时需要用它回连面板取配置',
+      `<div class="card-body"><div class="muted">请先到「系统设置 → 接入方式」填写面板对外地址，否则无法生成节点安装命令。</div></div>`)}
+    ${card('新增节点', '先在面板登记，再用生成的一条命令去装机',
       `<div class="card-body"><div class="toolbar">
-        <input id="nd-name" placeholder="节点名称" style="width:140px">
-        <input id="nd-base" placeholder="对外地址 https://node.example.com" style="flex:1;min-width:220px">
-        <input id="nd-probe" placeholder="探针地址 http://10.0.0.2:9800/load" style="flex:1;min-width:220px">
-        <input id="nd-capacity" type="number" step="1" min="1" value="100" placeholder="并发容量" style="width:110px">
+        <input id="nd-name" placeholder="节点名称 如 ca1" style="width:130px">
+        <input id="nd-base" placeholder="对外地址 https://ca1.example.com" style="flex:1;min-width:220px">
+        <input id="nd-probe" placeholder="探针地址 http://127.0.0.1:9800/load" style="flex:1;min-width:200px">
+        <input id="nd-capacity" type="number" min="1" value="100" style="width:100px" title="并发容量">
         <button class="btn primary" id="nd-go">添加</button>
-      </div></div>`)}
-    ${tableCard('推流节点', '按容量占用率分发', ['节点', '状态', '活跃流', '出口', '占用率', ''],
-      ns.map((n) => `<tr><td>${esc(n.name)}</td>
-        <td><span class="tag ${n.available ? 'ok' : 'bad'}">${n.available ? '可用' : (n.manually_disabled ? '已下线' : '不健康')}</span></td>
-        <td>${n.active_streams} / ${esc(n.capacity)}</td><td>${n.egress_mbps} Mbps</td>
-        <td>${Math.round((n.utilisation || 0) * 100)}%</td>
-        <td><button class="btn sm ${n.manually_disabled ? '' : 'danger'}"
-            onclick="nodeCtl('${esc(n.name)}','${n.manually_disabled ? 'enable' : 'disable'}')">
-            ${n.manually_disabled ? '上线' : '下线'}</button>
-            <button class="btn sm" onclick="editNodeCapacity('${esc(n.name)}',${n.capacity})">改容量</button>
-            <button class="btn sm danger" onclick="deleteNode('${esc(n.name)}')">删除</button></td></tr>`).join(''))}
-    ${tableCard('最近分发', '302 调度记录', ['时间', '节点', '负载', '候选', '策略', '请求'],
+      </div>
+      <div class="muted" style="margin-top:8px">添加后展开该节点填写「媒体根」，再复制安装命令到新机器执行。</div>
+      </div>`)}
+    ${ns.length ? ns.map(nodeCard).join('') : card('推流节点', '尚未配置',
+      '<div class="card-body"><div class="empty">还没有节点</div></div>')}
+    ${tableCard('最近分发', '302 调度记录', ['时间', '节点', '占用', '候选', '策略', '请求'],
       log.slice().reverse().map((e) => `<tr><td>${new Date(e.ts * 1000).toLocaleTimeString()}</td>
         <td>${esc(e.node || '-')}</td>
         <td>${e.utilisation == null ? '-' : Math.round(e.utilisation * 100) + '%'}</td>
         <td>${esc(e.candidates)}</td>
         <td><span class="tag idle">${esc(e.reason || e.policy || '-')}</span></td>
-        <td>${esc((e.context || '').slice(0, 48))}</td></tr>`).join(''))}`;
+        <td>${esc((e.context || '').slice(0, 44))}</td></tr>`).join(''))}`;
   $('#nd-go').onclick = addNode;
 };
+
+/* 一个节点 = 一张卡：健康、媒体根、缓存、签名、安装命令全在这里。
+   这些都是「这台机器」的属性，放全局设置里是错的。 */
+function nodeCard(n) {
+  const pools = n.pools || [];
+  const health = n.available ? '<span class="tag ok">可用</span>'
+    : (n.manually_disabled ? '<span class="tag idle">已下线</span>'
+                           : '<span class="tag bad">不健康</span>');
+  const poolRows = pools.length
+    ? pools.map((p, i) => `<tr>
+        <td>${esc(p.name)}</td><td><code>${esc(p.emby_prefix)}</code></td>
+        <td><code>${esc(p.node_path)}</code></td>
+        <td><code>${esc(p.rclone_remote)}</code></td>
+        <td><code>${esc(p.url_prefix)}</code></td>
+        <td><button class="btn sm danger" onclick="delPool('${esc(n.name)}',${i})">删除</button></td>
+      </tr>`).join('')
+    : '';
+  return card(`⛁ ${n.name}`,
+    `${n.active_streams}/${n.capacity} 路 · ${Math.round((n.utilisation || 0) * 100)}% · ${n.egress_mbps} Mbps`,
+    `<div class="card-body">
+      <div class="toolbar" style="margin-bottom:10px">
+        ${health}
+        <span class="muted">${esc(n.base_url)}</span>
+        <span style="flex:1"></span>
+        <button class="btn sm" onclick="nodeCtl('${esc(n.name)}','${n.manually_disabled ? 'enable' : 'disable'}')">${n.manually_disabled ? '上线' : '下线'}</button>
+        <button class="btn sm" onclick="editNodeCapacity('${esc(n.name)}',${n.capacity})">改容量</button>
+        <button class="btn sm danger" onclick="deleteNode('${esc(n.name)}')">删除</button>
+      </div>
+
+      <div class="sub" style="margin:12px 0 4px"><b>媒体根映射</b> — Emby 里的路径对应节点上的哪个目录</div>
+      ${poolRows
+        ? `<table><thead><tr><th>名称</th><th>Emby 路径</th><th>节点路径</th><th>rclone remote</th><th>URL 前缀</th><th></th></tr></thead><tbody>${poolRows}</tbody></table>`
+        : '<div class="empty">未配置媒体根 — 该节点当前无法提供任何文件</div>'}
+      <div class="toolbar" style="margin-top:8px">
+        <input id="pl-name-${esc(n.name)}" placeholder="名称 main" style="width:90px">
+        <input id="pl-emby-${esc(n.name)}" placeholder="Emby 路径 /media" style="width:150px">
+        <input id="pl-path-${esc(n.name)}" placeholder="节点路径 /mnt/gdrive/Media" style="flex:1;min-width:170px">
+        <input id="pl-remote-${esc(n.name)}" placeholder="remote rc2:Media" style="width:150px">
+        <input id="pl-url-${esc(n.name)}" placeholder="URL 前缀 /s/main" style="width:120px">
+        <button class="btn" onclick="addPool('${esc(n.name)}')">添加媒体根</button>
+      </div>
+
+      <div class="sub" style="margin:14px 0 4px"><b>存储与安全</b></div>
+      <div class="form-row"><label>缓存目录</label>
+        <input id="nc-dir-${esc(n.name)}" value="${esc(n.cache_dir || '')}" placeholder="/var/cache/mediadeck"></div>
+      <div class="form-row"><label>缓存上限</label>
+        <input id="nc-size-${esc(n.name)}" value="${esc(n.cache_size || '')}" placeholder="2T" style="width:120px">
+        <span class="muted">别超过该盘可用空间</span></div>
+      <div class="form-row"><label>签名密钥</label>
+        <span class="${n.sign_secret_set ? 'tag ok' : 'tag bad'}">${n.sign_secret_set ? '已设置' : '未设置 · 链接永久公开'}</span>
+        <span class="muted">${esc(n.sign_secret_masked || '')}</span>
+        <button class="btn sm" onclick="rotateNodeSecret('${esc(n.name)}')">重置密钥</button></div>
+      <div class="form-row"><label>签名参数</label>
+        <input id="nc-argd-${esc(n.name)}" value="${esc(n.sign_arg_digest || 'md5')}" style="width:90px">
+        <input id="nc-arge-${esc(n.name)}" value="${esc(n.sign_arg_expires || 'expires')}" style="width:110px">
+        <span class="muted">节点 nginx 用的参数名（已有站点常用 k / e）</span></div>
+      <div class="form-row"><label>链接有效期</label>
+        <input id="nc-ttl-${esc(n.name)}" type="number" min="60" value="${esc(n.sign_ttl_seconds || 21600)}" style="width:120px">
+        <span class="muted">秒</span></div>
+      <div class="form-row"><label>rclone 配置</label>
+        <span class="${n.rclone_conf_set ? 'tag ok' : 'tag warn'}">${n.rclone_conf_set ? '已保存' : '未保存'}</span>
+        <button class="btn sm" onclick="editRcloneConf('${esc(n.name)}')">粘贴 rclone.conf</button>
+        <span class="muted">保存后装机时自动写入，无需在节点上跑 rclone config</span></div>
+      <div class="toolbar">
+        <button class="btn primary" onclick="saveNodeStorage('${esc(n.name)}')">保存</button>
+        <button class="btn" onclick="showEnroll('${esc(n.name)}')">获取安装命令</button>
+      </div>
+      <div id="enroll-${esc(n.name)}" style="margin-top:10px"></div>
+    </div>`);
+}
+
+async function addPool(name) {
+  const g = (k) => ($(`#pl-${k}-${CSS.escape(name)}`) || {}).value || '';
+  const node = (state.nodes || []).find((n) => n.name === name);
+  if (!node) return;
+  const pools = (node.pools || []).slice();
+  pools.push({
+    name: g('name').trim(), emby_prefix: g('emby').trim(),
+    node_path: g('path').trim(), rclone_remote: g('remote').trim(),
+    url_prefix: g('url').trim() || ('/s/' + g('name').trim()),
+  });
+  try {
+    await api(`/api/nodes/${encodeURIComponent(name)}`, {
+      method: 'PUT', body: JSON.stringify({ pools }) });
+    toast('媒体根已添加'); renderPage('nodes');
+  } catch (e) { toast('添加失败: ' + e.message, 1); }
+}
+async function delPool(name, index) {
+  const node = (state.nodes || []).find((n) => n.name === name);
+  if (!node) return;
+  const pools = (node.pools || []).filter((_, i) => i !== index);
+  try {
+    await api(`/api/nodes/${encodeURIComponent(name)}`, {
+      method: 'PUT', body: JSON.stringify({ pools }) });
+    toast('已删除'); renderPage('nodes');
+  } catch (e) { toast('删除失败: ' + e.message, 1); }
+}
+async function saveNodeStorage(name) {
+  const g = (k) => ($(`#nc-${k}-${CSS.escape(name)}`) || {}).value || '';
+  try {
+    await api(`/api/nodes/${encodeURIComponent(name)}`, { method: 'PUT', body: JSON.stringify({
+      cache_dir: g('dir').trim(), cache_size: g('size').trim(),
+      sign_arg_digest: g('argd').trim(), sign_arg_expires: g('arge').trim(),
+      sign_ttl_seconds: parseInt(g('ttl'), 10) || 21600,
+    }) });
+    toast('已保存'); renderPage('nodes');
+  } catch (e) { toast('保存失败: ' + e.message, 1); }
+}
+async function rotateNodeSecret(name) {
+  if (!confirm(`重置 ${name} 的签名密钥？\n\n已发出的播放链接会立即失效，且必须重新在节点上执行安装命令。`)) return;
+  try {
+    await api(`/api/nodes/${encodeURIComponent(name)}/rotate-secret`, { method: 'POST' });
+    toast('密钥已重置，请重新部署该节点'); renderPage('nodes');
+  } catch (e) { toast('失败: ' + e.message, 1); }
+}
+async function editRcloneConf(name) {
+  const text = prompt(`粘贴该节点使用的 rclone.conf 全文\n（建议为节点单独建 OAuth 身份，避免和主机抢配额）`);
+  if (text === null) return;
+  try {
+    await api(`/api/nodes/${encodeURIComponent(name)}`, {
+      method: 'PUT', body: JSON.stringify({ rclone_conf: text }) });
+    toast('已保存'); renderPage('nodes');
+  } catch (e) { toast('保存失败: ' + e.message, 1); }
+}
+async function showEnroll(name) {
+  const box = $(`#enroll-${CSS.escape(name)}`);
+  box.textContent = '生成中…';
+  try {
+    const r = await api(`/api/nodes/${encodeURIComponent(name)}/enroll`);
+    box.innerHTML = `
+      <div class="muted" style="margin-bottom:6px">在这台新机器上以 root 执行（其余配置面板已自动带过去）：</div>
+      <pre class="codeblock">${esc(r.command)}</pre>
+      ${(r.warnings || []).map((w) => `<div class="tag warn" style="margin-top:6px">${esc(w)}</div>`).join('')}
+      <div class="muted" style="margin-top:6px">前置：DNS 中该节点域名解析到本机且为 DNS-only（灰云），视频不能走 CDN 代理。</div>`;
+  } catch (e) {
+    box.innerHTML = `<span class="tag bad">生成失败</span> ${esc(e.message)}`;
+  }
+}
 async function nodeCtl(name, action) {
   try { await api(`/api/nodes/${encodeURIComponent(name)}/${action}`, { method: 'POST' });
     toast(action === 'disable' ? '已下线' : '已上线'); renderPage('nodes');
@@ -329,11 +470,11 @@ async function addNode() {
   if (!body.name || !body.base_url || !body.probe_url) return toast('请填写完整节点信息', 1);
   try {
     await api('/api/nodes', { method: 'POST', body: JSON.stringify(body) });
-    toast('节点已添加'); renderPage('nodes');
+    toast('节点已添加，请继续配置媒体根'); renderPage('nodes');
   } catch (e) { toast('添加失败: ' + e.message, 1); }
 }
 async function editNodeCapacity(name, current) {
-  const value = prompt(`设置 ${name} 的并发容量（该节点最多同时承载多少路播放）`, current);
+  const value = prompt(`设置 ${name} 的并发容量（最多同时承载多少路播放）`, current);
   if (value === null) return;
   try {
     await api(`/api/nodes/${encodeURIComponent(name)}`, {
@@ -453,14 +594,13 @@ PAGES.tasks = async () => {
 PAGES.settings = async () => {
   const s = await api('/api/settings').catch(() => null);
   if (!s) { $('#view').innerHTML = `<div class="card"><div class="empty">设置加载失败</div></div>`; return; }
-  const e = s.emby, d = s.dispatch, p = s.playback;
-  const dl = s.delivery || { signing_enabled: false, secret_set: false, ttl_seconds: 21600 };
-  const ig = s.integration || { panel_public_url: '', emby_public_url: '', node_media_root: '/srv/media' };
+  const e = s.emby, d = s.dispatch, p = s.playback, ig = s.integration;
   const connected = e.enabled && e.api_key_set;
+  const mapped = (s.nodes || []).filter((n) => (n.pools || []).length).length;
   $('#view').innerHTML = `
     ${s.mock_mode ? card('演示模式', '当前以 MEDIADECK_MOCK=1 运行',
       `<div class="card-body"><div class="muted">所有数据均为模拟值，保存的配置不会连接真实服务。</div></div>`) : ''}
-    ${card('Emby 对接', connected ? '已连接' : '尚未连接 — 面板的用户管理与媒体库依赖此配置',
+    ${card('Emby 对接', connected ? '已连接' : '尚未连接 — 用户管理与媒体库依赖此配置',
       `<div class="card-body">
         <div class="form-row"><label>服务器地址</label>
           <input id="em-url" value="${esc(e.url)}" placeholder="http://127.0.0.1:8096"></div>
@@ -480,10 +620,30 @@ PAGES.settings = async () => {
           <span id="em-result" class="muted">${connected ? '已配置' : '未配置'}</span>
         </div>
       </div>`)}
+    ${card('接入方式', '你现有的 Emby 域名如何把播放分发到节点',
+      `<div class="card-body">
+        <div class="muted" style="margin-bottom:12px">
+          用户仍然只访问原来的 Emby 地址，客户端不用改任何设置。
+          只需在反代里把<b>播放请求</b>转给面板；Web 界面、刮削、图片、转码照旧直接走 Emby。
+          <b>面板地址</b>同时也是节点装机时回连取配置的地址，必须填。
+        </div>
+        <div class="form-row"><label>面板地址</label>
+          <input id="ig-panel" value="${esc(ig.panel_public_url)}" placeholder="https://deck.example.com"></div>
+        <div class="form-row"><label>Emby 地址</label>
+          <input id="ig-emby" value="${esc(ig.emby_public_url)}" placeholder="https://emby.example.com"></div>
+        <div class="toolbar">
+          <select id="ig-server" style="width:120px">
+            <option value="caddy">Caddy</option><option value="nginx">nginx</option>
+          </select>
+          <button class="btn" id="ig-show">生成反代配置</button>
+          <button class="btn primary" id="ig-save">保存</button>
+        </div>
+        <div id="ig-out" style="margin-top:10px"></div>
+      </div>`)}
     ${card('播放调度策略', '决定同一个文件由哪个推流节点承载',
       `<div class="card-body">
         <div class="form-row"><label>策略</label>
-          <select id="dp-policy" style="min-width:220px">
+          <select id="dp-policy" style="min-width:200px">
             <option value="affinity" ${d.policy === 'affinity' ? 'selected' : ''}>文件亲和（推荐）</option>
             <option value="least-load" ${d.policy === 'least-load' ? 'selected' : ''}>最低负载</option>
           </select></div>
@@ -491,8 +651,7 @@ PAGES.settings = async () => {
           <input id="dp-threshold" type="number" step="0.05" min="0.05" max="1" value="${esc(d.load_threshold)}" style="width:110px">
           <span class="muted">节点容量占用率超过此值时改派其他节点（0.8 = 80%）</span></div>
         <div class="muted" style="margin:6px 0 10px">
-          文件亲和：同一个文件固定由同一节点服务，只需缓存一份，回源流量不翻倍；
-          节点故障或过载时自动顺延。最低负载：每次都挑当前最闲的节点，会导致多节点重复缓存同一文件。
+          文件亲和：同一个文件固定由同一节点服务，只缓存一份，回源流量不翻倍；节点故障或过载时自动顺延。
         </div>
         <div class="toolbar"><button class="btn primary" id="dp-save">保存策略</button>
           <span id="dp-result" class="muted"></span></div>
@@ -501,118 +660,48 @@ PAGES.settings = async () => {
       : '未启用 — 当前所有播放仍由 Emby 主机直接吐流',
       `<div class="card-body">
         <div class="muted" style="margin-bottom:12px">
-          开启后，客户端的播放请求经面板按文件亲和分发到节点。
-          <b>转码、无法识别的条目、无可用节点时会自动回退由 Emby 直接提供</b>，不会因为面板出错导致放不了。
+          开启后客户端播放请求经面板按文件亲和分发到节点。
+          <b>转码、无法识别的条目、没有能提供该文件的节点时都会自动回退由 Emby 直供</b>，不会因面板出错导致放不了。
         </div>
         <div class="form-row"><label>启用分流</label>
           <input id="pb-enabled" type="checkbox" ${p.enabled ? 'checked' : ''}>
-          <span class="muted">需先配置至少一个推流节点</span></div>
+          <span class="muted">已有 ${mapped} 个节点配置了媒体根</span></div>
         <div class="form-row"><label>仅直播</label>
           <input id="pb-direct" type="checkbox" ${p.direct_only ? 'checked' : ''}>
           <span class="muted">转码流由 Emby 主机生成，节点上没有，建议保持勾选</span></div>
-        <div class="form-row"><label>去除前缀</label>
-          <input id="pb-strip" value="${esc(p.strip_prefix)}" placeholder="/media"></div>
-        <div class="form-row"><label>路径模板</label>
-          <input id="pb-template" value="${esc(p.path_template)}" placeholder="{path}"></div>
         <div class="muted" style="margin:0 0 10px">
-          Emby 看到的是 <code>/media/Movies/x.mkv</code>，节点上可能是另一个根目录。
-          去除 <code>/media</code> 后套用模板得到节点侧路径；模板必须包含 <code>{path}</code>。
+          <b>路径映射已移到「节点管理」的每个节点里</b> —— 不同节点挂载的目录和网盘身份都可能不同，
+          放在全局会导致一台机器上有的库能放、有的库 404。
         </div>
         <div class="toolbar">
-          <input id="pb-item" placeholder="填入 Emby ItemId 试算" style="width:200px">
+          <input id="pb-item" placeholder="填入 Emby ItemId 试算" style="width:190px">
           <button class="btn" id="pb-preview">预览路径</button>
           <button class="btn primary" id="pb-save">保存</button>
         </div>
         <div id="pb-result" class="muted" style="margin-top:10px"></div>
       </div>`)}
-    ${card('链接安全（签名）', dl.signing_enabled ? '已启用 — 播放链接带签名且会过期'
-      : '⚠ 未启用 — 发给客户端的节点链接是永久公开的，任何人拿到都能下载',
-      `<div class="card-body">
-        <div class="muted" style="margin-bottom:12px">
-          不签名时，用户从浏览器里复制出播放地址就能无限制转发。
-          开启后链接带有效期，过期自动失效。
-          <b>节点上的 nginx 必须使用同一个密钥</b>（下方安装脚本会自动写入）。
-        </div>
-        <div class="form-row"><label>启用签名</label>
-          <input id="dl-enabled" type="checkbox" ${dl.signing_enabled ? 'checked' : ''}>
-          <span class="muted">开启后请重新部署节点配置，否则节点会 403</span></div>
-        <div class="form-row"><label>签名密钥</label>
-          <input id="dl-secret" type="password" placeholder="${dl.secret_set ? esc(dl.secret_masked) + '（留空则不修改）' : '留空保存将自动生成'}"></div>
-        <div class="form-row"><label>链接有效期</label>
-          <input id="dl-ttl" type="number" min="60" max="604800" value="${esc(dl.ttl_seconds)}" style="width:130px">
-          <span class="muted">秒（${Math.round(dl.ttl_seconds / 3600)} 小时）— 建议大于最长一部片的片长</span></div>
-        <div class="toolbar">
-          <button class="btn primary" id="dl-save">保存</button>
-          <button class="btn danger" id="dl-rotate">重置密钥</button>
-          <span class="muted">重置后已发出的链接全部失效</span>
-        </div>
-      </div>`)}
-    ${card('接入方式', '你现有的 Emby 域名如何把播放分发到节点',
-      `<div class="card-body">
-        <div class="muted" style="margin-bottom:12px">
-          用户仍然只访问你原来的 Emby 地址，客户端不用改任何设置。
-          只需在反代里把<b>播放请求</b>转给面板，Web 界面、刷剁、图片、转码照旧走 Emby。
-        </div>
-        <div class="form-row"><label>面板地址</label>
-          <input id="ig-panel" value="${esc(ig.panel_public_url)}" placeholder="http://127.0.0.1:8300"></div>
-        <div class="form-row"><label>Emby 地址</label>
-          <input id="ig-emby" value="${esc(ig.emby_public_url)}" placeholder="https://emby.example.com"></div>
-        <div class="form-row"><label>节点媒体根</label>
-          <input id="ig-root" value="${esc(ig.node_media_root)}" placeholder="/srv/media">
-          <span class="muted">节点上挂载媒体的目录</span></div>
-        <div class="toolbar">
-          <select id="ig-server" style="width:130px">
-            <option value="caddy">Caddy</option><option value="nginx">nginx</option>
-          </select>
-          <button class="btn" id="ig-show">生成反代配置</button>
-          <button class="btn primary" id="ig-save">保存</button>
-        </div>
-        <div id="ig-out" style="margin-top:10px"></div>
-      </div>`)}
-    ${tableCard('推流节点', `${s.nodes.length} 个已配置 · 在「节点管理」中新增与获取安装脚本`,
-      ['名称', '对外地址', '探针地址', '并发容量', '状态'],
+    ${tableCard('推流节点', `${s.nodes.length} 个已配置 · 媒体根、缓存、签名密钥都在「节点管理」里按节点配置`,
+      ['名称', '对外地址', '媒体根', '签名', '状态'],
       s.nodes.map((n) => `<tr><td>${esc(n.name)}</td><td>${esc(n.base_url)}</td>
-        <td>${esc(n.probe_url)}</td><td>${esc(n.capacity)}</td>
+        <td>${(n.pools || []).length ? (n.pools || []).map((x) => esc(x.emby_prefix)).join(', ')
+          : '<span class="tag bad">未配置</span>'}</td>
+        <td>${n.sign_secret_set ? '<span class="tag ok">已设置</span>' : '<span class="tag bad">未设置</span>'}</td>
         <td><span class="tag ${n.enabled ? 'ok' : 'idle'}">${n.enabled ? '启用' : '停用'}</span></td></tr>`).join(''))}`;
   $('#em-save').onclick = saveEmby;
   $('#em-test').onclick = testEmby;
   $('#dp-save').onclick = saveDispatch;
   $('#pb-save').onclick = savePlayback;
   $('#pb-preview').onclick = previewPlayback;
-  $('#dl-save').onclick = saveDelivery;
-  $('#dl-rotate').onclick = rotateDeliverySecret;
   $('#ig-save').onclick = saveIntegration;
   $('#ig-show').onclick = showFrontendConfig;
 };
-async function saveDelivery() {
-  const key = $('#dl-secret').value;
-  try {
-    await api('/api/settings/delivery', { method: 'PUT', body: JSON.stringify({
-      signing_enabled: $('#dl-enabled').checked,
-      secret: key === '' ? SECRET_KEEP : key,
-      ttl_seconds: parseInt($('#dl-ttl').value, 10) || 21600,
-    }) });
-    toast('链接签名配置已保存');
-    renderPage('settings');
-  } catch (e) { toast('保存失败: ' + e.message, 1); }
-}
-async function rotateDeliverySecret() {
-  if (!confirm('重新生成签名密钥？\n\n已发出去的所有播放链接会立即失效，\n正在播放的用户需要重新起播。\n\n换密钥后必须重新部署节点配置。')) return;
-  try {
-    await api('/api/settings/delivery/rotate', { method: 'POST' });
-    toast('密钥已更新，请重新部署节点');
-    renderPage('settings');
-  } catch (e) { toast('操作失败: ' + e.message, 1); }
-}
 async function saveIntegration() {
   try {
     await api('/api/settings/integration', { method: 'PUT', body: JSON.stringify({
       panel_public_url: $('#ig-panel').value.trim(),
       emby_public_url: $('#ig-emby').value.trim(),
-      node_media_root: $('#ig-root').value.trim(),
     }) });
-    toast('接入配置已保存');
-    renderPage('settings');
+    toast('接入配置已保存'); renderPage('settings');
   } catch (e) { toast('保存失败: ' + e.message, 1); }
 }
 async function showFrontendConfig() {
@@ -628,15 +717,12 @@ function playbackPayload() {
   return {
     enabled: $('#pb-enabled').checked,
     direct_only: $('#pb-direct').checked,
-    strip_prefix: $('#pb-strip').value.trim(),
-    path_template: $('#pb-template').value.trim() || '{path}',
   };
 }
 async function savePlayback() {
   try {
     await api('/api/settings/playback', { method: 'PUT', body: JSON.stringify(playbackPayload()) });
-    toast('播放分流配置已保存');
-    renderPage('settings');
+    toast('播放分流配置已保存'); renderPage('settings');
   } catch (err) { toast('保存失败: ' + err.message, 1); }
 }
 async function previewPlayback() {
@@ -647,7 +733,8 @@ async function previewPlayback() {
   try {
     const r = await api(`/api/playback/preview?item_id=${encodeURIComponent(id)}`);
     el.innerHTML = r.redirected
-      ? `<span class="tag ok">分流到 ${esc(r.node)}</span><br>
+      ? `<span class="tag ok">分流到 ${esc(r.node)} · ${esc(r.pool)}</span>
+         ${r.signed ? '<span class="tag ok">已签名</span>' : '<span class="tag bad">未签名</span>'}<br>
          <span class="muted">Emby 路径</span> <code>${esc(r.media_path)}</code><br>
          <span class="muted">节点 URL</span> <code>${esc(r.target)}</code>`
       : `<span class="tag warn">不分流（${esc(r.reason)}）</span><br>
@@ -660,7 +747,6 @@ function embyPayload() {
   const key = $('#em-key').value;
   return {
     url: $('#em-url').value.trim(),
-    // Empty field means "keep what is stored", so editing the URL alone is safe.
     api_key: key === '' ? SECRET_KEEP : key,
     timeout_seconds: parseFloat($('#em-timeout').value) || 15,
     enabled: $('#em-enabled').checked,
@@ -670,8 +756,7 @@ function embyPayload() {
 async function saveEmby() {
   try {
     await api('/api/settings/emby', { method: 'PUT', body: JSON.stringify(embyPayload()) });
-    toast('Emby 配置已保存，立即生效');
-    renderPage('settings');
+    toast('Emby 配置已保存，立即生效'); renderPage('settings');
   } catch (e) { toast('保存失败: ' + e.message, 1); }
 }
 async function testEmby() {
@@ -731,6 +816,67 @@ async function applyUpdate() {
   } catch (e) { toast('更新失败: ' + e.message, 1); }
 }
 
+/* ---------------- live updates ---------------- */
+/* Polling every 30s was wrong in both directions: a stream starting now stayed
+   invisible for up to 30s, while an idle panel hammered Emby forever -- and the
+   periodic re-render wiped whatever the operator was typing. The server now
+   pushes snapshots over SSE and only when something actually changed. */
+const LIVE = {
+  dashboard: ['nodes', 'sessions', 'pipeline'],
+  nodes: ['nodes'],
+  pipeline: ['pipeline'],
+  tasks: ['tasks'],
+  mounts: ['mounts'],
+};
+const live = { src: null, data: {}, page: null, retry: 0 };
+
+function setLiveState(ok) {
+  const el = $('#live-state');
+  if (!el) return;
+  el.className = 'tag ' + (ok ? 'ok' : 'idle');
+  el.textContent = ok ? '实时' : '重连中';
+}
+
+function connectLive(page) {
+  const topics = LIVE[page];
+  if (live.src) { live.src.close(); live.src = null; }
+  live.page = page;
+  live.data = {};
+  if (!topics) { setLiveState(false); return; }
+
+  const src = new EventSource(`/api/stream?topics=${topics.join(',')}`);
+  live.src = src;
+  src.onopen = () => { live.retry = 0; setLiveState(true); };
+  topics.forEach((topic) => {
+    src.addEventListener(topic, (ev) => {
+      try { live.data[topic] = JSON.parse(ev.data); } catch (e) { return; }
+      setLiveState(true);
+      // Re-render only the page that asked for this data, and never while a
+      // form on it is focused -- that is what used to eat keystrokes.
+      if (live.page === state.page && !isEditing()) {
+        renderPage(state.page, false, true);
+      }
+    });
+  });
+  src.onerror = () => {
+    setLiveState(false);
+    src.close();
+    live.src = null;
+    // EventSource retries on its own, but only for transport errors; an auth
+    // or proxy failure needs an explicit backoff so we do not spin.
+    live.retry = Math.min(live.retry + 1, 6);
+    setTimeout(() => { if (live.page === state.page) connectLive(state.page); },
+               1000 * live.retry);
+  };
+}
+
+function isEditing() {
+  const el = document.activeElement;
+  if (!el) return false;
+  const tag = (el.tagName || '').toLowerCase();
+  return tag === 'input' || tag === 'select' || tag === 'textarea';
+}
+
 /* ---------------- boot ---------------- */
 buildNav();
 api('/api/update/version').then((v) => { $('#version').textContent = v.version; }).catch(() => {});
@@ -739,9 +885,3 @@ api('/api/whoami').then((w) => {
   $('#who-initial').textContent = (w.user || '?').slice(0, 1).toUpperCase();
 }).catch(() => {});
 go((location.hash || '').replace('#/', '') || 'dashboard');
-/* Pages with forms must not auto-refresh: re-rendering mid-edit wipes whatever
-   the operator is currently typing. */
-const NO_AUTO_REFRESH = new Set(['update', 'settings']);
-state.timer = setInterval(() => {
-  if (!NO_AUTO_REFRESH.has(state.page)) renderPage(state.page);
-}, 30000);

@@ -21,6 +21,8 @@ without giving up cache locality.
 """
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import hashlib
 import time
 from collections import deque
@@ -71,6 +73,10 @@ class Scheduler:
         policy: str = "affinity",
         load_threshold: float = 0.8,
     ) -> None:
+        # Set whenever the node list changes so the probe loop can wake up and
+        # report a fresh node's health immediately instead of leaving it shown
+        # as unavailable until the next 15s tick.
+        self._wake = asyncio.Event()
         self._probe = probe
         self._policy = policy if policy in POLICIES else "affinity"
         self._load_threshold = load_threshold
@@ -99,6 +105,13 @@ class Scheduler:
             if name not in seen:
                 self._states.pop(name, None)
                 self._history.pop(name, None)
+        self._wake.set()
+
+    async def wait_for_change(self, timeout: float) -> None:
+        """Sleep until the node list changes, or the timeout elapses."""
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(self._wake.wait(), timeout=timeout)
+        self._wake.clear()
 
     def set_policy(self, policy: str, load_threshold: float | None = None) -> None:
         if policy in POLICIES:
@@ -152,8 +165,17 @@ class Scheduler:
             reverse=True,
         )
 
-    def pick(self, record: bool = True, context: str = "") -> NodeState | None:
+    def pick(self, record: bool = True, context: str = "",
+             predicate: Any = None) -> NodeState | None:
+        """Choose a node.
+
+        ``predicate`` filters to nodes that can actually serve this request --
+        a node only mirroring one media root must never be handed a file from
+        another root, or the client gets a 404 from a "healthy" node.
+        """
         candidates = [s for s in self._states.values() if s.available()]
+        if predicate is not None:
+            candidates = [s for s in candidates if predicate(s)]
         chosen: NodeState | None = None
         reason = "none-available"
 

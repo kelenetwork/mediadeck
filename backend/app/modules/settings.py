@@ -1,21 +1,29 @@
 """Settings service — the configuration surface of the product.
 
-Everything an Emby operator is expected to change lives here and is editable
-from the panel UI: which Emby server to drive, which streaming nodes exist,
-and how playback requests are dispatched across them.  Changes are persisted
-and applied to the running process immediately; no restart, no shell.
+Scope rule, learned the hard way: a setting lives with the thing it describes.
 
-Secrets (API keys) are never returned to the browser in cleartext.  The API
-exposes a masked preview plus a ``configured`` flag, and accepts the sentinel
-``KEEP`` value on save to mean "leave the stored secret untouched" — so an
-operator can edit the URL without re-typing the key.
+Global settings are the ones that are true for the whole deployment: which
+Emby server to drive, how the front door reaches the panel, and how playback
+requests are dispatched.
+
+Everything else belongs to a *node*: which Drive identity it mounts, where its
+cache is, which media roots it mirrors, and which key signs its URLs.  Two
+nodes routinely differ in all four, so a global "strip this prefix" or a single
+global signing key cannot express a real fleet -- and silently breaks it: with
+one global prefix, a server with both ``/media`` and ``/media-gd3`` roots has
+its entire second library 404 on every node.
+
+Secrets are never returned to the browser in cleartext.  The API exposes a
+masked preview plus a ``configured`` flag, and accepts the sentinel ``KEEP``
+value on save to mean "leave the stored secret untouched".
 """
 from __future__ import annotations
 
 import re
+import secrets
 from typing import Any
 
-from app.core.config import Settings, StreamNode, demo_nodes
+from app.core.config import NodePool, Settings, StreamNode, demo_nodes
 from app.core.errors import ConfigError
 from app.core.store import SettingsStore
 from app.modules.signing import MAX_TTL, MIN_TTL, generate_secret
@@ -23,31 +31,20 @@ from app.modules.signing import MAX_TTL, MIN_TTL, generate_secret
 SECRET_UNCHANGED = "__KEEP__"
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$")
 MAX_NODES = 64
+MAX_POOLS = 12
 
-# Playback interception is opt-in: it changes where clients actually fetch
-# bytes from, so it must never switch itself on during an upgrade.
+# Playback interception is opt-in: it changes where clients fetch bytes from,
+# so it must never switch itself on during an upgrade.
 PLAYBACK_DEFAULTS: dict[str, Any] = {
     "enabled": False,
     "direct_only": True,
-    "strip_prefix": "",
-    "path_template": "{path}",
-}
-
-# Delivery security. An unsigned node URL is a permanent public download link;
-# signing makes it expire. Off by default because turning it on without the
-# matching nginx config on the node would 403 every stream.
-DELIVERY_DEFAULTS: dict[str, Any] = {
-    "signing_enabled": False,
-    "secret": "",
-    "ttl_seconds": 21600,
 }
 
 # How the operator's existing Emby entrypoint reaches this panel. Needed to
-# generate copy-pasteable reverse-proxy and node config instead of prose.
+# generate copy-pasteable front-door and node config instead of prose.
 INTEGRATION_DEFAULTS: dict[str, Any] = {
     "panel_public_url": "",
     "emby_public_url": "",
-    "node_media_root": "/srv/media",
 }
 
 
@@ -70,6 +67,13 @@ def _require_http_url(value: str, field: str) -> str:
     return value
 
 
+def _abs_path(value: str, field: str) -> str:
+    value = (value or "").strip().rstrip("/")
+    if not value.startswith("/"):
+        raise ConfigError(f"{field} 必须是绝对路径（以 / 开头）")
+    return value
+
+
 class SettingsService:
     def __init__(self, store: SettingsStore, scheduler: Any = None) -> None:
         self._store = store
@@ -80,11 +84,7 @@ class SettingsService:
 
     # -- bootstrap -----------------------------------------------------------
     def bootstrap_from_env(self, cfg: Settings) -> bool:
-        """Seed the store from .env on first run only.
-
-        Keeps existing env-configured deployments working across the upgrade,
-        while all later edits go through the UI.  Returns True if seeded.
-        """
+        """Seed the store from .env on first run only."""
         if self._store.loaded_from_disk:
             return False
         api_key = (cfg.emby_api_key or "").strip()
@@ -101,11 +101,7 @@ class SettingsService:
             "load_threshold": 0.8,
         }, persist=False)
         self._store.set_section("playback", dict(PLAYBACK_DEFAULTS), persist=False)
-        self._store.set_section("delivery", dict(DELIVERY_DEFAULTS), persist=False)
         self._store.set_section("integration", dict(INTEGRATION_DEFAULTS), persist=False)
-        # Mock mode seeds a demo fleet through the same path as real nodes, so
-        # the settings page and the scheduler can never disagree about what
-        # exists.
         seed = cfg.nodes() or (demo_nodes() if cfg.mediadeck_mock else [])
         self._store.set("nodes", [n.model_dump() for n in seed], persist=False)
         self._store.save()
@@ -113,7 +109,6 @@ class SettingsService:
 
     # -- emby ----------------------------------------------------------------
     def emby_config(self) -> dict[str, Any]:
-        """Raw config for internal adapter use (includes the secret)."""
         section = self._store.section("emby")
         return {
             "enabled": bool(section.get("enabled")),
@@ -124,7 +119,6 @@ class SettingsService:
         }
 
     def emby_public(self) -> dict[str, Any]:
-        """Safe-to-render config for the settings UI."""
         cfg = self.emby_config()
         return {
             "enabled": cfg["enabled"],
@@ -138,34 +132,27 @@ class SettingsService:
     def save_emby(self, payload: dict[str, Any]) -> dict[str, Any]:
         current = self.emby_config()
         url = _require_http_url(payload.get("url", current["url"]), "Emby 地址")
-
         api_key = payload.get("api_key", SECRET_UNCHANGED)
         if api_key == SECRET_UNCHANGED or api_key is None:
             api_key = current["api_key"]
         api_key = str(api_key).strip()
-
         enabled = bool(payload.get("enabled", current["enabled"]))
         if enabled and not api_key:
             raise ConfigError("启用 Emby 集成前必须填写 API Key")
-
         try:
             timeout = float(payload.get("timeout_seconds", current["timeout_seconds"]))
         except (TypeError, ValueError):
             raise ConfigError("超时时间必须是数字") from None
         if not 1 <= timeout <= 120:
             raise ConfigError("超时时间必须在 1–120 秒之间")
-
         self._store.set_section("emby", {
-            "enabled": enabled,
-            "url": url,
-            "api_key": api_key,
+            "enabled": enabled, "url": url, "api_key": api_key,
             "verify_ssl": bool(payload.get("verify_ssl", current["verify_ssl"])),
             "timeout_seconds": timeout,
         })
         return self.emby_public()
 
     def resolve_probe_target(self, payload: dict[str, Any]) -> tuple[str, str, float, bool]:
-        """Resolve a 'test connection' request against stored + submitted values."""
         current = self.emby_config()
         url = _require_http_url(payload.get("url") or current["url"], "Emby 地址")
         api_key = payload.get("api_key", SECRET_UNCHANGED)
@@ -209,85 +196,23 @@ class SettingsService:
         cfg = dict(PLAYBACK_DEFAULTS)
         for key in cfg:
             if key in section:
-                cfg[key] = section[key]
-        cfg["enabled"] = bool(cfg["enabled"])
-        cfg["direct_only"] = bool(cfg["direct_only"])
-        cfg["strip_prefix"] = str(cfg["strip_prefix"] or "")
-        cfg["path_template"] = str(cfg["path_template"] or "{path}")
+                cfg[key] = bool(section[key])
         return cfg
 
     def save_playback(self, payload: dict[str, Any]) -> dict[str, Any]:
         current = self.playback_config()
-        template = str(payload.get("path_template", current["path_template"]) or "{path}")
-        if "{path}" not in template:
-            raise ConfigError("路径模板必须包含 {path} 占位符")
         enabled = bool(payload.get("enabled", current["enabled"]))
-        if enabled and not self.nodes():
-            raise ConfigError("启用播放分流前必须至少配置一个推流节点")
+        if enabled:
+            nodes = self.nodes()
+            if not nodes:
+                raise ConfigError("启用播放分流前必须至少配置一个推流节点")
+            if not any(n.pools for n in nodes):
+                raise ConfigError("启用前请先给节点配置媒体根映射（节点详情 → 媒体根）")
         self._store.set_section("playback", {
             "enabled": enabled,
             "direct_only": bool(payload.get("direct_only", current["direct_only"])),
-            "strip_prefix": str(payload.get("strip_prefix", current["strip_prefix"]) or ""),
-            "path_template": template,
         })
         return self.playback_config()
-
-    # -- delivery security ---------------------------------------------------
-    def delivery_config(self) -> dict[str, Any]:
-        section = self._store.section("delivery")
-        cfg = dict(DELIVERY_DEFAULTS)
-        for key in cfg:
-            if key in section:
-                cfg[key] = section[key]
-        cfg["signing_enabled"] = bool(cfg["signing_enabled"])
-        cfg["secret"] = str(cfg["secret"] or "")
-        try:
-            cfg["ttl_seconds"] = int(cfg["ttl_seconds"])
-        except (TypeError, ValueError):
-            cfg["ttl_seconds"] = DELIVERY_DEFAULTS["ttl_seconds"]
-        return cfg
-
-    def delivery_public(self) -> dict[str, Any]:
-        cfg = self.delivery_config()
-        return {
-            "signing_enabled": cfg["signing_enabled"],
-            "secret_set": bool(cfg["secret"]),
-            "secret_masked": mask_secret(cfg["secret"]),
-            "ttl_seconds": cfg["ttl_seconds"],
-        }
-
-    def save_delivery(self, payload: dict[str, Any]) -> dict[str, Any]:
-        current = self.delivery_config()
-        try:
-            ttl = int(payload.get("ttl_seconds", current["ttl_seconds"]))
-        except (TypeError, ValueError):
-            raise ConfigError("链接有效期必须是数字") from None
-        if not MIN_TTL <= ttl <= MAX_TTL:
-            raise ConfigError(f"链接有效期必须在 {MIN_TTL}–{MAX_TTL} 秒之间")
-
-        secret = payload.get("secret", SECRET_UNCHANGED)
-        if secret == SECRET_UNCHANGED or secret is None or secret == "":
-            secret = current["secret"]
-        secret = str(secret).strip()
-
-        enabled = bool(payload.get("signing_enabled", current["signing_enabled"]))
-        # Enabling without a key would sign with an empty secret; generate one
-        # rather than silently producing URLs the node cannot verify.
-        if enabled and not secret:
-            secret = generate_secret()
-
-        self._store.set_section("delivery", {
-            "signing_enabled": enabled,
-            "secret": secret,
-            "ttl_seconds": ttl,
-        })
-        return self.delivery_public()
-
-    def rotate_delivery_secret(self) -> dict[str, Any]:
-        current = self.delivery_config()
-        current["secret"] = generate_secret()
-        self._store.set_section("delivery", current)
-        return self.delivery_public()
 
     # -- integration ---------------------------------------------------------
     def integration_config(self) -> dict[str, Any]:
@@ -302,17 +227,12 @@ class SettingsService:
         current = self.integration_config()
         panel = str(payload.get("panel_public_url", current["panel_public_url"]) or "").strip()
         emby = str(payload.get("emby_public_url", current["emby_public_url"]) or "").strip()
-        root = str(payload.get("node_media_root", current["node_media_root"]) or "").strip()
         if panel:
             panel = _require_http_url(panel, "面板对外地址")
         if emby:
             emby = _require_http_url(emby, "Emby 对外地址")
-        if root and not root.startswith("/"):
-            raise ConfigError("节点媒体根目录必须是绝对路径")
         self._store.set_section("integration", {
-            "panel_public_url": panel,
-            "emby_public_url": emby,
-            "node_media_root": root or INTEGRATION_DEFAULTS["node_media_root"],
+            "panel_public_url": panel, "emby_public_url": emby,
         })
         return self.integration_config()
 
@@ -327,8 +247,24 @@ class SettingsService:
                 continue
         return out
 
+    def node(self, name: str) -> StreamNode | None:
+        return next((n for n in self.nodes() if n.name == name), None)
+
+    @staticmethod
+    def node_public(node: StreamNode) -> dict[str, Any]:
+        """Node view for the UI: never leaks the signing key or enroll token."""
+        data = node.model_dump()
+        secret = data.pop("sign_secret", "") or ""
+        rclone_conf = data.pop("rclone_conf", "") or ""
+        data.pop("enroll_token", None)
+        data["sign_secret_set"] = bool(secret)
+        data["sign_secret_masked"] = mask_secret(secret)
+        # The Drive config contains OAuth tokens; only report whether it is set.
+        data["rclone_conf_set"] = bool(rclone_conf.strip())
+        return data
+
     def nodes_public(self) -> list[dict[str, Any]]:
-        return [n.model_dump() for n in self.nodes()]
+        return [self.node_public(n) for n in self.nodes()]
 
     def _persist_nodes(self, nodes: list[StreamNode]) -> None:
         self._store.set("nodes", [n.model_dump() for n in nodes])
@@ -336,7 +272,44 @@ class SettingsService:
             self._scheduler.reconfigure(nodes)
 
     @staticmethod
-    def _validate_node(payload: dict[str, Any], existing: StreamNode | None = None) -> StreamNode:
+    def _validate_pools(raw: Any, existing: list[NodePool]) -> list[NodePool]:
+        if raw is None:
+            return existing
+        if not isinstance(raw, list):
+            raise ConfigError("媒体根必须是列表")
+        if len(raw) > MAX_POOLS:
+            raise ConfigError(f"媒体根数量不能超过 {MAX_POOLS}")
+        out: list[NodePool] = []
+        seen_prefix: set[str] = set()
+        seen_name: set[str] = set()
+        for item in raw:
+            if not isinstance(item, dict):
+                raise ConfigError("媒体根格式错误")
+            name = str(item.get("name") or "").strip()
+            if not NAME_RE.match(name):
+                raise ConfigError("媒体根名称只能包含字母、数字、点、下划线和连字符")
+            if name in seen_name:
+                raise ConfigError(f"媒体根名称重复: {name}")
+            emby_prefix = _abs_path(str(item.get("emby_prefix") or ""), "Emby 路径前缀")
+            if emby_prefix in seen_prefix:
+                raise ConfigError(f"Emby 路径前缀重复: {emby_prefix}")
+            url_prefix = str(item.get("url_prefix") or "").strip().rstrip("/")
+            if not url_prefix.startswith("/"):
+                raise ConfigError("节点 URL 前缀必须以 / 开头")
+            node_path = str(item.get("node_path") or "").strip().rstrip("/")
+            if node_path and not node_path.startswith("/"):
+                raise ConfigError("节点本地路径必须是绝对路径")
+            seen_name.add(name)
+            seen_prefix.add(emby_prefix)
+            out.append(NodePool(
+                name=name, emby_prefix=emby_prefix, url_prefix=url_prefix,
+                node_path=node_path,
+                rclone_remote=str(item.get("rclone_remote") or "").strip(),
+            ))
+        return out
+
+    def _validate_node(self, payload: dict[str, Any],
+                       existing: StreamNode | None = None) -> StreamNode:
         base = existing.model_dump() if existing else {}
         name = str(payload.get("name", base.get("name", ""))).strip()
         if not NAME_RE.match(name):
@@ -349,12 +322,43 @@ class SettingsService:
             raise ConfigError("并发容量必须是数字") from None
         if not 1 <= capacity <= 100000:
             raise ConfigError("并发容量必须在 1–100000 之间")
+
+        pools = self._validate_pools(
+            payload.get("pools"),
+            [NodePool(**p) for p in (base.get("pools") or [])],
+        )
+
+        secret = payload.get("sign_secret", SECRET_UNCHANGED)
+        if secret == SECRET_UNCHANGED or secret is None:
+            secret = base.get("sign_secret", "")
+        secret = str(secret).strip()
+
+        try:
+            ttl = int(payload.get("sign_ttl_seconds", base.get("sign_ttl_seconds", 21600)))
+        except (TypeError, ValueError):
+            raise ConfigError("链接有效期必须是数字") from None
+        if not MIN_TTL <= ttl <= MAX_TTL:
+            raise ConfigError(f"链接有效期必须在 {MIN_TTL}–{MAX_TTL} 秒之间")
+
         return StreamNode(
-            name=name,
-            base_url=base_url,
-            probe_url=probe_url,
-            capacity=capacity,
+            name=name, base_url=base_url, probe_url=probe_url, capacity=capacity,
             enabled=bool(payload.get("enabled", base.get("enabled", True))),
+            pools=pools,
+            sign_secret=secret,
+            sign_ttl_seconds=ttl,
+            sign_arg_digest=str(payload.get(
+                "sign_arg_digest", base.get("sign_arg_digest", "md5")) or "md5").strip(),
+            sign_arg_expires=str(payload.get(
+                "sign_arg_expires", base.get("sign_arg_expires", "expires")) or "expires").strip(),
+            cache_dir=str(payload.get(
+                "cache_dir", base.get("cache_dir", "/var/cache/mediadeck"))).strip(),
+            cache_size=str(payload.get("cache_size", base.get("cache_size", "500G"))).strip(),
+            # Drive identity travels with the node: without it the installer
+            # would still need `rclone config` run by hand on the target,
+            # which is exactly the manual step one-command enrollment removes.
+            rclone_conf=str(payload.get(
+                "rclone_conf", base.get("rclone_conf", "")) or ""),
+            enroll_token=str(base.get("enroll_token", "")),
         )
 
     def add_node(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -364,9 +368,14 @@ class SettingsService:
         node = self._validate_node(payload)
         if any(n.name == node.name for n in nodes):
             raise ConfigError(f"节点名称已存在: {node.name}")
+        # A node with no signing key would hand out permanent public links;
+        # generate one up front so the installer can bake it in.
+        if not node.sign_secret:
+            node.sign_secret = generate_secret()
+        node.enroll_token = secrets.token_urlsafe(24)
         nodes.append(node)
         self._persist_nodes(nodes)
-        return node.model_dump()
+        return self.node_public(node)
 
     def update_node(self, name: str, payload: dict[str, Any]) -> dict[str, Any]:
         nodes = self.nodes()
@@ -378,7 +387,7 @@ class SettingsService:
             raise ConfigError(f"节点名称已存在: {updated.name}")
         nodes[index] = updated
         self._persist_nodes(nodes)
-        return updated.model_dump()
+        return self.node_public(updated)
 
     def delete_node(self, name: str) -> bool:
         nodes = self.nodes()
@@ -387,3 +396,33 @@ class SettingsService:
             raise KeyError(name)
         self._persist_nodes(remaining)
         return True
+
+    def rotate_node_secret(self, name: str) -> dict[str, Any]:
+        nodes = self.nodes()
+        index = next((i for i, n in enumerate(nodes) if n.name == name), None)
+        if index is None:
+            raise KeyError(name)
+        nodes[index].sign_secret = generate_secret()
+        self._persist_nodes(nodes)
+        return self.node_public(nodes[index])
+
+    # -- enrollment ----------------------------------------------------------
+    def node_by_enroll_token(self, token: str) -> StreamNode | None:
+        token = (token or "").strip()
+        if not token:
+            return None
+        for node in self.nodes():
+            if node.enroll_token and secrets.compare_digest(node.enroll_token, token):
+                return node
+        return None
+
+    def node_enroll_token(self, name: str) -> str:
+        """Return (creating if needed) the one-shot install token for a node."""
+        nodes = self.nodes()
+        index = next((i for i, n in enumerate(nodes) if n.name == name), None)
+        if index is None:
+            raise KeyError(name)
+        if not nodes[index].enroll_token:
+            nodes[index].enroll_token = secrets.token_urlsafe(24)
+            self._persist_nodes(nodes)
+        return nodes[index].enroll_token
