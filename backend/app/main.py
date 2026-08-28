@@ -19,6 +19,7 @@ from app.modules.imports import ImportManager, JobKind, MockExecutor
 from app.modules.mounts import MockMounts, MountsReader
 from app.modules.pipeline import MockPipeline, PipelineReader
 from app.modules.scheduler import Scheduler
+from app.modules.storage import MockStorage, StorageManager
 from app.modules.tasks import MockTasks, TasksReader
 from app.modules.updater import MockUpdater, Updater
 
@@ -33,6 +34,15 @@ def _auth(credentials: HTTPBasicCredentials = Depends(security)) -> str:  # noqa
     if not (user_ok and pass_ok):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, headers={"WWW-Authenticate": "Basic"})
     return credentials.username
+
+
+def _storage_call(fn: Any, *args: Any, **kwargs: Any) -> Any:
+    try:
+        return fn(*args, **kwargs)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from None
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(409, str(exc)) from None
 
 
 @app.on_event("startup")
@@ -50,6 +60,7 @@ async def _startup() -> None:
     app.state.mounts = (
         MockMounts() if cfg.mediadeck_mock else MountsReader(cfg.mounts_snapshot_path)
     )
+    app.state.storage = MockStorage() if cfg.mediadeck_mock else StorageManager(cfg)
     app.state.tasks = (
         MockTasks() if cfg.mediadeck_mock else TasksReader(cfg.tasks_snapshot_path)
     )
@@ -178,6 +189,57 @@ async def update_apply(target: str | None = Body(None, embed=True)) -> dict[str,
 @app.get("/api/mounts", dependencies=[Depends(_auth)])
 async def mounts() -> dict[str, Any]:
     return app.state.mounts.snapshot()
+
+
+# ---- storage (rclone remotes + systemd mounts) -----------------------------
+@app.get("/api/storage/remotes", dependencies=[Depends(_auth)])
+async def storage_list_remotes() -> list[dict[str, Any]]:
+    return _storage_call(app.state.storage.list_remotes)
+
+
+@app.post("/api/storage/remotes", dependencies=[Depends(_auth)])
+async def storage_add_remote(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:  # noqa: B008
+    return _storage_call(
+        app.state.storage.add_remote,
+        payload.get("name") or "",
+        payload.get("type") or "",
+        payload.get("options") or {},
+    )
+
+
+@app.delete("/api/storage/remotes/{name}", dependencies=[Depends(_auth)])
+async def storage_delete_remote(name: str) -> dict[str, bool]:
+    return _storage_call(app.state.storage.delete_remote, name)
+
+
+@app.post("/api/storage/remotes/{name}/test", dependencies=[Depends(_auth)])
+async def storage_test_remote(name: str) -> dict[str, Any]:
+    return _storage_call(app.state.storage.test_remote, name)
+
+
+@app.get("/api/storage/mounts", dependencies=[Depends(_auth)])
+async def storage_list_mounts() -> list[dict[str, Any]]:
+    return _storage_call(app.state.storage.list_mounts)
+
+
+@app.post("/api/storage/mounts", dependencies=[Depends(_auth)])
+async def storage_create_mount(spec: dict[str, Any] = Body(...)) -> dict[str, Any]:  # noqa: B008
+    return _storage_call(app.state.storage.create_mount, spec)
+
+
+@app.post("/api/storage/mounts/{name}/start", dependencies=[Depends(_auth)])
+async def storage_start_mount(name: str) -> dict[str, Any]:
+    return _storage_call(app.state.storage.start_mount, name)
+
+
+@app.post("/api/storage/mounts/{name}/stop", dependencies=[Depends(_auth)])
+async def storage_stop_mount(name: str) -> dict[str, Any]:
+    return _storage_call(app.state.storage.stop_mount, name)
+
+
+@app.delete("/api/storage/mounts/{name}", dependencies=[Depends(_auth)])
+async def storage_delete_mount(name: str) -> dict[str, bool]:
+    return _storage_call(app.state.storage.delete_mount, name)
 
 
 @app.get("/api/tasks", dependencies=[Depends(_auth)])

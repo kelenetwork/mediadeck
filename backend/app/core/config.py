@@ -39,6 +39,13 @@ class Settings(BaseSettings):
     repo_root: str = ""
     service_name: str = "mediadeck"
 
+    rclone_binary: str = "rclone"
+    rclone_config_path: str = ""
+    mount_root: str = ""
+    cache_root: str = ""
+    systemd_unit_dir: str = "/etc/systemd/system"
+    systemd_unit_prefix: str = "mediadeck-mount-"
+
     def nodes(self) -> list[StreamNode]:
         try:
             raw = json.loads(self.stream_nodes or "[]")

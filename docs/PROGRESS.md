@@ -4,6 +4,31 @@ Newest entries first. Every working session appends one entry.
 
 ---
 
+## 2026-08-29 (7) — storage management backend (v0.8.0)
+**Done**
+- Panel becomes a configuration entry point, not just a viewer: cloud remotes
+  and mounts can now be created from the API instead of being hand-edited on
+  the host.
+- `app/modules/storage.py`: StorageManager (configparser-based remote CRUD with
+  atomic writes, connectivity test, systemd unit generation, start/stop/delete)
+  plus MockStorage for credential-free development.
+- Settings: rclone_binary, rclone_config_path, mount_root, cache_root,
+  systemd_unit_dir, systemd_unit_prefix.
+- Nine /api/storage/* routes with ValueError -> 422 and other failures -> 409.
+- Security gates reviewed line-by-line and verified by hand: name allowlist
+  regex, realpath containment against mount root (blocks ../, absolute paths
+  and nested traversal), list-form subprocess with no shell, fixed unit-name
+  prefix, secret redaction on read, explicit not-configured errors.
+- Implementation delegated to a coding subagent; reviewed in depth (this
+  touches production writes and permission logic) before commit.
+- Tests 16/16, ruff clean.
+
+**Next**
+- Storage management UI page.
+- Full-replacement roadmap (own scraper/library/playback) per owner decision.
+
+---
+
 ## 2026-08-29 (6) — scheduled task center (v0.7.0)
 **Done**
 - `app/modules/tasks.py`: TasksReader over a sanitized host snapshot (missing
