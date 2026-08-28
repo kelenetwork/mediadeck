@@ -135,3 +135,21 @@ def test_import_lane_lifecycle() -> None:
         assert client.post(f"/api/imports/{cancellable['id']}/cancel", headers=_basic()).json()["cancelled"]
         failed = client.get("/api/imports?state=failed", headers=_basic()).json()
         assert any(j["id"] == cancellable["id"] for j in failed)
+
+
+def test_updater_mock() -> None:
+    with TestClient(app) as client:
+        v = client.get("/api/update/version", headers=_basic()).json()
+        assert v["version"].startswith("v0.0.0")
+        chk = client.get("/api/update/check", headers=_basic()).json()
+        assert chk["ok"] and chk["update_available"]
+        r = client.post("/api/update/apply", headers=_basic(), json={})
+        assert r.json()["started"] and r.json()["target"] == "v0.0.1"
+
+
+def test_semver_helpers() -> None:
+    from app.modules.updater import latest_tag, semver_key
+    assert semver_key("v1.2.3") == (1, 2, 3)
+    assert semver_key("v1.2") is None and semver_key("junk") is None
+    assert latest_tag(["v0.1.0", "v0.10.0", "v0.2.9", "nope"]) == "v0.10.0"
+    assert latest_tag(["nope"]) is None

@@ -16,6 +16,7 @@ from app.core.config import settings
 from app.modules.imports import ImportManager, JobKind, MockExecutor
 from app.modules.pipeline import MockPipeline, PipelineReader
 from app.modules.scheduler import Scheduler
+from app.modules.updater import MockUpdater, Updater
 
 app = FastAPI(title="mediadeck", version="0.1.0")
 security = HTTPBasic()
@@ -43,6 +44,10 @@ async def _startup() -> None:
         MockPipeline() if cfg.mediadeck_mock else PipelineReader(cfg.pipeline_snapshot_path)
     )
     app.state.imports = ImportManager(MockExecutor() if cfg.mediadeck_mock else None)
+    if cfg.mediadeck_mock or not cfg.repo_root:
+        app.state.updater = MockUpdater()
+    else:
+        app.state.updater = Updater(cfg.repo_root, cfg.service_name)
     app.state.scheduler = Scheduler(cfg.nodes() or _mock_nodes(cfg), probe)
 
     async def probe_loop() -> None:
@@ -125,6 +130,25 @@ async def stream_redirect(path: str) -> RedirectResponse:
 @app.get("/api/pipeline", dependencies=[Depends(_auth)])
 async def pipeline() -> dict[str, Any]:
     return app.state.pipeline.snapshot()
+
+
+# ---- self-update -----------------------------------------------------------
+@app.get("/api/update/version", dependencies=[Depends(_auth)])
+async def update_version() -> dict[str, Any]:
+    return app.state.updater.version()
+
+
+@app.get("/api/update/check", dependencies=[Depends(_auth)])
+async def update_check() -> dict[str, Any]:
+    return app.state.updater.check()
+
+
+@app.post("/api/update/apply", dependencies=[Depends(_auth)])
+async def update_apply(target: str | None = Body(None, embed=True)) -> dict[str, Any]:
+    result = app.state.updater.update(target)
+    if not result.get("started"):
+        raise HTTPException(409, result.get("error", "update not started"))
+    return result
 
 
 # ---- import lanes ----------------------------------------------------------

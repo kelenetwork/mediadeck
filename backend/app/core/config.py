@@ -37,6 +37,9 @@ class Settings(BaseSettings):
 
     pipeline_snapshot_path: str = ""
 
+    repo_root: str = ""
+    service_name: str = "mediadeck"
+
     def nodes(self) -> list[StreamNode]:
         try:
             raw = json.loads(self.stream_nodes or "[]")
