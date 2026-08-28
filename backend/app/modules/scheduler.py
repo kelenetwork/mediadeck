@@ -6,6 +6,7 @@ normalized load = active_streams / weight.  Ties broken by egress headroom.
 from __future__ import annotations
 
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
@@ -36,9 +37,16 @@ class NodeState:
 
 
 class Scheduler:
+    HISTORY_MAX = 720      # probe snapshots kept per node (~3h at 15s interval)
+    DISPATCH_MAX = 1000    # recent dispatch decisions kept
+
     def __init__(self, nodes: list[StreamNode], probe: Any) -> None:
         self._states: dict[str, NodeState] = {n.name: NodeState(node=n) for n in nodes}
         self._probe = probe
+        self._history: dict[str, deque[dict[str, Any]]] = {
+            n.name: deque(maxlen=self.HISTORY_MAX) for n in nodes
+        }
+        self._dispatch_log: deque[dict[str, Any]] = deque(maxlen=self.DISPATCH_MAX)
 
     async def refresh(self) -> None:
         for st in self._states.values():
@@ -52,12 +60,36 @@ class Scheduler:
             else:
                 st.ok = False
                 st.consecutive_failures += 1
+            self._history[st.node.name].append({
+                "ts": st.last_probe_ts,
+                "ok": st.ok,
+                "active_streams": st.active_streams if st.ok else None,
+                "egress_mbps": st.egress_mbps if st.ok else None,
+            })
 
-    def pick(self) -> NodeState | None:
+    def pick(self, record: bool = True, context: str = "") -> NodeState | None:
         candidates = [s for s in self._states.values() if s.available()]
-        if not candidates:
-            return None
-        return min(candidates, key=lambda s: (s.normalized_load(), s.egress_mbps))
+        chosen = None
+        if candidates:
+            chosen = min(candidates, key=lambda s: (s.normalized_load(), s.egress_mbps))
+        if record:
+            self._dispatch_log.append({
+                "ts": time.time(),
+                "node": chosen.node.name if chosen else None,
+                "normalized_load": chosen.normalized_load() if chosen else None,
+                "candidates": len(candidates),
+                "context": context[:200],
+            })
+        return chosen
+
+    def history(self, name: str, limit: int = 240) -> list[dict[str, Any]]:
+        entries = self._history.get(name)
+        if entries is None:
+            raise KeyError(name)
+        return list(entries)[-max(1, min(limit, self.HISTORY_MAX)):]
+
+    def dispatch_log(self, limit: int = 100) -> list[dict[str, Any]]:
+        return list(self._dispatch_log)[-max(1, min(limit, self.DISPATCH_MAX)):]
 
     def set_disabled(self, name: str, disabled: bool) -> bool:
         st = self._states.get(name)

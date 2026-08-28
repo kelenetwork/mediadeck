@@ -59,3 +59,23 @@ def test_pipeline_mock() -> None:
         assert snap["available"] is True
         names = {q["name"] for q in snap["data"]["queues"]}
         assert "staging" in names and "upload-lanes" in names
+
+
+def test_history_and_dispatch_log() -> None:
+    with TestClient(app) as client:
+        # generate one real dispatch (recorded) via the 302 edge
+        client.get("/stream/demo/file.mkv", follow_redirects=False)
+        log = client.get("/api/dispatch/log", headers=_basic()).json()
+        assert log and log[-1]["node"] in {"mock-a", "mock-b"}
+        assert log[-1]["context"] == "demo/file.mkv"
+        # dry-run pick must NOT be recorded
+        before = len(client.get("/api/dispatch/log", headers=_basic()).json())
+        client.get("/api/dispatch/pick", headers=_basic())
+        after = len(client.get("/api/dispatch/log", headers=_basic()).json())
+        assert after == before
+        # unknown node history -> 404
+        assert client.get("/api/nodes/nope/history", headers=_basic()).status_code == 404
+        # known node history endpoint works (may be empty before first probe)
+        r = client.get("/api/nodes/mock-a/history", headers=_basic())
+        assert r.status_code == 200
+        assert isinstance(r.json(), list)

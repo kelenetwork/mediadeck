@@ -87,10 +87,23 @@ async def enable_node(name: str) -> dict[str, bool]:
     return {"disabled": False}
 
 
+@app.get("/api/nodes/{name}/history", dependencies=[Depends(_auth)])
+async def node_history(name: str, limit: int = 240) -> list[dict[str, Any]]:
+    try:
+        return app.state.scheduler.history(name, limit)
+    except KeyError:
+        raise HTTPException(404, "unknown node") from None
+
+
+@app.get("/api/dispatch/log", dependencies=[Depends(_auth)])
+async def dispatch_log(limit: int = 100) -> list[dict[str, Any]]:
+    return app.state.scheduler.dispatch_log(limit)
+
+
 @app.get("/api/dispatch/pick", dependencies=[Depends(_auth)])
 async def dispatch_pick() -> dict[str, Any]:
     """Dry-run of the 302 target selection (no redirect issued)."""
-    chosen = app.state.scheduler.pick()
+    chosen = app.state.scheduler.pick(record=False)
     if not chosen:
         raise HTTPException(503, "no available streaming node")
     return {"node": chosen.node.name, "base_url": chosen.node.base_url,
@@ -100,7 +113,7 @@ async def dispatch_pick() -> dict[str, Any]:
 @app.get("/stream/{path:path}")
 async def stream_redirect(path: str) -> RedirectResponse:
     """The actual 302 edge: redirect a stream request to the chosen node."""
-    chosen = app.state.scheduler.pick()
+    chosen = app.state.scheduler.pick(context=path)
     if not chosen:
         raise HTTPException(503, "no available streaming node")
     return RedirectResponse(f"{chosen.node.base_url.rstrip('/')}/{path}", status_code=302)

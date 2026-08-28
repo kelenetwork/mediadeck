@@ -4,6 +4,20 @@ Newest entries first. Every working session appends one entry.
 
 ---
 
+## 2026-08-28 (3) — scheduler dispatch log + probe history
+**Done**
+- Scheduler keeps per-node probe history (deque, ~3h at 15s interval) and a
+  recent dispatch decision log (node chosen, normalized load, candidate count,
+  request context). Dry-run picks are NOT recorded; real /stream 302s are.
+- New endpoints: `GET /api/nodes/{name}/history`, `GET /api/dispatch/log`.
+- +1 test (7 passing), ruff clean.
+
+**Next**
+- Host-side collector script (outside repo) exporting sanitized pipeline snapshot.
+- Roadmap Phase 2 prep: import-lane module skeleton.
+
+---
+
 ## 2026-08-28 (2) — pipeline overview + node probe agent
 **Done**
 - `app/modules/pipeline.py`: PipelineReader serves a sanitized JSON snapshot
