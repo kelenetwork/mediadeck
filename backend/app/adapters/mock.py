@@ -88,11 +88,23 @@ class MockEmby:
         # Mirrors the live adapter: only a non-empty token is ever accepted.
         return bool((token or "").strip()) and token != "invalid-token"
 
-    async def user_for_token(self, token: str) -> str | None:
+    async def user_for_token(self, token: str,
+                             device_id: str = "") -> str | None:
         """Deterministic mock: "tok:<uid>" resolves to that user, anything
-        else non-empty resolves to u1 so existing playback tests keep working."""
+        else non-empty resolves to u1 so existing playback tests keep working.
+
+        ``admin-key`` models the live ambiguity the real adapter has to break:
+        a fleet-wide credential identifies nobody on its own, and only the
+        request's ``DeviceId`` ("dev:<uid>") names the actual streamer.
+        """
         token = (token or "").strip()
         if not token or token == "invalid-token":
+            return None
+        if token == "admin-key":
+            device_id = (device_id or "").strip()
+            if device_id.startswith("dev:"):
+                uid = device_id[4:]
+                return uid if uid in self._users else None
             return None
         if token.startswith("tok:"):
             uid = token[4:]

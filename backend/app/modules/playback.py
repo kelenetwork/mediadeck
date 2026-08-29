@@ -120,6 +120,32 @@ def caller_token(headers: Any, query: dict[str, str]) -> str:
     return ""
 
 
+def caller_device(headers: Any, query: dict[str, str]) -> str:
+    """Extract the caller's device id from a playback request.
+
+    This is what disambiguates a fleet-wide admin api_key: Emby scopes
+    ``/emby/Sessions?api_key=`` to the credential, so a *user* token names its
+    owner on its own, but an admin key sees every session and identifies
+    nobody. The device id names the one session actually playing.
+
+    Emby clients spell it inconsistently across versions, and every spelling
+    missed here downgrades that client back to an unattributed, uncapped
+    stream -- so accept all of them rather than the modern one only.
+    """
+    for header in ("x-emby-device-id", "x-mediabrowser-device-id"):
+        value = headers.get(header)
+        if value:
+            return str(value).strip()
+    auth = headers.get("authorization") or headers.get("x-emby-authorization") or ""
+    match = re.search(r'deviceid\s*=\s*"?([^",\s]+)"?', str(auth), re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+    for key in ("DeviceId", "deviceId", "deviceid", "device_id"):
+        if query.get(key):
+            return str(query[key]).strip()
+    return ""
+
+
 def is_transcode_request(path: str, query: dict[str, str]) -> bool:
     """Decide whether Emby is generating this response rather than serving a file.
 
@@ -249,7 +275,8 @@ class PlaybackRouter:
     # -- main entry ----------------------------------------------------------
     async def route(self, item_id: str, request_path: str,
                     query: dict[str, str], caller_token: str = "",
-                    require_auth: bool = False) -> Decision:
+                    require_auth: bool = False,
+                    caller_device: str = "") -> Decision:
         cfg = self._config() or {}
 
         if not cfg.get("enabled"):
@@ -310,7 +337,8 @@ class PlaybackRouter:
             rate_bps, utag = 0, ""
             if self._rate_resolver is not None and caller_token:
                 try:
-                    rate_bps, utag = await self._rate_resolver(caller_token)
+                    rate_bps, utag = await self._rate_resolver(
+                        caller_token, caller_device)
                 except Exception:  # noqa: BLE001 - fail open: sign uncapped
                     rate_bps, utag = 0, ""
             target = sign_url(

@@ -37,7 +37,7 @@ from app.modules.imports import ImportManager, JobKind, MockExecutor
 from app.modules.members import MemberService, random_password
 from app.modules.mounts import MockMounts, MountsReader
 from app.modules.pipeline import MockPipeline, PipelineReader
-from app.modules.playback import PlaybackRouter, caller_token
+from app.modules.playback import PlaybackRouter, caller_device, caller_token
 from app.modules.provisioning import (
     emby_frontend_snippet,
     enroll_command,
@@ -186,20 +186,24 @@ async def _startup() -> None:
 
     # Playback interception: the piece that puts the scheduler on the real
     # client path instead of only the /stream test edge.
-    async def _member_rate(token: str) -> tuple[int, str]:
-        """Caller token -> (bandwidth cap in bytes/s, anonymised user tag).
+    async def _member_rate(token: str, device: str = "") -> tuple[int, str]:
+        """Caller credential -> (bandwidth cap in bytes/s, anonymised user tag).
 
         Signed into every node URL, so the node enforces the member's cap and
         can attribute real transfer bytes back to the user. Cached briefly:
         one playback start must not cost two extra round trips every time.
+
+        The device id is part of the cache key, not just the token: one admin
+        api_key is shared by every session it can see, so caching by token
+        alone would hand the first resolved user's cap to everyone else.
         """
-        cache_key = f"rate:{user_tag(token)}"
+        cache_key = f"rate:{user_tag(token)}:{user_tag(device)}"
         cached = app.state.cache.get(cache_key)
         if cached is not None:
             return cached
         result: tuple[int, str] = (0, "")
         try:
-            uid = await app.state.emby.user_for_token(token)
+            uid = await app.state.emby.user_for_token(token, device)
             if uid:
                 member = app.state.members.get(uid)
                 kbps = int((member or {}).get("bandwidth_limit_kbps") or 0)
@@ -207,7 +211,10 @@ async def _startup() -> None:
                 result = (kbps * 125, user_tag(uid))
         except Exception:  # noqa: BLE001 - fail open: sign uncapped
             result = (0, "")
-        app.state.cache.set(cache_key, result, ttl=60)
+        # An unresolved caller is cached only briefly: it means the stream is
+        # running uncapped and unattributed, and that must self-heal as soon
+        # as the session registers rather than persist for a full minute.
+        app.state.cache.set(cache_key, result, ttl=60 if result[1] else 10)
         return result
 
     app.state.playback = PlaybackRouter(
@@ -837,6 +844,7 @@ async def emby_video_stream(item_id: str, rest: str, request: Request) -> Redire
     decision = await app.state.playback.route(
         item_id, request.url.path.lstrip("/"), query,
         caller_token=caller_token(request.headers, query),
+        caller_device=caller_device(request.headers, query),
         require_auth=True,
     )
 
