@@ -17,6 +17,10 @@ class MockEmby:
         self._next = 3
         self._sessions: list[dict[str, Any]] = []
         self.stopped: list[tuple[str, str]] = []
+        self.deleted_sessions: list[str] = []
+        # username -> password; missing means any non-empty password is accepted
+        # so existing tests that never set a password still work.
+        self._passwords: dict[str, str] = {}
 
     async def system_info(self) -> dict[str, Any]:
         return {
@@ -48,7 +52,30 @@ class MockEmby:
         return True
 
     async def set_user_password(self, user_id: str, new_password: str) -> bool:
-        return user_id in self._users
+        user = self._users.get(user_id)
+        if not user:
+            return False
+        self._passwords[user.get("Name") or ""] = new_password
+        return True
+
+    async def authenticate_user(self, username: str, password: str) -> dict[str, Any] | None:
+        """Return the user dict on success, None on bad credentials.
+
+        Never raises on a wrong password: the caller maps None to a 422 so a
+        public redeem form cannot distinguish 'no such user' from 'bad password'.
+        """
+        if not username or not password:
+            return None
+        user = next((u for u in self._users.values()
+                     if (u.get("Name") or "").lower() == username.lower()), None)
+        if not user:
+            return None
+        expected = self._passwords.get(user.get("Name") or "")
+        if expected is None:
+            return dict(user)
+        if expected != password:
+            return None
+        return dict(user)
 
     async def apply_policy(self, user_id: str, policy_patch: dict[str, Any]) -> bool:
         user = self._users.get(user_id)
@@ -92,6 +119,12 @@ class MockEmby:
         before = len(self._sessions)
         self._sessions = [s for s in self._sessions if s.get("Id") != session_id]
         self.stopped.append((session_id, reason))
+        return len(self._sessions) < before
+
+    async def delete_session(self, session_id: str) -> bool:
+        before = len(self._sessions)
+        self._sessions = [s for s in self._sessions if s.get("Id") != session_id]
+        self.deleted_sessions.append(session_id)
         return len(self._sessions) < before
 
     async def sessions_for_user(self, user_id: str) -> list[dict[str, Any]]:

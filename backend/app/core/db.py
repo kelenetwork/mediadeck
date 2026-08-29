@@ -69,7 +69,10 @@ CREATE TABLE IF NOT EXISTS members (
     -- "nothing changed" from "never applied" without re-writing every policy
     -- on every pass.
     applied_fingerprint TEXT NOT NULL DEFAULT '',
-    applied_at          INTEGER
+    applied_at          INTEGER,
+    -- Per-member permission overlay. Missing keys inherit the plan; '{}' means
+    -- fully inherited. Validated in members.py, never trusted as raw input.
+    overrides_json      TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS idx_members_plan ON members(plan_id);
 CREATE INDEX IF NOT EXISTS idx_members_status ON members(status);
@@ -157,6 +160,37 @@ CREATE TABLE IF NOT EXISTS invites (
     revoked         INTEGER NOT NULL DEFAULT 0
 );
 
+-- Renewal / top-up codes. Distinct from invites: invites create accounts,
+-- these mutate an existing member (switch plan, extend days, add traffic).
+CREATE TABLE IF NOT EXISTS redeem_codes (
+    id                  TEXT PRIMARY KEY,
+    batch_id            TEXT NOT NULL,
+    kind                TEXT NOT NULL,
+    plan_id             TEXT,
+    extend_days         INTEGER NOT NULL DEFAULT 0,
+    add_traffic_bytes   INTEGER NOT NULL DEFAULT 0,
+    max_uses            INTEGER NOT NULL DEFAULT 1,
+    used_count          INTEGER NOT NULL DEFAULT 0,
+    expires_at          INTEGER,
+    created_at          INTEGER NOT NULL,
+    created_by          TEXT NOT NULL DEFAULT '',
+    note                TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_redeem_batch ON redeem_codes(batch_id);
+CREATE INDEX IF NOT EXISTS idx_redeem_kind ON redeem_codes(kind);
+
+CREATE TABLE IF NOT EXISTS redeem_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    code        TEXT NOT NULL,
+    user_id     TEXT NOT NULL DEFAULT '',
+    ts          INTEGER NOT NULL,
+    actor       TEXT NOT NULL DEFAULT '',
+    detail      TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_redeem_log_code ON redeem_log(code);
+CREATE INDEX IF NOT EXISTS idx_redeem_log_user ON redeem_log(user_id);
+CREATE INDEX IF NOT EXISTS idx_redeem_log_ts ON redeem_log(ts);
+
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -194,7 +228,20 @@ class Database:
                     "INSERT INTO meta(key,value) VALUES('schema_version',?)",
                     (str(SCHEMA_VERSION),),
                 )
+            self._ensure_column(
+                "members", "overrides_json", "TEXT NOT NULL DEFAULT '{}'")
             self._conn.commit()
+
+    def _ensure_column(self, table: str, name: str, ddl: str) -> None:
+        """Idempotent ADD COLUMN for databases created before the column existed.
+
+        CREATE TABLE IF NOT EXISTS never adds columns to an existing table, so
+        a fresh install gets the column from SCHEMA while an upgraded install
+        reaches here. PRAGMA table_info is the sqlite-portable check.
+        """
+        cols = {r[1] for r in self._conn.execute(f"PRAGMA table_info({table})")}
+        if name not in cols:
+            self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
 
     @contextmanager
     def write(self) -> Iterator[sqlite3.Connection]:

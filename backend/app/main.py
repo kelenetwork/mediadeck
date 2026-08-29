@@ -43,6 +43,7 @@ from app.modules.provisioning import (
     enroll_command,
     install_script,
 )
+from app.modules.redeem import RedeemService
 from app.modules.scheduler import Scheduler
 from app.modules.settings import SettingsService
 from app.modules.stats import StatsService
@@ -165,6 +166,8 @@ async def _startup() -> None:
         app.state.db, app.state.members, app.state.emby)
     app.state.invites = InviteService(
         app.state.db, app.state.plans, app.state.members, app.state.emby)
+    app.state.redeem = RedeemService(
+        app.state.db, app.state.plans, app.state.members, app.state.emby)
     app.state.stats = StatsService(app.state.db)
     app.state.usage = UsageSampler(
         app.state.db, app.state.members, app.state.emby, app.state.enforcement)
@@ -277,6 +280,12 @@ async def root(_: str = Depends(_auth)) -> FileResponse:
 async def invite_page(code: str) -> FileResponse:
     """Public redeem page: no admin session, the code is the credential."""
     return FileResponse(STATIC_DIR / "invite.html")
+
+
+@app.get("/redeem", include_in_schema=False)
+async def redeem_page() -> FileResponse:
+    """Public renewal-code page: the member authenticates with Emby credentials."""
+    return FileResponse(STATIC_DIR / "redeem.html")
 
 
 @app.get("/healthz")
@@ -932,16 +941,29 @@ async def members_list(status: str | None = None, plan_id: str | None = None,
 
 @app.get("/api/members/{user_id}", dependencies=[Depends(_auth)])
 async def members_get(user_id: str, days: int = 30) -> dict[str, Any]:
-    member = app.state.members.get(user_id)
-    if not member:
+    detail = app.state.members.detail(user_id)
+    if not detail:
         raise HTTPException(404, "unknown member")
-    detail = app.state.stats.member_detail(user_id, days)
+    days = max(1, min(int(days or 30), 400))
+    stats = app.state.stats.member_detail(user_id, days)
+    series = stats.get("series") or []
+    usage = {
+        "days": days,
+        "bytes": sum(int(p.get("bytes") or 0) for p in series),
+        "hours": round(sum(float(p.get("hours") or 0) for p in series), 2),
+        "plays": sum(int(p.get("plays") or 0) for p in series),
+        "series": series,
+    }
+    plays = list(stats.get("recent_plays") or [])[:20]
     sessions = []
     with contextlib.suppress(Exception):
         sessions = await app.state.emby.sessions_for_user(user_id)
     return {
-        "member": member,
         **detail,
+        "usage": usage,
+        "plays": plays,
+        "series": series,
+        "recent_plays": plays,
         "active_sessions": [{
             "id": s.get("Id"),
             "client": s.get("Client"),
@@ -949,8 +971,22 @@ async def members_get(user_id: str, days: int = 30) -> dict[str, Any]:
             "item": (s.get("NowPlayingItem") or {}).get("Name"),
             "paused": bool((s.get("PlayState") or {}).get("IsPaused")),
         } for s in sessions],
-        "audit": app.state.members.audit_log(50, subject=user_id),
     }
+
+
+@app.put("/api/members/{user_id}/overrides", dependencies=[Depends(_auth)])
+async def members_overrides(user_id: str, payload: dict[str, Any] = Body(...),  # noqa: B008
+                            user: str = Depends(_auth)) -> dict[str, Any]:
+    try:
+        member = app.state.members.set_overrides(user_id, payload, actor=user)
+    except KeyError:
+        raise HTTPException(404, "unknown member") from None
+    except ConfigError as exc:
+        raise HTTPException(400, str(exc)) from None
+    if app.state.settings_service.membership_config()["enforcement_enabled"]:
+        with contextlib.suppress(Exception):
+            await app.state.enforcement.enforce_now(user_id, "overrides updated")
+    return member
 
 
 @app.put("/api/members/{user_id}", dependencies=[Depends(_auth)])
@@ -1033,9 +1069,8 @@ async def members_status(user_id: str, payload: dict[str, Any] = Body(...),  # n
     return member
 
 
-@app.post("/api/members/{user_id}/password", dependencies=[Depends(_auth)])
-async def members_password(user_id: str, payload: dict[str, Any] = Body(default={}),  # noqa: B008
-                           user: str = Depends(_auth)) -> dict[str, Any]:
+async def _reset_member_password(user_id: str, payload: dict[str, Any],
+                                 actor: str) -> dict[str, Any]:
     """Set or randomise a member's Emby password.
 
     Returned in cleartext exactly once, because the operator has to relay it;
@@ -1046,39 +1081,70 @@ async def members_password(user_id: str, payload: dict[str, Any] = Body(default=
         raise HTTPException(422, "密码至少 6 位")
     if not await app.state.emby.set_user_password(user_id, password):
         raise HTTPException(404, "unknown user")
-    app.state.members.audit(user, "member.password", user_id, "password changed")
+    app.state.members.audit(actor, "member.password", user_id, "password changed")
     return {"ok": True, "password": password}
+
+
+@app.post("/api/members/{user_id}/password", dependencies=[Depends(_auth)])
+async def members_password(user_id: str, payload: dict[str, Any] = Body(default={}),  # noqa: B008
+                           user: str = Depends(_auth)) -> dict[str, Any]:
+    return await _reset_member_password(user_id, payload, user)
+
+
+@app.post("/api/members/{user_id}/actions/reset-password", dependencies=[Depends(_auth)])
+async def members_reset_password(user_id: str, payload: dict[str, Any] = Body(default={}),  # noqa: B008
+                                 user: str = Depends(_auth)) -> dict[str, Any]:
+    return await _reset_member_password(user_id, payload, user)
+
+
+async def _kick_member(user_id: str, payload: dict[str, Any], actor: str) -> dict[str, Any]:
+    reason = str(payload.get("reason") or "管理员结束了此次播放")
+    stopped = await app.state.enforcement.terminate_sessions(user_id, reason)
+    app.state.members.audit(actor, "member.kick", user_id, f"{stopped} session(s)")
+    return {"stopped": stopped}
 
 
 @app.post("/api/members/{user_id}/kick", dependencies=[Depends(_auth)])
 async def members_kick(user_id: str, payload: dict[str, Any] = Body(default={}),  # noqa: B008
                        user: str = Depends(_auth)) -> dict[str, Any]:
-    reason = str(payload.get("reason") or "管理员结束了此次播放")
-    stopped = await app.state.enforcement.terminate_sessions(user_id, reason)
-    app.state.members.audit(user, "member.kick", user_id, f"{stopped} session(s)")
-    return {"stopped": stopped}
+    return await _kick_member(user_id, payload, user)
+
+
+@app.post("/api/members/{user_id}/actions/kick", dependencies=[Depends(_auth)])
+async def members_action_kick(user_id: str, payload: dict[str, Any] = Body(default={}),  # noqa: B008
+                              user: str = Depends(_auth)) -> dict[str, Any]:
+    return await _kick_member(user_id, payload, user)
 
 
 @app.get("/api/members/{user_id}/devices", dependencies=[Depends(_auth)])
 async def members_devices(user_id: str) -> list[dict[str, Any]]:
-    return app.state.db.query(
-        "SELECT * FROM devices WHERE emby_user_id=? ORDER BY last_seen_at DESC",
-        (user_id,))
+    return app.state.members.devices(user_id)
+
+
+async def _set_device_blocked(user_id: str, device_id: str, blocked: bool,
+                              actor: str) -> dict[str, Any]:
+    try:
+        row = app.state.members.set_device_blocked(
+            user_id, device_id, blocked, actor=actor)
+    except KeyError:
+        raise HTTPException(404, "unknown device") from None
+    return {"ok": True, "blocked": bool(row.get("blocked")), "device": row}
 
 
 @app.post("/api/members/{user_id}/devices/{device_id}/block", dependencies=[Depends(_auth)])
 async def members_block_device(user_id: str, device_id: str,
                                payload: dict[str, Any] = Body(default={}),  # noqa: B008
                                user: str = Depends(_auth)) -> dict[str, Any]:
-    blocked = 1 if payload.get("blocked", True) else 0
-    changed = app.state.db.execute(
-        "UPDATE devices SET blocked=? WHERE emby_user_id=? AND device_id=?",
-        (blocked, user_id, device_id))
-    if not changed:
-        raise HTTPException(404, "unknown device")
-    app.state.members.audit(user, "device.block" if blocked else "device.unblock",
-                            user_id, device_id)
-    return {"ok": True, "blocked": bool(blocked)}
+    # Dedicated /unblock is the canonical clear; this still accepts blocked=false
+    # so the existing drawer button keeps working.
+    return await _set_device_blocked(
+        user_id, device_id, bool(payload.get("blocked", True)), user)
+
+
+@app.post("/api/members/{user_id}/devices/{device_id}/unblock", dependencies=[Depends(_auth)])
+async def members_unblock_device(user_id: str, device_id: str,
+                                 user: str = Depends(_auth)) -> dict[str, Any]:
+    return await _set_device_blocked(user_id, device_id, False, user)
 
 
 @app.delete("/api/members/{user_id}/devices/{device_id}", dependencies=[Depends(_auth)])
@@ -1207,10 +1273,83 @@ async def stats_play_methods(days: int = 30) -> dict[str, Any]:
 
 
 @app.get("/api/audit", dependencies=[Depends(_auth)])
-async def audit_log(limit: int = 100, subject: str | None = None,
+async def audit_log(limit: int = 100, offset: int = 0, subject: str | None = None,
                     actor: str | None = None, action: str | None = None
-                    ) -> list[dict[str, Any]]:
-    return app.state.members.audit_log(limit, subject=subject, actor=actor, action=action)
+                    ) -> dict[str, Any]:
+    limit = max(1, min(int(limit or 100), 1000))
+    offset = max(0, int(offset or 0))
+    items = app.state.members.audit_log(
+        limit, offset=offset, subject=subject, actor=actor, action=action)
+    total = app.state.members.audit_count(
+        subject=subject, actor=actor, action=action)
+    return {
+        "items": items,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+# ---- redeem codes ----------------------------------------------------------
+@app.post("/api/redeem-codes/generate", dependencies=[Depends(_auth)])
+async def redeem_generate(payload: dict[str, Any] = Body(...),  # noqa: B008
+                          user: str = Depends(_auth)) -> dict[str, Any]:
+    return app.state.redeem.generate(payload, actor=user)
+
+
+@app.get("/api/redeem-codes", dependencies=[Depends(_auth)])
+async def redeem_list(batch_id: str | None = None, status: str | None = None,
+                      limit: int = 500) -> dict[str, Any]:
+    return {
+        "codes": app.state.redeem.list(batch_id=batch_id, status=status, limit=limit),
+        "batches": app.state.redeem.batches(),
+        "logs": app.state.redeem.logs(limit=200),
+    }
+
+
+@app.delete("/api/redeem-codes/{code}", dependencies=[Depends(_auth)])
+async def redeem_delete(code: str, user: str = Depends(_auth)) -> dict[str, bool]:
+    try:
+        app.state.redeem.delete(code, actor=user)
+    except KeyError:
+        raise HTTPException(404, "unknown code") from None
+    return {"deleted": True}
+
+
+@app.post("/api/members/{user_id}/redeem", dependencies=[Depends(_auth)])
+async def members_redeem(user_id: str, payload: dict[str, Any] = Body(...),  # noqa: B008
+                         user: str = Depends(_auth)) -> dict[str, Any]:
+    result = app.state.redeem.redeem(
+        str(payload.get("code") or ""), user_id, actor=user)
+    if app.state.settings_service.membership_config()["enforcement_enabled"]:
+        with contextlib.suppress(Exception):
+            await app.state.enforcement.enforce_now(user_id, "redeem")
+    return result
+
+
+@app.post("/api/public/redeem", include_in_schema=False)
+async def public_redeem(request: Request,
+                        payload: dict[str, Any] = Body(...)) -> dict[str, Any]:  # noqa: B008
+    """Public: a member proves they own the Emby account, then consumes a code."""
+    app.state.redeem.check_rate(request.client.host if request.client else "")
+    result = await app.state.redeem.redeem_public(
+        str(payload.get("code") or ""),
+        str(payload.get("username") or ""),
+        str(payload.get("password") or ""),
+        actor="public",
+    )
+    member = result.get("member") or {}
+    user_id = member.get("emby_user_id")
+    if user_id and app.state.settings_service.membership_config()["enforcement_enabled"]:
+        with contextlib.suppress(Exception):
+            await app.state.enforcement.enforce_now(user_id, "public redeem")
+    # Do not echo the full member record to an unauthenticated caller.
+    return {
+        "ok": True,
+        "kind": result.get("kind"),
+        "result": result.get("result"),
+        "username": member.get("username"),
+    }
 
 
 @app.get("/api/usage/status", dependencies=[Depends(_auth)])

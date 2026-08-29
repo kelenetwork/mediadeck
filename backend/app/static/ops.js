@@ -195,7 +195,7 @@ PAGES.members = async () => {
   $('#mf-apply-enf').onclick = () => enforcementApply();
 };
 function memberRow(m) {
-  const cap = (m.plan && m.plan.max_devices) || 0;
+  const cap = m.max_devices || (m.plan && m.plan.max_devices) || 0;
   const devices = cap ? `${m.device_count || 0}/${cap}` : `${m.device_count || 0}/不限`;
   const id = q(m.emby_user_id);
   const tog = m.state === 'suspended' ? 'active' : 'suspended';
@@ -315,26 +315,218 @@ async function memberDelete(id, username) {
     renderPage('members');
   } catch (e) { toast('失败: ' + e.message, 1); }
 }
+function fmtKbps(n) {
+  n = Number(n || 0);
+  if (!n) return '不限';
+  if (n >= 1000) return (n / 1000) + ' Mbps';
+  return n + ' kbps';
+}
+function boolLabel(v) { return v ? '允许' : '禁止'; }
+function localInputFromTs(ts) {
+  const d = new Date(Number(ts) * 1000);
+  if (Number.isNaN(d.getTime())) return '';
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+function flagSelect(id, value) {
+  const cur = (value === 0 || value === false) ? '0' : (value === 1 || value === true) ? '1' : '';
+  return `<select id="${esc(id)}">
+    <option value="" ${cur === '' ? 'selected' : ''}>继承</option>
+    <option value="1" ${cur === '1' ? 'selected' : ''}>允许</option>
+    <option value="0" ${cur === '0' ? 'selected' : ''}>禁止</option>
+  </select>`;
+}
+function ovSource(m, key, planVal, effVal, fmt) {
+  const ov = (m.overrides || {});
+  const hit = (m.overridden_keys || []).includes(key) || Object.prototype.hasOwnProperty.call(ov, key);
+  const shown = fmt ? fmt(effVal) : String(effVal == null ? '-' : effVal);
+  const inherited = fmt ? fmt(planVal) : String(planVal == null ? '-' : planVal);
+  if (hit) return `<span class="tag override">已覆盖(${esc(shown)})</span>`;
+  return `<span class="tag inherit">继承套餐(${esc(inherited)})</span>`;
+}
+function overrideEditor(m, libs) {
+  const ov = m.overrides || {};
+  const plan = m.plan || {};
+  const eff = m.effective || {};
+  const sel = new Set(ov.libraries || []);
+  const libOpts = (libs || []).map((l) => {
+    const id = l.id || l.name;
+    return `<label style="margin-right:10px"><input type="checkbox" class="ov-lib" value="${esc(id)}" ${sel.has(id) ? 'checked' : ''}> ${esc(l.name)}</label>`;
+  }).join('') || '<span class="muted">无法读取媒体库</span>';
+  const num = (k) => (ov[k] != null ? ov[k] : '');
+  const mode = ov.libraries_mode || 'inherit';
+  const exp = ov.expires_at_override ? localInputFromTs(ov.expires_at_override) : '';
+  const extraGib = ov.extra_traffic_bytes ? (ov.extra_traffic_bytes / (1024 ** 3)).toFixed(2) : '';
+  return `
+    <div class="ov-row"><div class="ov-label">并发</div>
+      <div class="ov-src">${ovSource(m, 'max_streams', plan.max_streams || 1, eff.max_streams)}</div>
+      <div class="ov-controls"><input id="ov-streams" type="number" min="1" placeholder="继承" value="${esc(num('max_streams'))}" style="width:90px">
+        <button class="btn sm" type="button" onclick="clearOverrideField('max_streams')">还原</button></div></div>
+    <div class="ov-row"><div class="ov-label">码率</div>
+      <div class="ov-src">${ovSource(m, 'max_bitrate_kbps', plan.max_bitrate_kbps || 0, eff.max_bitrate_kbps, fmtKbps)}</div>
+      <div class="ov-controls"><input id="ov-bitrate" type="number" min="0" placeholder="继承" value="${esc(num('max_bitrate_kbps'))}" style="width:110px">
+        <span class="muted">kbps，0=不限</span>
+        <button class="btn sm" type="button" onclick="clearOverrideField('max_bitrate_kbps')">还原</button></div></div>
+    <div class="ov-row"><div class="ov-label">设备</div>
+      <div class="ov-src">${ovSource(m, 'max_devices', plan.max_devices || 0, eff.max_devices)}</div>
+      <div class="ov-controls"><input id="ov-devices" type="number" min="0" placeholder="继承" value="${esc(num('max_devices'))}" style="width:90px">
+        <button class="btn sm" type="button" onclick="clearOverrideField('max_devices')">还原</button></div></div>
+    <div class="ov-row"><div class="ov-label">转码</div>
+      <div class="ov-src">${ovSource(m, 'allow_transcode', plan.allow_transcode, eff.allow_transcode, boolLabel)}</div>
+      <div class="ov-controls">${flagSelect('ov-transcode', ov.allow_transcode)}
+        <button class="btn sm" type="button" onclick="clearOverrideField('allow_transcode')">还原</button></div></div>
+    <div class="ov-row"><div class="ov-label">下载</div>
+      <div class="ov-src">${ovSource(m, 'allow_download', plan.allow_download, eff.allow_download, boolLabel)}</div>
+      <div class="ov-controls">${flagSelect('ov-download', ov.allow_download)}
+        <button class="btn sm" type="button" onclick="clearOverrideField('allow_download')">还原</button></div></div>
+    <div class="ov-row"><div class="ov-label">同步</div>
+      <div class="ov-src">${ovSource(m, 'allow_sync', plan.allow_sync, eff.allow_sync, boolLabel)}</div>
+      <div class="ov-controls">${flagSelect('ov-sync', ov.allow_sync)}
+        <button class="btn sm" type="button" onclick="clearOverrideField('allow_sync')">还原</button></div></div>
+    <div class="ov-row"><div class="ov-label">媒体库</div>
+      <div class="ov-src">${ovSource(m, 'libraries_mode', 'inherit', eff.libraries_mode || 'inherit')}</div>
+      <div class="ov-controls">
+        <select id="ov-libmode">
+          ${['inherit', 'replace', 'extend'].map((x) => `<option value="${x}" ${mode === x ? 'selected' : ''}>${esc({ inherit: '继承', replace: '替换', extend: '追加' }[x])}</option>`).join('')}
+        </select>
+        <button class="btn sm" type="button" onclick="clearOverrideField('libraries')">还原</button>
+        <div>${libOpts}</div></div></div>
+    <div class="ov-row"><div class="ov-label">到期覆盖</div>
+      <div class="ov-src">${ovSource(m, 'expires_at_override', plan.duration_days ? (plan.duration_days + ' 天') : '套餐到期', m.expires_at_effective || m.expires_at, (v) => v ? fmtExpiry(v) : '不限期')}</div>
+      <div class="ov-controls"><input id="ov-exp" type="datetime-local" value="${esc(exp)}">
+        <button class="btn sm" type="button" onclick="clearOverrideField('expires_at_override')">还原</button></div></div>
+    <div class="ov-row"><div class="ov-label">额外流量</div>
+      <div class="ov-src">${ovSource(m, 'extra_traffic_bytes', 0, eff.extra_traffic_bytes || 0, fmtBytes)}</div>
+      <div class="ov-controls"><input id="ov-extra" type="number" min="0" step="0.01" placeholder="0" value="${esc(extraGib)}" style="width:110px">
+        <span class="muted">GiB，叠加在套餐配额上</span>
+        <button class="btn sm" type="button" onclick="clearOverrideField('extra_traffic_bytes')">还原</button></div></div>
+    <div class="toolbar" style="margin-top:10px">
+      <button class="btn primary" type="button" id="ov-save">保存覆盖</button>
+      <button class="btn" type="button" id="ov-clear">全部还原</button>
+    </div>`;
+}
+function collectOverridesFromForm(existing) {
+  const ov = Object.assign({}, existing || {});
+  const streams = ($('#ov-streams') || {}).value;
+  if (streams === '' || streams == null) delete ov.max_streams;
+  else ov.max_streams = parseInt(streams, 10);
+  const bitrate = ($('#ov-bitrate') || {}).value;
+  if (bitrate === '' || bitrate == null) delete ov.max_bitrate_kbps;
+  else ov.max_bitrate_kbps = parseInt(bitrate, 10);
+  const devices = ($('#ov-devices') || {}).value;
+  if (devices === '' || devices == null) delete ov.max_devices;
+  else ov.max_devices = parseInt(devices, 10);
+  const readFlag = (elId, key) => {
+    const v = (($('#' + elId) || {}).value || '');
+    if (v === '') delete ov[key];
+    else ov[key] = v === '1' ? 1 : 0;
+  };
+  readFlag('ov-transcode', 'allow_transcode');
+  readFlag('ov-download', 'allow_download');
+  readFlag('ov-sync', 'allow_sync');
+  const mode = (($('#ov-libmode') || {}).value || 'inherit');
+  const libs = [...document.querySelectorAll('.ov-lib:checked')].map((x) => x.value);
+  if (mode === 'inherit') {
+    delete ov.libraries_mode; delete ov.libraries;
+  } else {
+    ov.libraries_mode = mode;
+    ov.libraries = libs;
+  }
+  const exp = (($('#ov-exp') || {}).value || '').trim();
+  if (!exp) delete ov.expires_at_override;
+  else ov.expires_at_override = Math.floor(new Date(exp).getTime() / 1000);
+  const extra = (($('#ov-extra') || {}).value || '').trim();
+  if (extra === '') delete ov.extra_traffic_bytes;
+  else ov.extra_traffic_bytes = Math.round(parseFloat(extra) * 1024 ** 3);
+  return ov;
+}
+async function saveOverrides(userId) {
+  const m = (state.memberDetail && state.memberDetail.member) || {};
+  try {
+    await api(`/api/members/${encodeURIComponent(userId)}/overrides`, {
+      method: 'PUT', body: JSON.stringify(collectOverridesFromForm(m.overrides || {})),
+    });
+    toast('已保存覆盖');
+    memberDetail(userId);
+    renderPage('members');
+  } catch (e) { toast('失败: ' + e.message, 1); }
+}
+async function clearOverrideField(key) {
+  const m = (state.memberDetail && state.memberDetail.member) || {};
+  const id = m.emby_user_id;
+  if (!id) return;
+  const ov = Object.assign({}, m.overrides || {});
+  delete ov[key];
+  if (key === 'libraries') { delete ov.libraries; delete ov.libraries_mode; }
+  try {
+    await api(`/api/members/${encodeURIComponent(id)}/overrides`, {
+      method: 'PUT', body: JSON.stringify(ov),
+    });
+    toast('已还原该字段');
+    memberDetail(id);
+  } catch (e) { toast('失败: ' + e.message, 1); }
+}
+async function clearAllOverrides(userId) {
+  if (!confirm('还原全部覆盖，改回完全继承套餐？')) return;
+  try {
+    await api(`/api/members/${encodeURIComponent(userId)}/overrides`, {
+      method: 'PUT', body: JSON.stringify({}),
+    });
+    toast('已全部还原');
+    memberDetail(userId);
+    renderPage('members');
+  } catch (e) { toast('失败: ' + e.message, 1); }
+}
+async function memberRedeemFor(userId) {
+  const code = prompt('输入要代兑的续费码', '');
+  if (!code) return;
+  try {
+    const r = await api(`/api/members/${encodeURIComponent(userId)}/redeem`, {
+      method: 'POST', body: JSON.stringify({ code: code.trim() }),
+    });
+    toast('已兑换 ' + (r.kind || ''));
+    memberDetail(userId);
+    renderPage('members');
+  } catch (e) { toast('失败: ' + e.message, 1); }
+}
 async function memberDetail(id) {
   id = uq(id);
   openModal('成员详情', '<div class="muted">加载中…</div>', { drawer: true });
   try {
-    const d = await api(`/api/members/${encodeURIComponent(id)}?days=30`);
+    const [d, libs] = await Promise.all([
+      api(`/api/members/${encodeURIComponent(id)}?days=30`),
+      api('/api/emby/libraries').catch(() => []),
+    ]);
+    state.memberDetail = d;
     const m = d.member || {};
-    const plan = m.plan || {};
-    const series = d.series || [];
+    const usage = d.usage || {};
+    const series = usage.series || d.series || [];
     const devices = d.devices || [];
-    const plays = d.recent_plays || [];
+    const plays = d.plays || d.recent_plays || [];
     const audit = d.audit || [];
     const body = document.querySelector('#modal-root .modal-body');
     if (!body) return;
-    const bitrate = plan.max_bitrate_kbps ? ((plan.max_bitrate_kbps / 1000) + ' Mbps') : '不限';
-    const deviceCap = plan.max_devices ? (plan.max_devices + ' 台') : '不限';
+    const tog = m.state === 'suspended' ? 'active' : 'suspended';
+    const togLabel = m.state === 'suspended' ? '启用' : '停用';
     body.innerHTML = `
-      <div class="help">${esc(m.username)} · ${esc(m.plan_name)} · ${stateTag(m.state)}</div>
-      <div class="help">限制：${esc(plan.max_streams || 1)} 路 · 码率 ${esc(bitrate)} · 设备 ${esc(deviceCap)} · ${plan.allow_transcode ? '允许转码' : '禁止转码'}</div>
+      <div class="help">${esc(m.username)} · ${esc(m.plan_name)} · ${stateTag(m.state)}
+        <span class="muted">${esc(m.state_reason || '')}</span></div>
+      <div class="help">到期 ${esc(fmtExpiry(m.expires_at_effective || m.expires_at))} · 流量 ${fmtBytes(m.traffic_used_bytes)} / ${fmtQuota(m.traffic_quota_bytes)}</div>
+      <div class="detail-actions">
+        <button class="btn sm" onclick="memberKick('${q(id)}')">踢下线</button>
+        <button class="btn sm" onclick="memberPassword('${q(id)}')">重置密码</button>
+        <button class="btn sm" onclick="memberStatus('${q(id)}','${tog}')">${togLabel}</button>
+        <button class="btn sm" onclick="memberRedeemFor('${q(id)}')">代兑续费码</button>
+      </div>
       ${trafficBar(m.traffic_used_bytes, m.traffic_quota_bytes)}
-      <h3 style="font-size:13px;margin:16px 0 6px">近 30 天流量</h3>
+      <h3 style="font-size:13px;margin:16px 0 6px">权限覆盖</h3>
+      ${overrideEditor(m, libs)}
+      <h3 style="font-size:13px;margin:16px 0 6px">近 30 天用量</h3>
+      <div class="stat-grid">
+        ${stat('⇅', fmtBytes(usage.bytes || 0), '流量', '30 天合计')}
+        ${stat('▶', (usage.hours || 0) + ' 小时', '时长', '30 天合计')}
+        ${stat('▣', usage.plays || 0, '播放', '30 天合计')}
+      </div>
       ${sparkline(series)}
       <h3 style="font-size:13px;margin:16px 0 6px">设备</h3>
       ${devices.length ? `<table><thead><tr><th>设备</th><th>客户端</th><th>最近</th><th></th></tr></thead><tbody>
@@ -342,18 +534,22 @@ async function memberDetail(id) {
           <td>${esc(dev.device_name || dev.device_id)}${dev.blocked ? ' <span class="tag bad">已封</span>' : ''}</td>
           <td>${esc(dev.client)}</td><td>${esc(fmtAgeTs(dev.last_seen_at))}</td>
           <td class="row-actions">
-            <button class="btn sm" onclick="blockDevice('${q(id)}','${q(dev.device_id)}',${!dev.blocked})">${dev.blocked ? '解封' : '封禁'}</button>
-            <button class="btn sm danger" onclick="forgetDevice('${q(id)}','${q(dev.device_id)}')">移除</button>
+            ${dev.blocked
+              ? `<button class="btn sm" onclick="unblockDevice('${q(id)}','${q(dev.device_id)}')">解封</button>`
+              : `<button class="btn sm" onclick="blockDevice('${q(id)}','${q(dev.device_id)}',true)">拉黑</button>`}
+            <button class="btn sm danger" onclick="forgetDevice('${q(id)}','${q(dev.device_id)}')">解绑</button>
           </td></tr>`).join('')}</tbody></table>` : '<div class="empty">暂无设备</div>'}
       <h3 style="font-size:13px;margin:16px 0 6px">最近播放</h3>
       ${plays.length ? `<table><thead><tr><th>内容</th><th>方式</th><th>时长</th></tr></thead><tbody>
         ${plays.slice(0, 20).map((p) => `<tr><td>${esc(p.series_name || p.item_name || '(未命名)')}</td>
           <td>${esc(p.play_method || '-')}</td><td>${esc(Math.round((p.seconds || 0) / 60))} 分</td></tr>`).join('')}
       </tbody></table>` : '<div class="empty">暂无播放</div>'}
-      <h3 style="font-size:13px;margin:16px 0 6px">审计</h3>
+      <h3 style="font-size:13px;margin:16px 0 6px">审计时间线</h3>
       ${audit.length ? audit.slice(0, 20).map((a) => `<div class="list-row"><div>
         <div class="t">${esc(a.action)}</div><div class="s">${esc(a.detail)}</div></div>
         <span class="muted">${esc(fmtAgeTs(a.ts))}</span></div>`).join('') : '<div class="empty">暂无记录</div>'}`;
+    if ($('#ov-save')) $('#ov-save').onclick = () => saveOverrides(id);
+    if ($('#ov-clear')) $('#ov-clear').onclick = () => clearAllOverrides(id);
   } catch (e) {
     const body = document.querySelector('#modal-root .modal-body');
     if (body) body.innerHTML = `<div class="page-error">${esc(e.message)}</div>`;
@@ -371,7 +567,15 @@ async function blockDevice(userId, deviceId, blocked) {
   try {
     await api(`/api/members/${encodeURIComponent(userId)}/devices/${encodeURIComponent(deviceId)}/block`, {
       method: 'POST', body: JSON.stringify({ blocked }) });
-    toast(blocked ? '已封禁' : '已解封'); memberDetail(userId);
+    toast(blocked ? '已拉黑' : '已解封'); memberDetail(userId);
+  } catch (e) { toast('失败: ' + e.message, 1); }
+}
+async function unblockDevice(userId, deviceId) {
+  userId = uq(userId); deviceId = uq(deviceId);
+  try {
+    await api(`/api/members/${encodeURIComponent(userId)}/devices/${encodeURIComponent(deviceId)}/unblock`, {
+      method: 'POST' });
+    toast('已解封'); memberDetail(userId);
   } catch (e) { toast('失败: ' + e.message, 1); }
 }
 async function forgetDevice(userId, deviceId) {
@@ -736,43 +940,177 @@ function bindChartHover(daily) {
   });
 }
 
+/* ---------------- redeem codes ---------------- */
+PAGES.redeem = async () => {
+  $('#view').innerHTML = pageLoading();
+  const [listing, plans] = await Promise.all([api('/api/redeem-codes'), api('/api/plans')]);
+  state.redeem = listing;
+  const codes = listing.codes || [];
+  const batches = listing.batches || [];
+  const logs = listing.logs || [];
+  const usable = codes.filter((c) => c.status === 'usable').length;
+  const kindLabel = { plan: '换套餐', extend_days: '延期', add_traffic: '加流量' };
+  $('#view').innerHTML = `
+    <div class="stat-grid">
+      ${stat('♻', codes.length, '续费码', `${usable} 个可用`)}
+      ${stat('▤', batches.length, '批次', '按生成批次汇总')}
+      ${stat('☰', logs.length, '兑换记录', '最近 200 条')}
+    </div>
+    ${card('生成续费码', '三种类型互斥：换套餐 / 延期天数 / 增加流量',
+      `<div class="card-body">
+        <div class="toolbar">
+          <select id="rd-kind">
+            <option value="plan">换套餐</option>
+            <option value="extend_days">延期天数</option>
+            <option value="add_traffic">增加流量</option>
+          </select>
+          <select id="rd-plan">${plans.map((p) => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join('')}</select>
+          <input id="rd-days" type="number" min="1" value="30" style="width:90px" title="延期天数">
+          <input id="rd-gib" type="number" min="1" value="100" style="width:90px" title="流量 GiB">
+          <input id="rd-uses" type="number" min="1" value="1" style="width:80px" title="每码可用次数">
+          <input id="rd-valid" type="number" min="0" value="30" style="width:80px" title="码本身有效天数，0=永久">
+          <input id="rd-count" type="number" min="1" value="1" style="width:80px" title="生成个数">
+          <input id="rd-note" placeholder="备注（可选）" style="flex:1;min-width:140px">
+          <button class="btn primary" id="rd-go">生成</button>
+        </div>
+        <div class="help">公开兑换页：${esc((location.origin || '') + '/redeem')}</div>
+      </div>`)
+    }
+    ${tableCard('批次', `${batches.length} 个`, ['批次', '类型', '数量', '已用', '可用', '备注', ''],
+      batches.map((b) => `<tr>
+        <td><code>${esc(b.batch_id)}</code></td>
+        <td>${esc(kindLabel[b.kind] || b.kind)}</td>
+        <td>${esc(b.count)}</td><td>${esc(b.used)}/${esc(b.capacity)}</td>
+        <td>${esc(b.usable)}</td><td>${esc(b.note)}</td>
+        <td><button class="btn sm" onclick="copyText(uq('${q(b.batch_id)}'))">复制批次</button></td>
+      </tr>`).join(''))}
+    ${tableCard('续费码', `${codes.length} 个`, ['码', '类型', '内容', '用量', '到期', '状态', ''],
+      codes.map((r) => {
+        const st = r.status === 'usable' ? ['ok', '可用']
+          : r.status === 'expired' ? ['expired', '已过期'] : ['exhausted', '已用完'];
+        let what = '-';
+        if (r.kind === 'plan') what = r.plan_id || '-';
+        else if (r.kind === 'extend_days') what = (r.extend_days || 0) + ' 天';
+        else if (r.kind === 'add_traffic') what = fmtBytes(r.add_traffic_bytes || 0);
+        return `<tr>
+          <td><code>${esc(r.id)}</code></td>
+          <td>${esc(kindLabel[r.kind] || r.kind)}</td>
+          <td>${esc(what)}</td>
+          <td>${esc(r.used_count)}/${esc(r.max_uses)}</td>
+          <td>${esc(fmtExpiry(r.expires_at))}</td>
+          <td><span class="tag ${st[0]}">${esc(st[1])}</span></td>
+          <td class="row-actions">
+            <button class="btn sm" onclick="copyText(uq('${q(r.id)}'))">复制</button>
+            <button class="btn sm danger" onclick="deleteRedeem('${q(r.id)}')">作废</button>
+          </td></tr>`;
+      }).join(''))}
+    ${tableCard('兑换记录', `${logs.length} 条`, ['时间', '码', '用户', '操作者', '详情'],
+      logs.map((l) => `<tr>
+        <td>${esc(fmtAgeTs(l.ts))}</td><td><code>${esc(l.code)}</code></td>
+        <td>${esc(l.user_id)}</td><td>${esc(l.actor)}</td><td>${esc(l.detail)}</td>
+      </tr>`).join(''))}`;
+  $('#rd-go').onclick = issueRedeem;
+  toggleRedeemFields();
+  $('#rd-kind').onchange = toggleRedeemFields;
+};
+function toggleRedeemFields() {
+  const kind = (($('#rd-kind') || {}).value || 'plan');
+  if ($('#rd-plan')) $('#rd-plan').disabled = kind !== 'plan';
+  if ($('#rd-days')) $('#rd-days').disabled = kind !== 'extend_days';
+  if ($('#rd-gib')) $('#rd-gib').disabled = kind !== 'add_traffic';
+}
+async function issueRedeem() {
+  const kind = $('#rd-kind').value;
+  const payload = {
+    kind,
+    max_uses: parseInt($('#rd-uses').value, 10) || 1,
+    valid_days: parseInt($('#rd-valid').value, 10) || 0,
+    count: parseInt($('#rd-count').value, 10) || 1,
+    note: $('#rd-note').value.trim(),
+  };
+  if (kind === 'plan') payload.plan_id = $('#rd-plan').value;
+  if (kind === 'extend_days') payload.extend_days = parseInt($('#rd-days').value, 10) || 0;
+  if (kind === 'add_traffic') {
+    payload.add_traffic_bytes = Math.round((parseFloat($('#rd-gib').value) || 0) * 1024 ** 3);
+  }
+  try {
+    const r = await api('/api/redeem-codes/generate', {
+      method: 'POST', body: JSON.stringify(payload),
+    });
+    toast('已生成 ' + (r.count || 0) + ' 个');
+    renderPage('redeem');
+  } catch (e) { toast('失败: ' + e.message, 1); }
+}
+async function deleteRedeem(code) {
+  code = uq(code);
+  if (!confirm('作废后该码立即不可兑换。继续？')) return;
+  try {
+    await api(`/api/redeem-codes/${encodeURIComponent(code)}`, { method: 'DELETE' });
+    toast('已作废'); renderPage('redeem');
+  } catch (e) { toast('失败: ' + e.message, 1); }
+}
+
 /* ---------------- audit ---------------- */
 PAGES.audit = async () => {
   $('#view').innerHTML = pageLoading();
-  const rows = await api('/api/audit?limit=200');
-  state.audit = rows;
-  $('#view').innerHTML = `
-    <div class="filter-bar">
-      <input id="au-actor" placeholder="操作者" style="width:120px">
-      <input id="au-action" placeholder="动作" style="width:140px">
-      <input id="au-subject" placeholder="对象" style="width:140px">
-      <button class="btn" id="au-go">筛选</button>
-    </div>
-    ${tableCard('审计日志', `${rows.length} 条`, ['时间', '操作者', '动作', '对象', '详情', '结果'],
-      auditRows(rows))}`;
-  $('#au-go').onclick = filterAudit;
+  state.auditOffset = 0;
+  state.auditLimit = 50;
+  await loadAudit();
 };
+function auditQuery() {
+  const qs = new URLSearchParams();
+  qs.set('limit', String(state.auditLimit || 50));
+  qs.set('offset', String(state.auditOffset || 0));
+  const actor = (($('#au-actor') || {}).value || '').trim();
+  const action = (($('#au-action') || {}).value || '').trim();
+  const subject = (($('#au-subject') || {}).value || '').trim();
+  if (actor) qs.set('actor', actor);
+  if (action) qs.set('action', action);
+  if (subject) qs.set('subject', subject);
+  return qs;
+}
+async function loadAudit() {
+  try {
+    const data = await api('/api/audit?' + auditQuery().toString());
+    const items = Array.isArray(data) ? data : (data.items || []);
+    const total = Array.isArray(data) ? items.length : (data.total || 0);
+    const limit = Array.isArray(data) ? items.length : (data.limit || 50);
+    const offset = Array.isArray(data) ? 0 : (data.offset || 0);
+    state.audit = data;
+    const page = Math.floor(offset / Math.max(limit, 1)) + 1;
+    const pages = Math.max(1, Math.ceil(total / Math.max(limit, 1)));
+    $('#view').innerHTML = `
+      <div class="filter-bar">
+        <input id="au-actor" placeholder="操作者" style="width:120px" value="${esc((($('#au-actor') || {}).value || ''))}">
+        <input id="au-action" placeholder="动作" style="width:140px" value="${esc((($('#au-action') || {}).value || ''))}">
+        <input id="au-subject" placeholder="对象" style="width:140px" value="${esc((($('#au-subject') || {}).value || ''))}">
+        <button class="btn" id="au-go">筛选</button>
+      </div>
+      <div class="pager">
+        <span>共 ${esc(total)} 条 · 第 ${esc(page)}/${esc(pages)} 页</span>
+        <button class="btn sm" id="au-prev" ${offset <= 0 ? 'disabled' : ''}>上一页</button>
+        <button class="btn sm" id="au-next" ${offset + limit >= total ? 'disabled' : ''}>下一页</button>
+      </div>
+      ${tableCard('审计日志', `${items.length} 条`, ['时间', '操作者', '动作', '对象', '详情', '结果'],
+        auditRows(items))}`;
+    $('#au-go').onclick = () => { state.auditOffset = 0; loadAudit(); };
+    $('#au-prev').onclick = () => {
+      state.auditOffset = Math.max(0, offset - limit); loadAudit();
+    };
+    $('#au-next').onclick = () => {
+      state.auditOffset = offset + limit; loadAudit();
+    };
+  } catch (e) {
+    $('#view').innerHTML = pageError(e);
+    if ($('#retry-page')) $('#retry-page').onclick = () => loadAudit();
+  }
+}
 function auditRows(rows) {
   return rows.map((a) => `<tr>
     <td>${esc(fmtAgeTs(a.ts))}</td><td>${esc(a.actor)}</td><td>${esc(a.action)}</td>
     <td>${esc(a.subject)}</td><td>${esc(a.detail)}</td>
     <td>${a.ok ? '<span class="tag ok">成功</span>' : '<span class="tag bad">失败</span>'}</td>
   </tr>`).join('');
-}
-async function filterAudit() {
-  const qs = new URLSearchParams();
-  qs.set('limit', '200');
-  const actor = $('#au-actor').value.trim();
-  const action = $('#au-action').value.trim();
-  const subject = $('#au-subject').value.trim();
-  if (actor) qs.set('actor', actor);
-  if (action) qs.set('action', action);
-  if (subject) qs.set('subject', subject);
-  try {
-    const rows = await api('/api/audit?' + qs.toString());
-    const tbody = document.querySelector('#view table tbody');
-    if (tbody) tbody.innerHTML = auditRows(rows) || '<tr><td colspan="6" class="empty">没有匹配记录</td></tr>';
-  } catch (e) { toast('筛选失败: ' + e.message, 1); }
 }
 
 if (typeof bootPanel === 'function') bootPanel();

@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>兑换续费码 · mediadeck</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body class="invite-body">
+<div class="invite-wrap">
+  <div class="brand-name">mediadeck</div>
+  <h1>兑换续费码</h1>
+  <p class="muted" id="sub">用已有账号验证后延长套餐、换套餐或补充流量</p>
+  <div id="view"></div>
+</div>
+<script>
+const $ = (s) => document.querySelector(s);
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, (c) =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+function kindLabel(kind) {
+  return ({ plan: '已切换套餐', extend_days: '已延长天数', add_traffic: '已补充流量' })[kind] || kind || '';
+}
+function resultText(kind, result) {
+  result = result || {};
+  if (kind === 'extend_days') return '延期 ' + (result.days || 0) + ' 天';
+  if (kind === 'add_traffic') return '已写入额外流量';
+  if (kind === 'plan') return '套餐已更新';
+  return '';
+}
+function form() {
+  $('#view').innerHTML = `
+    <div class="card">
+      <div class="card-head"><div><h3>验证账号并兑换</h3>
+        <div class="sub">用户名和密码与媒体库登录相同，续费码不会创建新账号</div></div></div>
+      <div class="card-body">
+        <div class="form-row"><label>用户名</label>
+          <input id="u" autocomplete="username" placeholder="已有账号"></div>
+        <div class="form-row"><label>密码</label>
+          <input id="p" type="password" autocomplete="current-password" placeholder="账号密码"></div>
+        <div class="form-row"><label>续费码</label>
+          <input id="c" autocomplete="off" placeholder="粘贴续费码"></div>
+        <div class="toolbar">
+          <button class="btn primary" id="go">兑换</button>
+          <span id="msg" class="muted"></span>
+        </div>
+      </div>
+    </div>`;
+  $('#go').onclick = redeem;
+}
+async function redeem() {
+  const username = ($('#u') || {}).value || '';
+  const password = ($('#p') || {}).value || '';
+  const code = ($('#c') || {}).value || '';
+  const msg = $('#msg');
+  msg.textContent = '提交中…';
+  try {
+    const r = await fetch('/api/public/redeem', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password, code: code.trim() }),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(body.detail || ('HTTP ' + r.status));
+    $('#view').innerHTML = `<div class="card"><div class="card-body">
+      <div class="tag ok">${esc(kindLabel(body.kind) || '兑换成功')}</div>
+      <p>账号 <b>${esc(body.username || username)}</b> ${esc(resultText(body.kind, body.result))}。</p>
+    </div></div>`;
+    $('#sub').textContent = '可以关闭此页面';
+  } catch (e) {
+    msg.innerHTML = `<span class="tag bad">${esc(e.message)}</span>`;
+  }
+}
+form();
+</script>
+</body>
+</html>
