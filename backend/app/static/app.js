@@ -10,19 +10,26 @@ const NAV = [
   { group: '概览', items: [
     { id: 'dashboard', icon: '▦', label: '仪表盘', sub: '集中查看系统运行、播放使用和待处理事项' },
   ]},
+  { group: '运营', items: [
+    { id: 'members', icon: '☺', label: '用户管理', sub: '套餐、流量、到期与设备' },
+    { id: 'plans', icon: '▣', label: '套餐管理', sub: '用户组、计费方式与限制' },
+    { id: 'invites', icon: '✦', label: '邀请码', sub: '发码开通与用量追踪' },
+    { id: 'stats', icon: '📈', label: '运营统计', sub: '流量、时长、热门内容与收入' },
+  ]},
   { group: '工作台', items: [
     { id: 'library', icon: '▤', label: '媒体库', sub: '媒体库分布与条目统计' },
     { id: 'imports', icon: '⇪', label: '网盘上片', sub: '网盘链接与云盘目录导入' },
-    { id: 'users', icon: '☺', label: '用户管理', sub: '账号、状态与密码' },
   ]},
   { group: '资源服务', items: [
     { id: 'nodes', icon: '⛁', label: '节点管理', sub: '推流节点负载与调度' },
     { id: 'pipeline', icon: '⇄', label: '管线状态', sub: '整理、上传队列与配额' },
+    { id: 'storage', icon: '☁', label: '存储管理', sub: '云盘账号与挂载点' },
     { id: 'mounts', icon: '⛃', label: '挂载管理', sub: '存储挂载健康与缓存占用' },
     { id: 'tasks', icon: '⏱', label: '调度中心', sub: '定时任务运行状态与失败追踪' },
   ]},
   { group: '系统管理', items: [
     { id: 'settings', icon: '⚙', label: '系统设置', sub: '对接 Emby、调度策略与节点配置' },
+    { id: 'audit', icon: '☰', label: '审计日志', sub: '操作记录与变更追踪' },
     { id: 'update', icon: '⟳', label: '版本更新', sub: '检查并应用新版本' },
   ]},
 ];
@@ -87,6 +94,82 @@ const tableCard = (title, sub, cols, rowsHtml, actions) => card(
     : `<div class="empty">暂无数据</div>`}</div>`,
   actions);
 
+function fmtAgeTs(ts) {
+  if (!ts) return '-';
+  return fmtAge((Date.now() / 1000) - Number(ts)) + '前';
+}
+function fmtMoney(cents, currency) {
+  const n = Number(cents || 0) / 100;
+  return (currency || 'CNY') + ' ' + n.toFixed(2);
+}
+function fmtQuota(n) {
+  return n ? fmtBytes(n) : '不限';
+}
+function pageError(err) {
+  return `<div class="card"><div class="page-error">
+    <div class="t">加载失败</div>
+    <div>${esc(err && err.message ? err.message : err)}</div>
+    <div style="margin-top:12px"><button class="btn" id="retry-page">重试</button></div>
+  </div></div>`;
+}
+function pageLoading() {
+  return '<div class="card"><div class="page-loading">加载中…</div></div>';
+}
+function trafficBar(used, quota) {
+  if (!quota) return `<span class="muted">${fmtBytes(used)} / 不限</span>`;
+  const pct = Math.max(0, Math.min(100, Math.round(used / quota * 100)));
+  const cls = pct >= 100 ? 'bad' : pct >= 80 ? 'warn' : '';
+  return `<div>${fmtBytes(used)} / ${fmtBytes(quota)}
+    <span class="bar ${cls}"><i style="width:${pct}%"></i></span></div>`;
+}
+function stateTag(st) {
+  const map = { active: ['ok', '正常'], suspended: ['warn', '已停用'], expired: ['bad', '已过期'],
+    exhausted: ['bad', '已超额'], pending: ['warn', '待开通'] };
+  const [cls, label] = map[st] || ['idle', st || '-'];
+  return `<span class="tag ${cls}">${esc(label)}</span>`;
+}
+async function copyText(text) {
+  try { await navigator.clipboard.writeText(text); toast('已复制'); }
+  catch (e) { toast('无法复制，请手动选择', 1); }
+}
+
+let _modalKey = null;
+function closeModal() {
+  const el = $('#modal-root');
+  if (el) el.remove();
+  if (_modalKey) { document.removeEventListener('keydown', _modalKey); _modalKey = null; }
+}
+function openModal(title, bodyHtml, opts) {
+  closeModal();
+  const wide = opts && opts.wide;
+  const drawer = opts && opts.drawer;
+  const root = document.createElement('div');
+  root.id = 'modal-root';
+  root.className = 'modal-root';
+  root.innerHTML = `<div class="modal ${wide ? 'wide' : ''} ${drawer ? 'drawer' : ''}" role="dialog" tabindex="-1">
+    <div class="modal-head"><h3>${esc(title)}</h3>
+      <button class="btn sm" type="button" id="modal-close">关闭</button></div>
+    <div class="modal-body">${bodyHtml}</div></div>`;
+  document.body.appendChild(root);
+  const box = root.querySelector('.modal');
+  const focusables = () => [...box.querySelectorAll('a[href],button,input,select,textarea')]
+    .filter((x) => !x.disabled && x.offsetParent !== null);
+  _modalKey = (e) => {
+    if (e.key === 'Escape') { closeModal(); return; }
+    if (e.key !== 'Tab') return;
+    const list = focusables();
+    if (!list.length) return;
+    const first = list[0]; const last = list[list.length - 1];
+    if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+  };
+  document.addEventListener('keydown', _modalKey);
+  root.addEventListener('click', (e) => { if (e.target === root) closeModal(); });
+  $('#modal-close').onclick = closeModal;
+  (focusables()[0] || box).focus();
+  return root;
+}
+
 /* ---------------- shell ---------------- */
 function buildNav() {
   $('#nav').innerHTML = NAV.map((g) => `
@@ -124,17 +207,23 @@ async function renderPage(page, manual, live) {
   } catch (e) {
     // A push-triggered re-render must stay silent: the operator did not ask
     // for it, so a toast on every transient failure would be noise.
-    if (!live) toast('加载失败: ' + e.message, 1);
+    if (!live) {
+      $('#view').innerHTML = pageError(e);
+      const btn = $('#retry-page');
+      if (btn) btn.onclick = () => renderPage(page, true);
+      toast('加载失败: ' + e.message, 1);
+    }
   }
 }
 
 /* ---------------- pages ---------------- */
 PAGES.dashboard = async () => {
-  const [sessions, pipe, nodes, libs] = await Promise.all([
+  const [sessions, pipe, nodes, libs, overview] = await Promise.all([
     api('/api/emby/sessions').catch(() => []),
     api('/api/pipeline').catch(() => ({ available: false })),
     api('/api/nodes').catch(() => []),
     api('/api/emby/libraries').catch(() => []),
+    api('/api/stats/overview?days=30').catch(() => null),
   ]);
   const online = nodes.filter((n) => n.available).length;
   const d = pipe.available ? pipe.data : {};
@@ -142,14 +231,19 @@ PAGES.dashboard = async () => {
   const queued = queues.reduce((a, q) => a + (q.items || 0), 0);
   const limited = (d.quota || []).filter((q) => q.state !== 'ok').length;
   const alerts = d.alerts || [];
+  const mem = (overview && overview.members) || {};
+  const rev = (overview && overview.revenue) || {};
+  const expiring = (overview && overview.expiring_7d) || [];
+  const exhaustedN = mem.exhausted || 0;
 
   $('#view').innerHTML = `
     <div class="stat-grid">
+      ${stat('☺', mem.total || 0, '成员', `${mem.active || 0} 正常 · ${mem.expired || 0} 过期`)}
+      ${stat('¥', overview ? fmtMoney(rev.mrr_cents, rev.currency) : '-', '月经常性收入', '按套餐折算')}
       ${stat('⛁', `${online} / ${nodes.length}`, '在线节点', nodes.length ? '推流节点健康状态' : '尚未配置节点')}
       ${stat('▶', sessions.length, '当前播放', sessions.length ? '正在进行的会话' : '暂无活跃会话')}
-      ${stat('▤', libs.length, '媒体库', libs.reduce((a, l) => a + (l.items || 0), 0) + ' 个条目')}
       ${stat('⇄', queued, '管线待处理', pipe.available ? '整理与上传队列' : '快照不可用')}
-      ${stat('⚠', alerts.length + limited, '待处理事项', limited ? `${limited} 个上传身份受限` : '系统关键状态')}
+      ${stat('⚠', alerts.length + limited + expiring.length + exhaustedN, '待处理事项', limited ? `${limited} 个上传身份受限` : '系统关键状态')}
     </div>
     <div class="grid-2">
       ${tableCard('当前播放', '实时会话', ['用户', '客户端', '方式', '码率'],
@@ -172,6 +266,15 @@ PAGES.dashboard = async () => {
                <div class="s">${esc(a.level)}</div></div>
                <span class="tag ${a.level === 'warn' ? 'warn' : 'idle'}">${esc(a.level)}</span></div>`).join('')}</div>`
           : `<div class="empty">当前没有待处理事项</div>`)}
+    </div>
+    <div class="grid-2">
+      ${tableCard('即将到期', '7 天内 · 点用户名进入用户管理', ['用户', '套餐', '剩余'],
+        expiring.map((m) => `<tr><td><a href="#/members">${esc(m.username)}</a></td>
+          <td>${esc(m.plan)}</td><td class="${m.days_left <= 1 ? 'danger-text' : ''}">${esc(m.days_left)} 天</td></tr>`).join(''))}
+      ${card('超额 / 过期', '需要处理的账号',
+        (mem.exhausted || mem.expired)
+          ? `<div class="card-body"><a href="#/members">超额 ${esc(mem.exhausted || 0)} · 过期 ${esc(mem.expired || 0)} · 停用 ${esc(mem.suspended || 0)}</a></div>`
+          : `<div class="empty">没有超额或过期账号</div>`)}
     </div>`;
 };
 
@@ -229,49 +332,6 @@ async function cancelImport(id) {
   catch (e) { toast('取消失败: ' + e.message, 1); }
 }
 
-PAGES.users = async () => {
-  const us = await api('/api/emby/users').catch(() => []);
-  const disabled = us.filter((u) => u.Policy && u.Policy.IsDisabled).length;
-  $('#view').innerHTML = `
-    <div class="stat-grid">
-      ${stat('☺', us.length, '用户总数', '媒体库账号')}
-      ${stat('✓', us.length - disabled, '正常账号', '可正常登录')}
-      ${stat('⊘', disabled, '已禁用', '停用中的账号')}
-    </div>
-    ${card('新建用户', '创建媒体库账号',
-      `<div class="card-body"><div class="toolbar">
-        <input id="nu" placeholder="用户名" style="min-width:220px">
-        <button class="btn primary" id="nu-go">创建</button></div></div>`)}
-    ${tableCard('用户列表', `${us.length} 个`, ['用户', '状态', ''],
-      us.map((u) => {
-        const dis = u.Policy && u.Policy.IsDisabled;
-        return `<tr><td>${esc(u.Name)}</td>
-          <td><span class="tag ${dis ? 'bad' : 'ok'}">${dis ? '已禁用' : '正常'}</span></td>
-          <td><button class="btn sm" onclick="userCtl('${esc(u.Id)}','${dis ? 'enable' : 'disable'}')">${dis ? '启用' : '禁用'}</button>
-              <button class="btn sm" onclick="resetPw('${esc(u.Id)}','${esc(u.Name)}')">改密</button></td></tr>`;
-      }).join(''))}`;
-  $('#nu-go').onclick = createUser;
-};
-async function createUser() {
-  const name = $('#nu').value.trim();
-  if (!name) return toast('请输入用户名', 1);
-  try { await api('/api/emby/users', { method: 'POST', body: JSON.stringify({ name }) });
-    toast('用户已创建'); renderPage('users');
-  } catch (e) { toast('创建失败: ' + e.message, 1); }
-}
-async function userCtl(id, action) {
-  try { await api(`/api/emby/users/${id}/${action}`, { method: 'POST' });
-    toast(action === 'disable' ? '已禁用' : '已启用'); renderPage('users');
-  } catch (e) { toast('操作失败: ' + e.message, 1); }
-}
-async function resetPw(id, name) {
-  const pw = prompt(`为 ${name} 设置新密码（至少 6 位）`);
-  if (!pw) return;
-  try { await api(`/api/emby/users/${id}/password`, { method: 'POST',
-    body: JSON.stringify({ new_password: pw }) }); toast('密码已更新');
-  } catch (e) { toast('改密失败: ' + e.message, 1); }
-}
-
 PAGES.nodes = async () => {
   const [ns, log, dispatch, st] = await Promise.all([
     api('/api/nodes').catch(() => []),
@@ -296,15 +356,13 @@ PAGES.nodes = async () => {
     </div>
     ${panelSet ? '' : card('⚠ 尚未填写面板对外地址', '节点安装时需要用它回连面板取配置',
       `<div class="card-body"><div class="muted">请先到「系统设置 → 接入方式」填写面板对外地址，否则无法生成节点安装命令。</div></div>`)}
-    ${card('新增节点', '先在面板登记，再用生成的一条命令去装机',
+    ${card('新增节点', '只需名称；地址由节点安装后自动上报',
       `<div class="card-body"><div class="toolbar">
-        <input id="nd-name" placeholder="节点名称 如 ca1" style="width:130px">
-        <input id="nd-base" placeholder="对外地址 https://ca1.example.com" style="flex:1;min-width:220px">
-        <input id="nd-probe" placeholder="探针地址 http://127.0.0.1:9800/load" style="flex:1;min-width:200px">
-        <input id="nd-capacity" type="number" min="1" value="100" style="width:100px" title="并发容量">
+        <input id="nd-name" placeholder="节点名称 如 node-a" style="width:160px">
+        <input id="nd-capacity" type="number" min="1" value="100" style="width:100px" title="并发容量（可选）">
         <button class="btn primary" id="nd-go">添加</button>
       </div>
-      <div class="muted" style="margin-top:8px">添加后展开该节点填写「媒体根」，再复制安装命令到新机器执行。</div>
+      <div class="muted" style="margin-top:8px">添加后会给出一条安装命令。节点回连后才显示真实对外地址。</div>
       </div>`)}
     ${ns.length ? ns.map(nodeCard).join('') : card('推流节点', '尚未配置',
       '<div class="card-body"><div class="empty">还没有节点</div></div>')}
@@ -316,6 +374,7 @@ PAGES.nodes = async () => {
         <td><span class="tag idle">${esc(e.reason || e.policy || '-')}</span></td>
         <td>${esc((e.context || '').slice(0, 44))}</td></tr>`).join(''))}`;
   $('#nd-go').onclick = addNode;
+  (state.nodes || []).forEach((n) => fillNodeMounts(n));
 };
 
 /* 一个节点 = 一张卡：健康、媒体根、缓存、签名、安装命令全在这里。
@@ -376,10 +435,14 @@ function nodeCard(n) {
       <div class="form-row"><label>链接有效期</label>
         <input id="nc-ttl-${esc(n.name)}" type="number" min="60" value="${esc(n.sign_ttl_seconds || 21600)}" style="width:120px">
         <span class="muted">秒</span></div>
-      <div class="form-row"><label>rclone 配置</label>
-        <span class="${n.rclone_conf_set ? 'tag ok' : 'tag warn'}">${n.rclone_conf_set ? '已保存' : '未保存'}</span>
-        <button class="btn sm" onclick="editRcloneConf('${esc(n.name)}')">粘贴 rclone.conf</button>
-        <span class="muted">保存后装机时自动写入，无需在节点上跑 rclone config</span></div>
+      ${n.legacy_config ? `<div class="form-row"><label>旧式配置</label>
+        <span class="tag warn">该节点仍保存独立 rclone.conf</span>
+        <button class="btn sm" onclick="migrateNodeStorage('${esc(n.name)}')">迁移到全局挂载</button></div>` : ''}
+      <div class="form-row"><label>全局挂载</label>
+        <div id="nmounts-${esc(n.name)}" class="muted">加载中…</div></div>
+      <div class="form-row"><label>接入状态</label>
+        ${n.enrolled ? `<span class="tag ok">已接入</span> <span class="muted">${esc(fmtAgeTs(n.first_seen_at))} · ${esc(n.enrolled_host || n.base_url)}</span>`
+                      : '<span class="tag warn">待接入</span>'}</div>
       <div class="toolbar">
         <button class="btn primary" onclick="saveNodeStorage('${esc(n.name)}')">保存</button>
         <button class="btn" onclick="showEnroll('${esc(n.name)}')">获取安装命令</button>
@@ -416,11 +479,13 @@ async function delPool(name, index) {
 }
 async function saveNodeStorage(name) {
   const g = (k) => ($(`#nc-${k}-${CSS.escape(name)}`) || {}).value || '';
+  const mountIds = [...document.querySelectorAll(`.nmount-${CSS.escape(name)}:checked`)].map((x) => x.value);
   try {
     await api(`/api/nodes/${encodeURIComponent(name)}`, { method: 'PUT', body: JSON.stringify({
       cache_dir: g('dir').trim(), cache_size: g('size').trim(),
       sign_arg_digest: g('argd').trim(), sign_arg_expires: g('arge').trim(),
       sign_ttl_seconds: parseInt(g('ttl'), 10) || 21600,
+      mount_ids: mountIds,
     }) });
     toast('已保存'); renderPage('nodes');
   } catch (e) { toast('保存失败: ' + e.message, 1); }
@@ -441,19 +506,49 @@ async function editRcloneConf(name) {
     toast('已保存'); renderPage('nodes');
   } catch (e) { toast('保存失败: ' + e.message, 1); }
 }
+function stopEnrollPoll() {
+  if (state.enrollTimer) { clearInterval(state.enrollTimer); state.enrollTimer = null; }
+}
 async function showEnroll(name) {
+  stopEnrollPoll();
   const box = $(`#enroll-${CSS.escape(name)}`);
+  if (!box) return;
   box.textContent = '生成中…';
+  const paint = async () => {
+    try {
+      const r = await api(`/api/nodes/${encodeURIComponent(name)}/enroll`);
+      const enrolled = r.enrolled;
+      box.innerHTML = `
+        <div class="toolbar" style="margin-bottom:6px">
+          ${enrolled ? `<span class="tag ok">已接入</span> <span class="muted">${esc(fmtAgeTs(r.first_seen_at))} · ${esc(r.enrolled_host || '')}</span>`
+                     : '<span class="tag warn">待接入</span>'}
+          <button class="btn sm" type="button" id="copy-enroll-${esc(name)}">复制命令</button>
+          <button class="btn sm" type="button" id="rotate-enroll-${esc(name)}">重新生成安装命令</button>
+        </div>
+        <div class="muted" style="margin-bottom:6px">在新机器上以 root 执行。命令不会自动运行。</div>
+        <pre class="codeblock">${esc(r.command)}</pre>
+        ${(r.warnings || []).map((w) => `<div class="tag warn" style="margin-top:6px">${esc(w)}</div>`).join('')}
+        <div class="muted" style="margin-top:6px">重新生成后，旧命令立即失效。</div>`;
+      const copyBtn = $(`#copy-enroll-${CSS.escape(name)}`);
+      if (copyBtn) copyBtn.onclick = () => copyText(r.command);
+      const rotBtn = $(`#rotate-enroll-${CSS.escape(name)}`);
+      if (rotBtn) rotBtn.onclick = () => rotateEnroll(name);
+      if (enrolled) stopEnrollPoll();
+    } catch (e) {
+      box.innerHTML = `<span class="tag bad">生成失败</span> ${esc(e.message)}`;
+      stopEnrollPoll();
+    }
+  };
+  await paint();
+  state.enrollTimer = setInterval(paint, 4000);
+}
+async function rotateEnroll(name) {
+  if (!confirm('重新生成后，旧的安装命令立即失效。继续？')) return;
   try {
-    const r = await api(`/api/nodes/${encodeURIComponent(name)}/enroll`);
-    box.innerHTML = `
-      <div class="muted" style="margin-bottom:6px">在这台新机器上以 root 执行（其余配置面板已自动带过去）：</div>
-      <pre class="codeblock">${esc(r.command)}</pre>
-      ${(r.warnings || []).map((w) => `<div class="tag warn" style="margin-top:6px">${esc(w)}</div>`).join('')}
-      <div class="muted" style="margin-top:6px">前置：DNS 中该节点域名解析到本机且为 DNS-only（灰云），视频不能走 CDN 代理。</div>`;
-  } catch (e) {
-    box.innerHTML = `<span class="tag bad">生成失败</span> ${esc(e.message)}`;
-  }
+    await api(`/api/nodes/${encodeURIComponent(name)}/rotate-enroll`, { method: 'POST' });
+    toast('已重新生成');
+    showEnroll(name);
+  } catch (e) { toast('失败: ' + e.message, 1); }
 }
 async function nodeCtl(name, action) {
   try { await api(`/api/nodes/${encodeURIComponent(name)}/${action}`, { method: 'POST' });
@@ -463,15 +558,38 @@ async function nodeCtl(name, action) {
 async function addNode() {
   const body = {
     name: $('#nd-name').value.trim(),
-    base_url: $('#nd-base').value.trim(),
-    probe_url: $('#nd-probe').value.trim(),
     capacity: parseFloat($('#nd-capacity').value) || 100,
   };
-  if (!body.name || !body.base_url || !body.probe_url) return toast('请填写完整节点信息', 1);
+  if (!body.name) return toast('请填写节点名称', 1);
   try {
-    await api('/api/nodes', { method: 'POST', body: JSON.stringify(body) });
-    toast('节点已添加，请继续配置媒体根'); renderPage('nodes');
+    const created = await api('/api/nodes', { method: 'POST', body: JSON.stringify(body) });
+    toast('节点已登记');
+    await renderPage('nodes');
+    showEnroll(created.name);
   } catch (e) { toast('添加失败: ' + e.message, 1); }
+}
+async function fillNodeMounts(n) {
+  const box = $(`#nmounts-${CSS.escape(n.name)}`);
+  if (!box) return;
+  try {
+    const mounts = await api('/api/storage/mounts');
+    if (!mounts.length) { box.textContent = '还没有全局挂载，请先到「存储管理」添加'; return; }
+    const chosen = new Set(n.mount_ids || []);
+    box.innerHTML = mounts.map((m) => `<label style="margin-right:12px">
+      <input type="checkbox" class="nmount-${esc(n.name)}" value="${esc(m.name)}" ${chosen.has(m.name) ? 'checked' : ''}>
+      ${esc(m.name)} <span class="muted">(${esc(m.remote)})</span></label>`).join('');
+  } catch (e) {
+    box.textContent = '无法读取全局挂载: ' + e.message;
+  }
+}
+async function migrateNodeStorage(name) {
+  if (!confirm(`把 ${name} 的旧式 rclone.conf 标记为已迁移？\n\n独立配置会保留，但之后请改用全局挂载列表。`)) return;
+  try {
+    await api(`/api/nodes/${encodeURIComponent(name)}`, {
+      method: 'PUT', body: JSON.stringify({ mount_ids: [] }) });
+    toast('已切换为全局挂载模式（旧配置仍保留，不会静默删除）');
+    renderPage('nodes');
+  } catch (e) { toast('失败: ' + e.message, 1); }
 }
 async function editNodeCapacity(name, current) {
   const value = prompt(`设置 ${name} 的并发容量（最多同时承载多少路播放）`, current);
@@ -686,7 +804,37 @@ PAGES.settings = async () => {
         <td>${(n.pools || []).length ? (n.pools || []).map((x) => esc(x.emby_prefix)).join(', ')
           : '<span class="tag bad">未配置</span>'}</td>
         <td>${n.sign_secret_set ? '<span class="tag ok">已设置</span>' : '<span class="tag bad">未设置</span>'}</td>
-        <td><span class="tag ${n.enabled ? 'ok' : 'idle'}">${n.enabled ? '启用' : '停用'}</span></td></tr>`).join(''))}`;
+        <td><span class="tag ${n.enabled ? 'ok' : 'idle'}">${n.enabled ? '启用' : '停用'}</span></td></tr>`).join(''))}
+    ${card('会员与计费', '流量采样与 Emby 策略下发',
+      `<div class="card-body">
+        <div class="form-row"><label>自动下发</label>
+          <input id="mb-enforcement" type="checkbox" ${s.membership && s.membership.enforcement_enabled ? 'checked' : ''}>
+          <span class="muted">关闭时只观察，不改 Emby 账号策略</span></div>
+        <div class="form-row"><label>采样间隔</label>
+          <input id="mb-interval" type="number" min="5" max="60" value="${esc((s.membership || {}).sample_interval_seconds || 15)}" style="width:90px">
+          <span class="muted">秒（5–60）</span></div>
+        <div class="form-row"><label>保留天数</label>
+          <input id="mb-keep" type="number" min="30" value="${esc((s.membership || {}).retention_days || 400)}" style="width:90px">
+          <span class="muted">播放记录与审计</span></div>
+        <div class="toolbar"><button class="btn primary" id="mb-save">保存会员设置</button></div>
+      </div>`)}
+    ${card('图片缓存', '海报走本地磁盘，减轻 Emby CPU',
+      `<div class="card-body">
+        <div id="ic-stats" class="muted">读取中…</div>
+        <div class="form-row"><label>启用</label>
+          <input id="ic-enabled" type="checkbox" ${(s.image_cache || {}).enabled ? 'checked' : ''}></div>
+        <div class="form-row"><label>容量</label>
+          <input id="ic-gib" type="number" min="1" value="${esc((s.image_cache || {}).max_gib || 4)}" style="width:90px">
+          <span class="muted">GiB</span></div>
+        <div class="form-row"><label>保留</label>
+          <input id="ic-age" type="number" min="1" value="${esc((s.image_cache || {}).max_age_days || 30)}" style="width:90px">
+          <span class="muted">天</span></div>
+        <div class="toolbar">
+          <button class="btn primary" id="ic-save">保存缓存设置</button>
+          <button class="btn" id="ic-sweep">立即清理</button>
+          <button class="btn danger" id="ic-clear">清空缓存</button>
+        </div>
+      </div>`)}`;
   $('#em-save').onclick = saveEmby;
   $('#em-test').onclick = testEmby;
   $('#dp-save').onclick = saveDispatch;
@@ -694,6 +842,11 @@ PAGES.settings = async () => {
   $('#pb-preview').onclick = previewPlayback;
   $('#ig-save').onclick = saveIntegration;
   $('#ig-show').onclick = showFrontendConfig;
+  $('#mb-save').onclick = saveMembership;
+  $('#ic-save').onclick = saveImageCache;
+  $('#ic-sweep').onclick = sweepImageCache;
+  $('#ic-clear').onclick = clearImageCache;
+  refreshImageCacheStats();
 };
 async function saveIntegration() {
   try {
@@ -781,6 +934,45 @@ async function saveDispatch() {
   } catch (e) { toast('保存失败: ' + e.message, 1); }
 }
 
+async function saveMembership() {
+  try {
+    await api('/api/settings/membership', { method: 'PUT', body: JSON.stringify({
+      enforcement_enabled: $('#mb-enforcement').checked,
+      sample_interval_seconds: parseInt($('#mb-interval').value, 10),
+      retention_days: parseInt($('#mb-keep').value, 10),
+    }) });
+    toast('会员设置已保存'); renderPage('settings');
+  } catch (e) { toast('保存失败: ' + e.message, 1); }
+}
+async function refreshImageCacheStats() {
+  const el = $('#ic-stats');
+  if (!el) return;
+  try {
+    const r = await api('/api/settings/image-cache');
+    const s = r.stats || {};
+    el.innerHTML = `占用 ${fmtBytes(s.bytes)} / ${fmtBytes(s.max_bytes)} · 命中率 ${s.hit_rate == null ? '-' : s.hit_rate + '%'} · ${esc(s.entries || 0)} 张`;
+  } catch (e) { el.textContent = '无法读取缓存状态'; }
+}
+async function saveImageCache() {
+  try {
+    await api('/api/settings/image-cache', { method: 'PUT', body: JSON.stringify({
+      enabled: $('#ic-enabled').checked,
+      max_gib: parseInt($('#ic-gib').value, 10),
+      max_age_days: parseInt($('#ic-age').value, 10),
+    }) });
+    toast('图片缓存已保存'); refreshImageCacheStats();
+  } catch (e) { toast('保存失败: ' + e.message, 1); }
+}
+async function sweepImageCache() {
+  try { await api('/api/settings/image-cache/sweep', { method: 'POST' }); toast('已清理超限条目'); refreshImageCacheStats(); }
+  catch (e) { toast('失败: ' + e.message, 1); }
+}
+async function clearImageCache() {
+  if (!confirm('清空全部海报缓存？下次打开媒体库会重新拉取。')) return;
+  try { await api('/api/settings/image-cache/clear', { method: 'POST' }); toast('已清空'); refreshImageCacheStats(); }
+  catch (e) { toast('失败: ' + e.message, 1); }
+}
+
 PAGES.update = async () => {
   const v = await api('/api/update/version').catch(() => ({ version: '?', commit: '?' }));
   $('#view').innerHTML = `
@@ -838,6 +1030,7 @@ function setLiveState(ok) {
 }
 
 function connectLive(page) {
+  stopEnrollPoll();
   const topics = LIVE[page];
   if (live.src) { live.src.close(); live.src = null; }
   live.page = page;
@@ -878,10 +1071,16 @@ function isEditing() {
 }
 
 /* ---------------- boot ---------------- */
-buildNav();
-api('/api/update/version').then((v) => { $('#version').textContent = v.version; }).catch(() => {});
-api('/api/whoami').then((w) => {
-  $('#who').textContent = w.user;
-  $('#who-initial').textContent = (w.user || '?').slice(0, 1).toUpperCase();
-}).catch(() => {});
-go((location.hash || '').replace('#/', '') || 'dashboard');
+/* ops.js registers PAGES.members/plans/invites/stats/storage/audit and then
+   calls bootPanel(). Starting here would paint those NAV entries as 页面不存在. */
+function bootPanel() {
+  if (bootPanel.done) return;
+  bootPanel.done = true;
+  buildNav();
+  api('/api/update/version').then((v) => { $('#version').textContent = v.version; }).catch(() => {});
+  api('/api/whoami').then((w) => {
+    $('#who').textContent = w.user;
+    $('#who-initial').textContent = (w.user || '?').slice(0, 1).toUpperCase();
+  }).catch(() => {});
+  go((location.hash || '').replace('#/', '') || 'dashboard');
+}

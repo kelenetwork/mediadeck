@@ -15,14 +15,14 @@ top-down without asking. Every item ships as its own PR + release tag.
 - [x] Media library overview
 - [~] Acquisition/downloads: dropped by owner decision (stays external)
 
-## v0.6.0 — Mount health (next)
+## v0.6.0 — Mount health (shipped)
 Storage is the single most failure-prone layer in this stack: FUSE mounts go
 stale, a union mount loses allow_other and the whole library 403s, ffprobe
 wedges in D-state. This page makes all of it visible in one place.
-- [ ] Collector: per-mount liveness (readdir probe), backend type, options
-- [ ] Detect stuck I/O (processes blocked in uninterruptible sleep per mount)
-- [ ] VFS cache usage vs configured limits; free-space floor per filesystem
-- [ ] Panel page: mount table, health tags, stuck-process alerts
+- [x] Collector: per-mount liveness (readdir probe), backend type, options
+- [x] Detect stuck I/O (processes blocked in uninterruptible sleep per mount)
+- [x] VFS cache usage vs configured limits; free-space floor per filesystem
+- [x] Panel page: mount table, health tags, stuck-process alerts
 
 ## v0.7.0 — Scheduled task center (shipped)
 - [x] Snapshot schema: per-job schedule, last run, status, duration, exit code,
@@ -31,13 +31,21 @@ wedges in D-state. This page makes all of it visible in one place.
 - [ ] Host collector wiring (in progress)
 - [ ] Manual trigger (allowlisted) — deferred
 
-## v0.8.0 — Invites & access
-- [ ] Invite code issuing with quota/expiry, redemption -> Emby user creation
-- [ ] Access control view: per-user device/stream limits at a glance
+## v0.8.0 — Invites & access (shipped in v0.10 panel)
+- [x] Invite code issuing with quota/expiry, redemption -> Emby user creation
+- [x] Access control view: per-user device/stream limits at a glance
+- [x] Public redeem page at `/invite/{code}` with rate limiting
 
 ## v0.9.0 — Playback reports & notifications
-- [ ] Playback history aggregation (top titles, per-user minutes, node split)
+- [x] Playback history aggregation (top titles, per-user minutes, node split)
 - [ ] Notification center with routing rules and delivery log
+
+## v0.10.0 — 运营中枢 (working tree, uncommitted)
+- [x] Membership / plans / invites / stats / storage / audit panel pages
+- [x] Node enroll: name-only create, one-line install, call-home report, rotate token
+- [x] Global storage remotes + mounts; nodes pick mounts instead of pasting rclone.conf
+- [x] Referential integrity (plan/remote in use -> HTTP 409)
+- [x] max_devices enforced on register + mid-stream kick
 
 ## v1.0.0 — Live import executor + UI pass
 - [ ] Bridge import jobs to real host-side workers (sanitized IPC)

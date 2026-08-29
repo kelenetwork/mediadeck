@@ -11,8 +11,12 @@ class MockEmby:
         self._users: dict[str, dict[str, Any]] = {
             "u1": {"Id": "u1", "Name": "demo-user-1", "Policy": {"IsDisabled": False}},
             "u2": {"Id": "u2", "Name": "demo-user-2", "Policy": {"IsDisabled": True}},
+            "admin": {"Id": "admin", "Name": "demo-admin",
+                      "Policy": {"IsDisabled": False, "IsAdministrator": True}},
         }
         self._next = 3
+        self._sessions: list[dict[str, Any]] = []
+        self.stopped: list[tuple[str, str]] = []
 
     async def system_info(self) -> dict[str, Any]:
         return {
@@ -67,13 +71,36 @@ class MockEmby:
 
     async def libraries(self) -> list[dict[str, Any]]:
         return [
-            {"name": "demo-movies", "type": "movies", "items": 120, "locations": 2},
-            {"name": "demo-series", "type": "tvshows", "items": 340, "locations": 3},
+            {"id": "lib-movies", "name": "demo-movies", "type": "movies",
+             "items": 120, "locations": 2},
+            {"id": "lib-series", "name": "demo-series", "type": "tvshows",
+             "items": 340, "locations": 3},
         ]
+
+    async def active_sessions_raw(self) -> list[dict[str, Any]]:
+        """Full session objects, shaped like Emby's, for usage accounting.
+
+        Injectable so tests can drive the sampler deterministically instead of
+        depending on random demo data.
+        """
+        return list(self._sessions)
+
+    def set_sessions(self, sessions: list[dict[str, Any]]) -> None:
+        self._sessions = list(sessions)
+
+    async def stop_session(self, session_id: str, reason: str = "") -> bool:
+        before = len(self._sessions)
+        self._sessions = [s for s in self._sessions if s.get("Id") != session_id]
+        self.stopped.append((session_id, reason))
+        return len(self._sessions) < before
+
+    async def sessions_for_user(self, user_id: str) -> list[dict[str, Any]]:
+        return [s for s in self._sessions if s.get("UserId") == user_id]
 
     async def active_sessions(self) -> list[dict[str, Any]]:
         return [
             {
+                "UserId": "u1",
                 "UserName": "demo-user-1",
                 "Client": "Demo Player",
                 "PlayMethod": "DirectStream",

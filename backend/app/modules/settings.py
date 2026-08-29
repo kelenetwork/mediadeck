@@ -32,6 +32,9 @@ SECRET_UNCHANGED = "__KEEP__"
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$")
 MAX_NODES = 64
 MAX_POOLS = 12
+# Used until the node calls home. `.invalid` is reserved and never resolves.
+PENDING_BASE_URL = "https://pending.invalid"
+PENDING_PROBE_URL = "http://127.0.0.1:9800/load"
 
 # Playback interception is opt-in: it changes where clients fetch bytes from,
 # so it must never switch itself on during an upgrade.
@@ -45,6 +48,24 @@ PLAYBACK_DEFAULTS: dict[str, Any] = {
 INTEGRATION_DEFAULTS: dict[str, Any] = {
     "panel_public_url": "",
     "emby_public_url": "",
+}
+
+# Artwork cache. Enabled by default because it is pure win: posters never
+# change for a given item+size, so re-deriving them on every scroll only burns
+# Emby CPU at the moment the UI most needs to feel instant.
+IMAGE_CACHE_DEFAULTS: dict[str, Any] = {
+    "enabled": True,
+    "max_gib": 4,
+    "max_age_days": 30,
+}
+
+# Membership enforcement. Off by default: this server has hundreds of accounts
+# created before the panel existed, and switching enforcement on must be a
+# deliberate act rather than something an upgrade does silently.
+MEMBERSHIP_DEFAULTS: dict[str, Any] = {
+    "enforcement_enabled": False,
+    "sample_interval_seconds": 15,
+    "retention_days": 400,
 }
 
 
@@ -102,6 +123,8 @@ class SettingsService:
         }, persist=False)
         self._store.set_section("playback", dict(PLAYBACK_DEFAULTS), persist=False)
         self._store.set_section("integration", dict(INTEGRATION_DEFAULTS), persist=False)
+        self._store.set_section("image_cache", dict(IMAGE_CACHE_DEFAULTS), persist=False)
+        self._store.set_section("membership", dict(MEMBERSHIP_DEFAULTS), persist=False)
         seed = cfg.nodes() or (demo_nodes() if cfg.mediadeck_mock else [])
         self._store.set("nodes", [n.model_dump() for n in seed], persist=False)
         self._store.save()
@@ -236,6 +259,83 @@ class SettingsService:
         })
         return self.integration_config()
 
+    # -- image cache ---------------------------------------------------------
+    def image_cache_config(self) -> dict[str, Any]:
+        section = self._store.section("image_cache")
+        cfg = dict(IMAGE_CACHE_DEFAULTS)
+        for key in cfg:
+            if key in section:
+                cfg[key] = section[key]
+        cfg["enabled"] = bool(cfg["enabled"])
+        try:
+            cfg["max_gib"] = max(1, int(cfg["max_gib"]))
+        except (TypeError, ValueError):
+            cfg["max_gib"] = IMAGE_CACHE_DEFAULTS["max_gib"]
+        try:
+            cfg["max_age_days"] = max(1, int(cfg["max_age_days"]))
+        except (TypeError, ValueError):
+            cfg["max_age_days"] = IMAGE_CACHE_DEFAULTS["max_age_days"]
+        cfg["max_bytes"] = cfg["max_gib"] * 1024 ** 3
+        return cfg
+
+    def save_image_cache(self, payload: dict[str, Any]) -> dict[str, Any]:
+        current = self.image_cache_config()
+        try:
+            max_gib = int(payload.get("max_gib", current["max_gib"]))
+            max_age = int(payload.get("max_age_days", current["max_age_days"]))
+        except (TypeError, ValueError):
+            raise ConfigError("缓存容量与保留天数必须是整数") from None
+        if not 1 <= max_gib <= 2048:
+            raise ConfigError("缓存容量必须在 1–2048 GiB 之间")
+        if not 1 <= max_age <= 3650:
+            raise ConfigError("缓存保留天数必须在 1–3650 之间")
+        self._store.set_section("image_cache", {
+            "enabled": bool(payload.get("enabled", current["enabled"])),
+            "max_gib": max_gib,
+            "max_age_days": max_age,
+        })
+        return self.image_cache_config()
+
+    # -- membership ----------------------------------------------------------
+    def membership_config(self) -> dict[str, Any]:
+        section = self._store.section("membership")
+        cfg = dict(MEMBERSHIP_DEFAULTS)
+        for key in cfg:
+            if key in section:
+                cfg[key] = section[key]
+        cfg["enforcement_enabled"] = bool(cfg["enforcement_enabled"])
+        try:
+            cfg["sample_interval_seconds"] = max(5, int(cfg["sample_interval_seconds"]))
+        except (TypeError, ValueError):
+            cfg["sample_interval_seconds"] = 15
+        try:
+            cfg["retention_days"] = max(30, int(cfg["retention_days"]))
+        except (TypeError, ValueError):
+            cfg["retention_days"] = 400
+        return cfg
+
+    def save_membership(self, payload: dict[str, Any]) -> dict[str, Any]:
+        current = self.membership_config()
+        try:
+            interval = int(payload.get(
+                "sample_interval_seconds", current["sample_interval_seconds"]))
+            retention = int(payload.get("retention_days", current["retention_days"]))
+        except (TypeError, ValueError):
+            raise ConfigError("采样间隔与保留天数必须是整数") from None
+        # Below ~5s the sampler spends more time talking to Emby than measuring;
+        # above 60s a user can burn a lot of quota between samples.
+        if not 5 <= interval <= 60:
+            raise ConfigError("采样间隔必须在 5–60 秒之间")
+        if not 30 <= retention <= 3650:
+            raise ConfigError("数据保留天数必须在 30–3650 之间")
+        self._store.set_section("membership", {
+            "enforcement_enabled": bool(payload.get(
+                "enforcement_enabled", current["enforcement_enabled"])),
+            "sample_interval_seconds": interval,
+            "retention_days": retention,
+        })
+        return self.membership_config()
+
     # -- nodes ---------------------------------------------------------------
     def nodes(self) -> list[StreamNode]:
         raw = self._store.get("nodes", []) or []
@@ -261,6 +361,9 @@ class SettingsService:
         data["sign_secret_masked"] = mask_secret(secret)
         # The Drive config contains OAuth tokens; only report whether it is set.
         data["rclone_conf_set"] = bool(rclone_conf.strip())
+        data["legacy_config"] = bool(rclone_conf.strip()) and not list(node.mount_ids or [])
+        data["enrolled"] = bool(node.first_seen_at)
+        data["pending"] = (node.base_url or "").rstrip("/") == PENDING_BASE_URL.rstrip("/")
         return data
 
     def nodes_public(self) -> list[dict[str, Any]]:
@@ -314,8 +417,17 @@ class SettingsService:
         name = str(payload.get("name", base.get("name", ""))).strip()
         if not NAME_RE.match(name):
             raise ConfigError("节点名称只能包含字母、数字、点、下划线和连字符（1–40 字符）")
-        base_url = _require_http_url(payload.get("base_url", base.get("base_url", "")), "节点地址")
-        probe_url = _require_http_url(payload.get("probe_url", base.get("probe_url", "")), "探针地址")
+        # A newly named node does not yet know its public address; the installer
+        # reports it. Empty URLs become a reserved placeholder rather than a
+        # validation error, so the operator is not asked to invent them.
+        raw_base = payload.get("base_url", base.get("base_url", ""))
+        raw_probe = payload.get("probe_url", base.get("probe_url", ""))
+        if not str(raw_base or "").strip():
+            raw_base = PENDING_BASE_URL
+        if not str(raw_probe or "").strip():
+            raw_probe = PENDING_PROBE_URL
+        base_url = _require_http_url(raw_base, "节点地址")
+        probe_url = _require_http_url(raw_probe, "探针地址")
         try:
             capacity = float(payload.get("capacity", base.get("capacity", 100)))
         except (TypeError, ValueError):
@@ -359,6 +471,12 @@ class SettingsService:
             rclone_conf=str(payload.get(
                 "rclone_conf", base.get("rclone_conf", "")) or ""),
             enroll_token=str(base.get("enroll_token", "")),
+            mount_ids=[str(x) for x in (
+                payload.get("mount_ids", base.get("mount_ids") or []) or [])
+                if str(x).strip()],
+            first_seen_at=base.get("first_seen_at"),
+            enrolled_host=str(payload.get(
+                "enrolled_host", base.get("enrolled_host", "")) or "")[:120],
         )
 
     def add_node(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -426,3 +544,44 @@ class SettingsService:
             nodes[index].enroll_token = secrets.token_urlsafe(24)
             self._persist_nodes(nodes)
         return nodes[index].enroll_token
+
+    def rotate_enroll_token(self, name: str) -> dict[str, Any]:
+        """Invalidate the current install command and issue a new token."""
+        nodes = self.nodes()
+        index = next((i for i, n in enumerate(nodes) if n.name == name), None)
+        if index is None:
+            raise KeyError(name)
+        nodes[index].enroll_token = secrets.token_urlsafe(24)
+        self._persist_nodes(nodes)
+        return self.node_public(nodes[index])
+
+    def apply_enroll_report(self, token: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """A node calling home after install: record its addresses and mark enrolled."""
+        import time
+        nodes = self.nodes()
+        index = next(
+            (i for i, n in enumerate(nodes)
+             if n.enroll_token and secrets.compare_digest(n.enroll_token, token)),
+            None,
+        )
+        if index is None:
+            raise KeyError(token)
+        node = nodes[index]
+        patch: dict[str, Any] = {}
+        if payload.get("base_url"):
+            patch["base_url"] = payload["base_url"]
+        if payload.get("probe_url"):
+            patch["probe_url"] = payload["probe_url"]
+        if payload.get("capacity") is not None:
+            patch["capacity"] = payload["capacity"]
+        host = str(payload.get("host") or payload.get("enrolled_host") or "")[:120]
+        if host:
+            patch["enrolled_host"] = host
+        updated = self._validate_node(patch, existing=node)
+        if not updated.first_seen_at:
+            updated.first_seen_at = int(time.time())
+        if host:
+            updated.enrolled_host = host
+        nodes[index] = updated
+        self._persist_nodes(nodes)
+        return self.node_public(updated)

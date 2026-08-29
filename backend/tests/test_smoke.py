@@ -161,7 +161,9 @@ def test_root_serves_panel() -> None:
         r = client.get("/", headers=_basic())
         assert r.status_code == 200
         assert "mediadeck" in r.text and "/static/app.js" in r.text
+        assert "/static/ops.js" in r.text
         assert client.get("/static/app.js", headers=_basic()).status_code == 200
+        assert client.get("/static/ops.js", headers=_basic()).status_code == 200
         assert client.get("/api/whoami", headers=_basic()).json()["user"] == "admin"
 
 
@@ -169,7 +171,7 @@ def test_emby_libraries() -> None:
     with TestClient(app) as client:
         libs = client.get("/api/emby/libraries", headers=_basic()).json()
         assert libs and libs[0]["name"] == "demo-movies"
-        assert {"name", "type", "items", "locations"} <= set(libs[0])
+        assert {"id", "name", "type", "items", "locations"} <= set(libs[0])
 
 
 def test_mounts_mock() -> None:
@@ -636,7 +638,8 @@ def test_enroll_command_is_one_line_and_needs_panel_url() -> None:
                          "emby_public_url": "https://emby.test"})
         body = client.get("/api/nodes/edge-1/enroll", headers=_basic()).json()
         assert body["command"].startswith("curl -fsSL https://panel.test/api/enroll/")
-        assert body["command"].endswith("| sudo bash")
+        assert "MEDIADECK_ENROLL_TOKEN=" in body["command"]
+        assert body["command"].endswith(" bash")
         assert body["ready"] is True
         assert client.get("/api/nodes/ghost/enroll", headers=_basic()).status_code == 404
 

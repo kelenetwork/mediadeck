@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>开通账号 · mediadeck</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body class="invite-body">
+<div class="invite-wrap">
+  <div class="brand-name">mediadeck</div>
+  <h1>开通账号</h1>
+  <p class="muted" id="sub">正在读取邀请码…</p>
+  <div id="view"></div>
+</div>
+<script>
+const $ = (s) => document.querySelector(s);
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, (c) =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+function fmtBytes(n) {
+  if (!n) return '不限';
+  const u = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return n.toFixed(1) + ' ' + u[i];
+}
+function codeFromPath() {
+  const parts = location.pathname.split('/').filter(Boolean);
+  return decodeURIComponent(parts[parts.length - 1] || '');
+}
+function planLimits(p) {
+  if (!p) return '';
+  const bits = [];
+  if (p.duration_days) bits.push(p.duration_days + ' 天');
+  if (p.traffic_quota_bytes) bits.push(fmtBytes(p.traffic_quota_bytes) + ' 流量');
+  if (p.max_streams) bits.push(p.max_streams + ' 路并发');
+  if (p.max_devices) bits.push('最多 ' + p.max_devices + ' 台设备');
+  bits.push(p.allow_transcode ? '允许转码' : '直通播放');
+  return bits.join(' · ');
+}
+async function load() {
+  const code = codeFromPath();
+  const view = $('#view');
+  try {
+    const r = await fetch('/api/invite/' + encodeURIComponent(code));
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(body.detail || ('HTTP ' + r.status));
+    const p = body.plan || {};
+    $('#sub').textContent = '邀请码有效，剩余 ' + (body.remaining_uses || 0) + ' 次';
+    view.innerHTML = `
+      <div class="card">
+        <div class="card-head"><div><h3>${esc(p.name || '套餐')}</h3>
+          <div class="sub">${esc(planLimits(p))}</div></div></div>
+        <div class="card-body">
+          <div class="form-row"><label>用户名</label>
+            <input id="u" autocomplete="username" placeholder="字母数字，2–49 位"></div>
+          <div class="form-row"><label>密码</label>
+            <input id="p" type="password" autocomplete="new-password" placeholder="至少 6 位"></div>
+          <div class="toolbar">
+            <button class="btn primary" id="go">开通</button>
+            <span id="msg" class="muted"></span>
+          </div>
+        </div>
+      </div>`;
+    $('#go').onclick = redeem;
+  } catch (e) {
+    $('#sub').textContent = '无法使用此邀请码';
+    view.innerHTML = `<div class="card"><div class="empty">${esc(e.message)}</div></div>`;
+  }
+}
+async function redeem() {
+  const code = codeFromPath();
+  const username = ($('#u') || {}).value || '';
+  const password = ($('#p') || {}).value || '';
+  const msg = $('#msg');
+  msg.textContent = '提交中…';
+  try {
+    const r = await fetch('/api/invite/' + encodeURIComponent(code) + '/redeem', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password }),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(body.detail || ('HTTP ' + r.status));
+    $('#view').innerHTML = `<div class="card"><div class="card-body">
+      <div class="tag ok">开通成功</div>
+      <p>账号 <b>${esc(body.username)}</b> 已创建，请用该用户名和刚才设置的密码登录媒体库。</p>
+    </div></div>`;
+    $('#sub').textContent = '可以关闭此页面';
+  } catch (e) {
+    msg.innerHTML = `<span class="tag bad">${esc(e.message)}</span>`;
+  }
+}
+load();
+</script>
+</body>
+</html>
