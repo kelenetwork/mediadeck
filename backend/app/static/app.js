@@ -14,7 +14,9 @@ const NAV = [
     { id: 'members', icon: '☺', label: '用户管理', sub: '套餐、流量、到期与设备' },
     { id: 'plans', icon: '▣', label: '套餐管理', sub: '用户组、计费方式与限制' },
     { id: 'invites', icon: '✦', label: '邀请码', sub: '发码开通与用量追踪' },
+    { id: 'redeem', icon: '♻', label: '续费码', sub: '延期、换套餐与流量补充' },
     { id: 'stats', icon: '📈', label: '运营统计', sub: '流量、时长、热门内容与收入' },
+    { id: 'audit', icon: '☰', label: '审计日志', sub: '操作记录与变更追踪' },
   ]},
   { group: '工作台', items: [
     { id: 'library', icon: '▤', label: '媒体库', sub: '媒体库分布与条目统计' },
@@ -29,7 +31,6 @@ const NAV = [
   ]},
   { group: '系统管理', items: [
     { id: 'settings', icon: '⚙', label: '系统设置', sub: '对接 Emby、调度策略与节点配置' },
-    { id: 'audit', icon: '☰', label: '审计日志', sub: '操作记录与变更追踪' },
     { id: 'update', icon: '⟳', label: '版本更新', sub: '检查并应用新版本' },
   ]},
 ];
@@ -1071,7 +1072,7 @@ function isEditing() {
 }
 
 /* ---------------- boot ---------------- */
-/* ops.js registers PAGES.members/plans/invites/stats/storage/audit and then
+/* ops.js registers PAGES.members/plans/invites/redeem/stats/storage/audit and then
    calls bootPanel(). Starting here would paint those NAV entries as 页面不存在. */
 function bootPanel() {
   if (bootPanel.done) return;
