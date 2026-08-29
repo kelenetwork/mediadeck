@@ -229,6 +229,31 @@ class LiveEmby:
         except ValueError:
             return False
 
+    async def user_for_token(self, token: str) -> str | None:
+        """Resolve a caller's Emby token to their user id.
+
+        Needed to look up the member's bandwidth cap when signing a node URL.
+        Uses the caller's own credential (/Users/Me), so it can never resolve
+        to anyone but the token's owner.
+        """
+        token = (token or "").strip()
+        if not token:
+            return None
+        base, _, timeout, verify = self._conn()
+        try:
+            async with self._client(timeout, verify) as client:
+                r = await client.get(f"{base}/emby/Users/Me",
+                                     headers={"X-Emby-Token": token})
+        except httpx.HTTPError:
+            return None
+        if r.status_code != 200:
+            return None
+        try:
+            uid = (r.json() or {}).get("Id")
+        except ValueError:
+            return None
+        return str(uid) if uid else None
+
     async def item_media_paths(self, item_id: str) -> dict[str, str]:
         """Map MediaSourceId -> on-disk file path for one item.
 
@@ -374,10 +399,13 @@ class LiveProbe:
                 r = await client.get(probe_url)
                 r.raise_for_status()
                 data = r.json()
+                speeds = data.get("user_speeds")
                 return {
                     "ok": True,
                     "active_streams": int(data.get("active_streams", 0)),
                     "egress_mbps": float(data.get("egress_mbps", 0.0)),
+                    "user_speeds": speeds if isinstance(speeds, dict) else {},
                 }
         except (httpx.HTTPError, ValueError, KeyError):
-            return {"ok": False, "active_streams": 0, "egress_mbps": 0.0}
+            return {"ok": False, "active_streams": 0, "egress_mbps": 0.0,
+                    "user_speeds": {}}

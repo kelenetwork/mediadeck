@@ -162,11 +162,15 @@ def match_pool(media_path: str, pools: list[Any]) -> tuple[Any, str] | None:
 
 class PlaybackRouter:
     def __init__(self, emby: Any, scheduler: Any, config_provider: Any,
-                 emby_config_provider: Any) -> None:
+                 emby_config_provider: Any, rate_resolver: Any = None) -> None:
         self._emby = emby
         self._scheduler = scheduler
         self._config = config_provider
         self._emby_config = emby_config_provider
+        # Optional async callable: caller token -> (rate_bytes_per_s, utag).
+        # Lives outside this module so the router stays ignorant of member
+        # semantics; None means "sign without a per-user cap" (mock mode).
+        self._rate_resolver = rate_resolver
         self._cache = TTLCache()
         self._auth_cache = TTLCache(ttl=60.0)
         self._log: list[dict[str, Any]] = []
@@ -300,11 +304,21 @@ class PlaybackRouter:
         url_path = f"{str(pool.url_prefix).rstrip('/')}/{relative}"
         secret = str(getattr(chosen.node, "sign_secret", "") or "")
         if secret:
+            # Per-user bandwidth cap and anonymised tag ride inside the
+            # signature: the node enforces the cap and attributes real bytes
+            # to the user, and neither can be edited off the URL.
+            rate_bps, utag = 0, ""
+            if self._rate_resolver is not None and caller_token:
+                try:
+                    rate_bps, utag = await self._rate_resolver(caller_token)
+                except Exception:  # noqa: BLE001 - fail open: sign uncapped
+                    rate_bps, utag = 0, ""
             target = sign_url(
                 chosen.node.base_url, url_path, secret,
                 int(getattr(chosen.node, "sign_ttl_seconds", 21600) or 21600),
                 arg_digest=str(getattr(chosen.node, "sign_arg_digest", "md5")),
                 arg_expires=str(getattr(chosen.node, "sign_arg_expires", "expires")),
+                rate_bps=rate_bps, utag=utag,
             )
         else:
             target = public_url(chosen.node.base_url, url_path)

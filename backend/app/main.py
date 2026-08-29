@@ -45,6 +45,7 @@ from app.modules.provisioning import (
 )
 from app.modules.scheduler import Scheduler
 from app.modules.settings import SettingsService
+from app.modules.signing import user_tag
 from app.modules.stats import StatsService
 from app.modules.storage import MockStorage, StorageManager
 from app.modules.tasks import MockTasks, TasksReader
@@ -185,11 +186,36 @@ async def _startup() -> None:
 
     # Playback interception: the piece that puts the scheduler on the real
     # client path instead of only the /stream test edge.
+    async def _member_rate(token: str) -> tuple[int, str]:
+        """Caller token -> (bandwidth cap in bytes/s, anonymised user tag).
+
+        Signed into every node URL, so the node enforces the member's cap and
+        can attribute real transfer bytes back to the user. Cached briefly:
+        one playback start must not cost two extra round trips every time.
+        """
+        cache_key = f"rate:{user_tag(token)}"
+        cached = app.state.cache.get(cache_key)
+        if cached is not None:
+            return cached
+        result: tuple[int, str] = (0, "")
+        try:
+            uid = await app.state.emby.user_for_token(token)
+            if uid:
+                member = app.state.members.get(uid)
+                kbps = int((member or {}).get("bandwidth_limit_kbps") or 0)
+                # nginx limit_rate takes bytes/second; kbps -> B/s is *125.
+                result = (kbps * 125, user_tag(uid))
+        except Exception:  # noqa: BLE001 - fail open: sign uncapped
+            result = (0, "")
+        app.state.cache.set(cache_key, result, ttl=60)
+        return result
+
     app.state.playback = PlaybackRouter(
         app.state.emby,
         app.state.scheduler,
         app.state.settings_service.playback_config,
         app.state.settings_service.emby_config,
+        rate_resolver=_member_rate,
     )
 
     # ---- membership, billing, statistics --------------------------------
@@ -863,14 +889,24 @@ async def emby_sessions() -> list[dict[str, Any]]:
     sessions = await app.state.cache.resolve(
         "emby:sessions", app.state.emby.active_sessions, ttl=5
     )
-    # Live bandwidth comes from the usage sampler (bytes actually billed over
-    # the last sample window), not from media bitrate: the dashboard shows
-    # what the wire carries, and a paused session shows 0.
-    speeds = app.state.usage.live_speeds()
+    # Live bandwidth prefers what the *node* measured on the wire (collected
+    # from the nginx speed log, keyed by anonymised user tag). Sessions served
+    # by the Emby origin have no node measurement and fall back to the usage
+    # sampler's estimate, marked as such so the UI can say ≈.
+    est = app.state.usage.live_speeds()
+    node_speeds = app.state.scheduler.user_speeds()
     out = []
     for s in sessions:
         s = dict(s)
-        s["SpeedMbps"] = round(speeds.get(str(s.get("Id") or ""), 0) * 8 / 1e6, 1)
+        real = node_speeds.get(user_tag(str(s.get("UserId") or "")))
+        if real:
+            # Node speeds are per *user*: concurrent sessions of one account
+            # share the tag, so both rows show the account's wire rate.
+            s["SpeedMbps"] = round(real * 8 / 1e6, 1)
+            s["SpeedSource"] = "node"
+        else:
+            s["SpeedMbps"] = round(est.get(str(s.get("Id") or ""), 0) * 8 / 1e6, 1)
+            s["SpeedSource"] = "estimate"
         out.append(s)
     return out
 

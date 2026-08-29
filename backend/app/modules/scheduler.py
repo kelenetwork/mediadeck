@@ -43,6 +43,13 @@ class NodeState:
     last_probe_ts: float = 0.0
     consecutive_failures: int = 0
     manually_disabled: bool = False
+    # Anonymised user tag -> measured bytes/second on this node's wire, as
+    # reported by the node's speed collector. Display-only; never billing.
+    user_speeds: dict[str, int] = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.user_speeds is None:
+            self.user_speeds = {}
 
     def utilisation(self) -> float:
         """Fraction of this node's capacity currently in use (0.0 - 1.0+).
@@ -137,9 +144,13 @@ class Scheduler:
                 st.consecutive_failures = 0
                 st.active_streams = int(data.get("active_streams", 0))
                 st.egress_mbps = float(data.get("egress_mbps", 0.0))
+                speeds = data.get("user_speeds")
+                st.user_speeds = ({str(k): int(v) for k, v in speeds.items()}
+                                  if isinstance(speeds, dict) else {})
             else:
                 st.ok = False
                 st.consecutive_failures += 1
+                st.user_speeds = {}
             self._history[st.node.name].append({
                 "ts": st.last_probe_ts,
                 "ok": st.ok,
@@ -207,6 +218,19 @@ class Scheduler:
         return chosen
 
     # -- introspection -------------------------------------------------------
+    def user_speeds(self) -> dict[str, int]:
+        """Anonymised user tag -> bytes/second, summed across all nodes.
+
+        Summed because one account may stream from two nodes at once; the
+        dashboard shows what that account pulls in total.
+        """
+        out: dict[str, int] = {}
+        for st in self._states.values():
+            for tag, bps in (st.user_speeds or {}).items():
+                if tag:
+                    out[tag] = out.get(tag, 0) + int(bps)
+        return out
+
     def history(self, name: str, limit: int = 240) -> list[dict[str, Any]]:
         entries = self._history.get(name)
         if entries is None:
