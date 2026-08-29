@@ -123,19 +123,60 @@ class SpeedLog:
                 fh = None
                 time.sleep(5)
 
-    def _ingest(self, line: str) -> None:
+    @staticmethod
+    def parse(line: str) -> tuple[float, str, int, float] | None:
+        """Parse one access-log line into (end_ts, utag, bytes, seconds).
+
+        Deliberately tolerant of *which* mediadeck_speed format a node runs.
+        Nodes provisioned at different times write different shapes:
+
+            <msec> u=<tag> r=<rate> <bytes> <secs>   # current, self-labelling
+            <msec> <tag> <bytes> <secs>              # original, positional
+
+        Parsing only the positional form against a labelled log made every
+        line raise ValueError on int("r=10000000"), so every line was dropped
+        and user_speeds stayed empty forever -- the panel then fell back to
+        its estimate and live speed silently read wrong. Accept both rather
+        than couple the agent to one nginx template version.
+        """
         parts = line.split()
         if len(parts) < 4:
-            return
+            return None
         try:
             end_ts = float(parts[0])
-            utag = parts[1]
-            sent = int(parts[2])
-            took = max(0.05, float(parts[3]))
         except ValueError:
-            return
+            return None
+
+        utag = ""
+        rest: list[str] = []
+        for token in parts[1:]:
+            if token.startswith("u="):
+                utag = token[2:]
+            elif token.startswith("r="):
+                continue          # the rate cap is not needed for speed
+            else:
+                rest.append(token)
+        if not utag:
+            # Positional form: the tag is the first field after the timestamp.
+            if len(rest) < 3:
+                return None
+            utag, rest = rest[0], rest[1:]
+        if len(rest) < 2:
+            return None
+        try:
+            sent = int(rest[-2])
+            took = max(0.05, float(rest[-1]))
+        except ValueError:
+            return None
         if not utag or utag == "-" or sent <= 0:
+            return None
+        return end_ts, utag, sent, took
+
+    def _ingest(self, line: str) -> None:
+        parsed = self.parse(line)
+        if parsed is None:
             return
+        end_ts, utag, sent, took = parsed
         with self._lock:
             self._events.append((end_ts, end_ts - took, utag, sent))
             if len(self._events) > 10000:
@@ -165,6 +206,19 @@ class SpeedLog:
 
 
 class Sampler:
+    """Interface counters sampled fast enough to read as "live".
+
+    The panel polls every 15s, so the number it renders is only as fresh as
+    the last sample. Sampling on a 5s cycle meant a poll could show a rate
+    measured up to 5s ago, averaged over the 5s before *that*: a transfer
+    running at 51 MB/s was reported as 0.6, and a finished one kept showing
+    its old peak. Sample every second and report a short trailing window, so
+    the value tracks the wire closely while still ignoring single-tick noise.
+    """
+
+    INTERVAL = 1.0   # seconds between counter reads
+    WINDOW = 3.0     # seconds of counter history averaged into the reading
+
     def __init__(self, iface: str, ports: set[int], speedlog: "SpeedLog") -> None:
         self.iface = iface
         self.ports = ports
@@ -175,18 +229,40 @@ class Sampler:
         threading.Thread(target=self._loop, daemon=True).start()
 
     def _loop(self) -> None:
-        prev = tx_bytes(self.iface)
-        prev_ts = time.monotonic()
+        # (monotonic_ts, tx_bytes) samples covering the trailing window.
+        history: list[tuple[float, int]] = [(time.monotonic(), tx_bytes(self.iface))]
+        counter = 0
+        active = established_count(self.ports)
         while True:
-            time.sleep(5)
-            now = tx_bytes(self.iface)
+            time.sleep(self.INTERVAL)
             now_ts = time.monotonic()
-            mbps = max(0.0, (now - prev) * 8 / (now_ts - prev_ts) / 1e6)
-            active = established_count(self.ports)
+            history.append((now_ts, tx_bytes(self.iface)))
+            cutoff = now_ts - self.WINDOW
+            # Keep one sample older than the cutoff so the window stays full.
+            while len(history) > 2 and history[1][0] < cutoff:
+                history.pop(0)
+
+            first_ts, first_tx = history[0]
+            span = now_ts - first_ts
+            delta = history[-1][1] - first_tx
+            # Counter wrap or interface reset: restart rather than report a
+            # negative or absurd spike.
+            if delta < 0 or span <= 0:
+                history = [(now_ts, history[-1][1])]
+                mbps = 0.0
+            else:
+                mbps = delta * 8 / span / 1e6
+
+            # Connection counting walks /proc/net/tcp, which is far more
+            # expensive than reading one counter line; it does not need to run
+            # at the full sample rate.
+            counter += 1
+            if counter % 5 == 0:
+                active = established_count(self.ports)
+
             with self._lock:
-                self.egress_mbps = round(mbps, 1)
+                self.egress_mbps = round(max(0.0, mbps), 1)
                 self.active = active
-            prev, prev_ts = now, now_ts
 
     def snapshot(self) -> dict:
         with self._lock:
