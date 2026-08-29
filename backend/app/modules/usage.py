@@ -1,0 +1,322 @@
+"""Usage sampling — turn live Emby sessions into billable traffic.
+
+How traffic is measured, and why this way
+-----------------------------------------
+Emby does not report bytes served per user, so consumption has to be inferred.
+Three approaches were possible:
+
+1. **Position delta x bitrate.**  Wrong: seeking forward advances position
+   without transferring the skipped bytes, so a user who skips an intro gets
+   billed for it.
+2. **Node access logs.**  Most accurate, but the signed URLs handed to clients
+   deliberately carry no user identity, and adding one would leak who is
+   watching what into every node's log file.
+3. **Wall-clock playing time x bitrate.**  What this uses.  While a session is
+   actually playing, bytes leave the server at roughly the media bitrate, and
+   pausing stops the transfer once the client buffer fills.
+
+So: sample every N seconds, and for each session that is playing, bill
+`bitrate/8 x seconds_since_last_sample`.
+
+The accuracy caveats are deliberate and bounded:
+
+* A paused session still fills its buffer for a few seconds; undercounting
+  there is preferred over charging a user for time they did not watch.
+* Client-side buffering means bytes can be pulled ahead of playback; over a
+  whole session this averages out.
+* A restart makes the gap since the last sample unbounded, so deltas are
+  clamped: a panel outage must never produce a surprise bill.
+
+Everything here is idempotent per sample tick and safe to run concurrently with
+readers, because writes go through the shared SQLite connection lock.
+"""
+from __future__ import annotations
+
+import time
+from datetime import UTC, datetime
+from typing import Any
+
+from app.core.db import Database
+from app.modules.members import MemberService
+
+# Longest gap that may be billed in one sample. Anything larger means the
+# sampler was not running (deploy, crash, host reboot), and charging for that
+# window would invent traffic the user never used.
+MAX_BILLABLE_GAP_SECONDS = 120
+
+# A session must be seen playing at least this long before it counts as a play
+# event, so a mis-tap that starts and stops does not pollute "top titles".
+MIN_PLAY_SECONDS = 20
+
+TICKS_PER_SECOND = 10_000_000
+
+
+def day_key(ts: float | None = None) -> str:
+    return datetime.fromtimestamp(ts or time.time(), UTC).strftime("%Y-%m-%d")
+
+
+def session_bitrate(session: dict[str, Any]) -> int:
+    """Bits per second for this session.
+
+    Transcoding bitrate wins when present: that is what actually leaves the
+    server, and it is usually lower than the source. Falling back to the source
+    bitrate keeps direct play accurate.
+    """
+    transcoding = session.get("TranscodingInfo") or {}
+    item = session.get("NowPlayingItem") or {}
+    for value in (transcoding.get("Bitrate"), item.get("Bitrate")):
+        try:
+            rate = int(value or 0)
+        except (TypeError, ValueError):
+            continue
+        if rate > 0:
+            return rate
+    # Nothing reported: assume a conservative 4 Mbps rather than zero, so an
+    # unreported stream is not silently free.
+    return 4_000_000
+
+
+def is_playing(session: dict[str, Any]) -> bool:
+    if not session.get("NowPlayingItem"):
+        return False
+    return not bool((session.get("PlayState") or {}).get("IsPaused"))
+
+
+class UsageSampler:
+    """Stateful sampler. One instance, ticked on a timer."""
+
+    def __init__(self, db: Database, members: MemberService, emby: Any,
+                 enforcement: Any = None) -> None:
+        self._db = db
+        self._members = members
+        self._emby = emby
+        self._enforcement = enforcement
+        # session id -> tracking state, held in memory only: losing it on
+        # restart costs at most one sample interval of accuracy.
+        self._live: dict[str, dict[str, Any]] = {}
+        self._last_tick = 0.0
+        self._last_error: str | None = None
+        self._ticks = 0
+        # Device-cap refusals collected during a tick, kicked after billing so
+        # one over-limit client cannot abort accounting for everyone else.
+        self._pending_kicks: list[tuple[str, str]] = []
+
+    # -- main loop -----------------------------------------------------------
+    async def tick(self, node_of: Any = None) -> dict[str, Any]:
+        now = time.time()
+        try:
+            sessions = await self._emby.active_sessions_raw()
+        except Exception as exc:  # noqa: BLE001 - a flaky Emby must not kill the loop
+            self._last_error = str(exc)[:200]
+            return {"ok": False, "error": self._last_error}
+
+        self._ticks += 1
+        self._last_error = None
+        seen: set[str] = set()
+        billed_bytes = 0
+        billed_users: dict[str, int] = {}
+        self._pending_kicks = []
+
+        for session in sessions:
+            sid = str(session.get("Id") or "")
+            if not sid:
+                continue
+            user_id = str(session.get("UserId") or "")
+            if not user_id:
+                continue
+            seen.add(sid)
+
+            self._track_device(session, user_id, now)
+
+            state = self._live.get(sid)
+            playing = is_playing(session)
+            item = session.get("NowPlayingItem") or {}
+
+            if state is None:
+                # New session: start the clock but bill nothing yet. Billing a
+                # full interval on first sight would charge for playback that
+                # started an instant ago.
+                self._live[sid] = {
+                    "user_id": user_id,
+                    "username": session.get("UserName") or "",
+                    "item_id": str(item.get("Id") or ""),
+                    "item_name": item.get("Name") or "",
+                    "item_type": item.get("Type") or "",
+                    "series_name": item.get("SeriesName") or "",
+                    "device_id": session.get("DeviceId") or "",
+                    "client": session.get("Client") or "",
+                    "play_method": (session.get("PlayState") or {}).get("PlayMethod") or "",
+                    "remote_ip": session.get("RemoteEndPoint") or "",
+                    "started_at": int(now),
+                    "last_ts": now,
+                    "seconds": 0.0,
+                    "bytes": 0,
+                    "transcoded": bool(session.get("TranscodingInfo")),
+                }
+                continue
+
+            # A session that switched title is two plays, not one.
+            current_item = str(item.get("Id") or "")
+            if current_item and current_item != state["item_id"]:
+                self._finish(sid, state, now)
+                self._live[sid] = {
+                    **state,
+                    "item_id": current_item,
+                    "item_name": item.get("Name") or "",
+                    "item_type": item.get("Type") or "",
+                    "series_name": item.get("SeriesName") or "",
+                    "started_at": int(now),
+                    "last_ts": now,
+                    "seconds": 0.0,
+                    "bytes": 0,
+                }
+                continue
+
+            delta = now - float(state["last_ts"])
+            state["last_ts"] = now
+            if not playing:
+                continue
+            if delta <= 0:
+                continue
+            # Clamp: a long gap means the sampler was down, not that the user
+            # watched continuously through it.
+            delta = min(delta, MAX_BILLABLE_GAP_SECONDS)
+
+            rate = session_bitrate(session)
+            chunk = int(rate / 8 * delta)
+            state["seconds"] = float(state["seconds"]) + delta
+            state["bytes"] = int(state["bytes"]) + chunk
+            if session.get("TranscodingInfo"):
+                state["transcoded"] = True
+            if node_of:
+                state["node"] = node_of(state.get("item_id")) or state.get("node", "")
+
+            billed_bytes += chunk
+            billed_users[user_id] = billed_users.get(user_id, 0) + chunk
+
+        # Sessions that vanished have ended.
+        for sid in [s for s in self._live if s not in seen]:
+            self._finish(sid, self._live.pop(sid), now)
+
+        if billed_users:
+            self._commit(billed_users, now)
+
+        self._last_tick = now
+        result = {
+            "ok": True,
+            "sessions": len(seen),
+            "playing": sum(1 for s in self._live.values() if s.get("seconds", 0) >= 0),
+            "billed_bytes": billed_bytes,
+            "users": len(billed_users),
+        }
+        # Enforcement runs after accounting so a member who just crossed their
+        # quota is stopped in this tick rather than the next one.
+        if billed_users and self._enforcement:
+            result["enforced"] = await self._enforce_exhausted(list(billed_users))
+        if self._pending_kicks and self._enforcement:
+            result["device_kicks"] = await self._kick_refused_devices()
+        return result
+
+    # -- persistence ---------------------------------------------------------
+    def _commit(self, per_user: dict[str, int], now: float) -> None:
+        day = day_key(now)
+        with self._db.write() as conn:
+            for user_id, chunk in per_user.items():
+                conn.execute(
+                    "INSERT INTO usage_daily (day,emby_user_id,bytes,seconds,plays,"
+                    "transcodes) VALUES (?,?,?,0,0,0) "
+                    "ON CONFLICT(day,emby_user_id) DO UPDATE SET bytes=bytes+?",
+                    (day, user_id, chunk, chunk))
+                # Only members are metered; non-members are still recorded in
+                # usage_daily for statistics, but never billed.
+                conn.execute(
+                    "UPDATE members SET traffic_used_bytes=traffic_used_bytes+?,"
+                    "last_seen_at=? WHERE emby_user_id=?",
+                    (chunk, int(now), user_id))
+
+    def _finish(self, sid: str, state: dict[str, Any], now: float) -> None:
+        seconds = int(state.get("seconds") or 0)
+        if seconds < MIN_PLAY_SECONDS:
+            return
+        with self._db.write() as conn:
+            conn.execute(
+                "INSERT INTO play_events (emby_user_id,username,item_id,item_name,"
+                "item_type,series_name,device_id,client,play_method,node,remote_ip,"
+                "bytes,seconds,started_at,ended_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (state["user_id"], state.get("username", ""), state.get("item_id", ""),
+                 state.get("item_name", ""), state.get("item_type", ""),
+                 state.get("series_name", ""), state.get("device_id", ""),
+                 state.get("client", ""), state.get("play_method", ""),
+                 state.get("node", ""), state.get("remote_ip", ""),
+                 int(state.get("bytes") or 0), seconds,
+                 int(state.get("started_at") or now), int(now)))
+            conn.execute(
+                "INSERT INTO usage_daily (day,emby_user_id,bytes,seconds,plays,transcodes)"
+                " VALUES (?,?,0,?,1,?) ON CONFLICT(day,emby_user_id) DO UPDATE SET "
+                "seconds=seconds+?, plays=plays+1, transcodes=transcodes+?",
+                (day_key(state.get("started_at") or now), state["user_id"],
+                 seconds, 1 if state.get("transcoded") else 0,
+                 seconds, 1 if state.get("transcoded") else 0))
+
+    def _track_device(self, session: dict[str, Any], user_id: str, now: float) -> None:
+        device_id = str(session.get("DeviceId") or "")
+        if not device_id:
+            return
+        accepted = self._members.register_device(
+            user_id, device_id,
+            device_name=session.get("DeviceName") or "",
+            client=session.get("Client") or "",
+            app_version=session.get("ApplicationVersion") or "",
+            last_ip=session.get("RemoteEndPoint") or "",
+            now=int(now),
+        )
+        if not accepted and self._enforcement:
+            sid = str(session.get("Id") or "")
+            if sid:
+                self._pending_kicks.append((sid, user_id))
+
+    # -- enforcement hooks ---------------------------------------------------
+    async def _kick_refused_devices(self) -> int:
+        kicked = 0
+        for sid, user_id in self._pending_kicks:
+            try:
+                stopped = await self._emby.stop_session(sid, "设备数已达上限")
+            except Exception:  # noqa: BLE001 - a flaky node must not abort the rest
+                stopped = False
+            if stopped:
+                kicked += 1
+            self._members.audit(
+                "system", "device.kick", user_id, f"session={sid}")
+        self._pending_kicks = []
+        return kicked
+
+    async def _enforce_exhausted(self, user_ids: list[str]) -> int:
+        """Disable and disconnect members who just ran out.
+
+        Checked here rather than on a slow timer because the gap between
+        "quota reached" and "playback stops" is exactly the amount of traffic
+        given away for free.
+        """
+        acted = 0
+        for user_id in user_ids:
+            member = self._members.get(user_id)
+            if not member or member["state"] != "exhausted":
+                continue
+            # Already enforced recently; avoid hammering Emby every tick.
+            applied_at = member.get("applied_at")
+            if applied_at and int(time.time()) - int(applied_at) < 300:
+                continue
+            await self._enforcement.enforce_now(user_id, "quota exhausted")
+            await self._enforcement.terminate_sessions(user_id, "流量配额已用尽")
+            acted += 1
+        return acted
+
+    # -- introspection -------------------------------------------------------
+    def status(self) -> dict[str, Any]:
+        return {
+            "ticks": self._ticks,
+            "last_tick": self._last_tick,
+            "tracked_sessions": len(self._live),
+            "last_error": self._last_error,
+        }

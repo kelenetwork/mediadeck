@@ -70,6 +70,11 @@ class StreamNode(BaseModel):
     # `rclone config`, which is exactly the manual step this replaces.
     rclone_conf: str = ""
     enroll_token: str = ""         # one-shot token for unattended install
+    # Global storage mounts this node should carry. Empty means "not bound
+    # to the global list yet"; existing nodes may still have rclone_conf.
+    mount_ids: list[str] = []
+    first_seen_at: int | None = None
+    enrolled_host: str = ""
 
 
 class Settings(BaseSettings):

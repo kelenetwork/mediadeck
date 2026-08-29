@@ -37,7 +37,10 @@ def _host_of(url: str) -> str:
 def enroll_command(panel_url: str, token: str) -> str:
     """The single line an operator pastes on a fresh server."""
     base = panel_url.rstrip("/")
-    return (f"curl -fsSL {base}/api/enroll/{token}/script | sudo bash")
+    # Token is also passed as env so the piped script can report home even
+    # though bash sees stdin as $0, not the original URL.
+    return (f"curl -fsSL {base}/api/enroll/{token}/script | "
+            f"sudo env MEDIADECK_ENROLL_TOKEN={token} bash")
 
 
 def nginx_site(node: Any) -> str:
@@ -255,6 +258,34 @@ else
   exit 1
 fi""")
 
+    token_recover = (
+        "# The one-liner that fetched this script is `.../api/enroll/<token>/script`.\n"
+        "# Recover the token from env (preferred) or from $0 if curl left the URL there.\n"
+        'ENROLL_TOKEN="${MEDIADECK_ENROLL_TOKEN:-}"\n'
+        'if [ -z "$ENROLL_TOKEN" ]; then\n'
+        '  case "${0:-}" in\n'
+        '    *"/api/enroll/"*) ENROLL_TOKEN=$(printf \'%s\' "$0" | '
+        "sed -n 's#.*/api/enroll/\\([^/]*\\)/script.*#\\1#p') ;;\n"
+        "  esac\n"
+        "fi\n"
+    )
+    report_home = (
+        "# Tell the panel which addresses this machine actually has, so the operator\n"
+        "# never has to type them. Failure here is non-fatal: the node still works.\n"
+        'if [ -n "${ENROLL_TOKEN:-}" ]; then\n'
+        '  echo "==> 上报本机地址"\n'
+        f'  PUBLIC_HOST="$(hostname -f 2>/dev/null || hostname || echo {host})"\n'
+        "  REPORT_JSON=$(printf "
+        "'{\"base_url\":\"https://%s\",\"probe_url\":\"http://127.0.0.1:%s/load\",\"host\":\"%s\"}' "
+        f'"$PUBLIC_HOST" {LOADPROBE_PORT} "$PUBLIC_HOST")\n'
+        f"  curl -fsS -X POST {panel}/api/enroll/"
+        "${ENROLL_TOKEN}/report \\\n"
+        "    -H 'Content-Type: application/json' \\\n"
+        '    -d "$REPORT_JSON" \\\n'
+        '    >/dev/null && echo "    [OK] 已回连面板" || echo "    [!!] 回连面板失败（节点本身已可用）"\n'
+        "fi\n"
+    )
+
     return f"""#!/bin/bash
 # ===========================================================
 # mediadeck 节点安装 — "{node.name}"
@@ -271,7 +302,7 @@ fi""")
 #   2. {node.cache_dir} 所在磁盘剩余空间 > {node.cache_size}
 # ===========================================================
 set -euo pipefail
-
+{token_recover}
 echo "==> 1/6 安装依赖"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
@@ -317,7 +348,9 @@ echo
 echo "==========================================================="
 echo "节点 {node.name} 安装完成。回面板「节点管理」，状态应变为「可用」。"
 echo "==========================================================="
-"""
+
+{report_home}"""
+
 
 
 def emby_frontend_snippet(panel_url: str, emby_url: str, server: str = "caddy") -> str:

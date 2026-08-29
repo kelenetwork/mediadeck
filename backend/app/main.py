@@ -4,9 +4,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import secrets
+import time
 from pathlib import Path as FilePath
 from typing import Any
+from urllib.parse import urlencode
 
+import httpx
 from fastapi import Body, Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.responses import (
     FileResponse,
@@ -22,12 +25,18 @@ from app.adapters.live import LiveEmby, LiveProbe, probe_emby
 from app.adapters.mock import MockEmby, MockProbe
 from app.core.cache import TTLCache
 from app.core.config import settings
-from app.core.errors import ConfigError, NotConfigured, UpstreamError
+from app.core.db import Database
+from app.core.errors import ConfigError, ConflictError, NotConfigured, UpstreamError
 from app.core.store import SettingsStore
+from app.modules.enforcement import EnforcementService
 from app.modules.events import EventStream, safe_stream
+from app.modules.imagecache import ALLOWED_IMAGE_TYPES, ImageCache
 from app.modules.imports import ImportManager, JobKind, MockExecutor
+from app.modules.invites import InviteService, random_password
+from app.modules.members import MemberService
 from app.modules.mounts import MockMounts, MountsReader
 from app.modules.pipeline import MockPipeline, PipelineReader
+from app.modules.plans import PlanService
 from app.modules.playback import PlaybackRouter, caller_token
 from app.modules.provisioning import (
     emby_frontend_snippet,
@@ -36,9 +45,11 @@ from app.modules.provisioning import (
 )
 from app.modules.scheduler import Scheduler
 from app.modules.settings import SettingsService
+from app.modules.stats import StatsService
 from app.modules.storage import MockStorage, StorageManager
 from app.modules.tasks import MockTasks, TasksReader
 from app.modules.updater import MockUpdater, Updater
+from app.modules.usage import UsageSampler
 
 app = FastAPI(title="mediadeck", version="0.1.0")
 security = HTTPBasic()
@@ -66,6 +77,12 @@ def _storage_call(fn: Any, *args: Any, **kwargs: Any) -> Any:
 async def _config_error_handler(_: Any, exc: ConfigError) -> JSONResponse:
     """Invalid operator input: answer with the message the UI should show."""
     return JSONResponse(status_code=422, content={"detail": str(exc)})
+
+
+@app.exception_handler(ConflictError)
+async def _conflict_error_handler(_: Any, exc: ConflictError) -> JSONResponse:
+    """Well-formed but currently impossible: the operator must resolve state first."""
+    return JSONResponse(status_code=409, content={"detail": str(exc)})
 
 
 @app.exception_handler(NotConfigured)
@@ -136,6 +153,82 @@ async def _startup() -> None:
         app.state.settings_service.emby_config,
     )
 
+    # ---- membership, billing, statistics --------------------------------
+    # Operational data lives in SQLite rather than the settings JSON: traffic
+    # accounting appends continuously and has to answer aggregate questions,
+    # which a rewritten-in-full document cannot do safely.
+    app.state.db = Database(cfg.data_dir / "mediadeck.db")
+    app.state.plans = PlanService(app.state.db)
+    app.state.plans.seed_defaults()
+    app.state.members = MemberService(app.state.db, app.state.plans)
+    app.state.enforcement = EnforcementService(
+        app.state.db, app.state.members, app.state.emby)
+    app.state.invites = InviteService(
+        app.state.db, app.state.plans, app.state.members, app.state.emby)
+    app.state.stats = StatsService(app.state.db)
+    app.state.usage = UsageSampler(
+        app.state.db, app.state.members, app.state.emby, app.state.enforcement)
+
+    image_cfg = app.state.settings_service.image_cache_config()
+    app.state.images = ImageCache(
+        cfg.data_dir / "imagecache",
+        max_bytes=image_cfg["max_bytes"],
+        max_age_seconds=image_cfg["max_age_days"] * 86400,
+    )
+
+    def _node_for_item(item_id: str) -> str:
+        """Which node most recently served this item, for traffic attribution.
+
+        Read from the dispatch log rather than tracked separately: the log is
+        already the authoritative record of what the scheduler decided, so a
+        second source could only ever disagree with it.
+        """
+        if not item_id:
+            return ""
+        for entry in reversed(app.state.playback.recent(60)):
+            if entry.get("item_id") == item_id and entry.get("node"):
+                return str(entry["node"])
+        return ""
+
+    async def usage_loop() -> None:
+        """Sample playback, roll billing periods, and keep caches bounded.
+
+        One loop rather than several timers: these steps must not interleave
+        (rolling a period while sampling could reset a quota mid-write), and
+        serialising them keeps the ordering obvious.
+
+        Every step is individually guarded: a failure in housekeeping must not
+        stop metering, because unmetered playback is the one outcome that
+        costs money.
+        """
+        housekeeping_due = 0.0
+        prune_due = 0.0
+        while True:
+            membership = app.state.settings_service.membership_config()
+            await asyncio.sleep(max(5, int(membership["sample_interval_seconds"])))
+            with contextlib.suppress(Exception):
+                await app.state.usage.tick(node_of=_node_for_item)
+
+            now = time.time()
+            if now >= housekeeping_due:
+                housekeeping_due = now + 600
+                with contextlib.suppress(Exception):
+                    app.state.members.roll_periods()
+                # Enforcement only writes to Emby once the operator has
+                # switched it on; until then the panel observes and reports.
+                if membership["enforcement_enabled"]:
+                    with contextlib.suppress(Exception):
+                        await app.state.enforcement.reconcile(apply=True)
+                with contextlib.suppress(Exception):
+                    app.state.images.sweep()
+
+            if now >= prune_due:
+                prune_due = now + 86400
+                with contextlib.suppress(Exception):
+                    app.state.stats.prune(int(membership["retention_days"]))
+
+    app.state.usage_task = asyncio.create_task(usage_loop())
+
     async def probe_loop() -> None:
         while True:
             with contextlib.suppress(Exception):
@@ -178,6 +271,12 @@ async def whoami() -> dict[str, str]:
 @app.get("/", include_in_schema=False)
 async def root(_: str = Depends(_auth)) -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
+
+
+@app.get("/invite/{code}", include_in_schema=False)
+async def invite_page(code: str) -> FileResponse:
+    """Public redeem page: no admin session, the code is the credential."""
+    return FileResponse(STATIC_DIR / "invite.html")
 
 
 @app.get("/healthz")
@@ -234,6 +333,8 @@ async def settings_overview() -> dict[str, Any]:
         "dispatch": service.dispatch_config(),
         "playback": service.playback_config(),
         "integration": service.integration_config(),
+        "membership": service.membership_config(),
+        "image_cache": service.image_cache_config(),
         "nodes": service.nodes_public(),
     }
 
@@ -559,6 +660,16 @@ async def node_rotate_secret(name: str) -> dict[str, Any]:
         raise HTTPException(404, "unknown node") from None
 
 
+@app.post("/api/nodes/{name}/rotate-enroll", dependencies=[Depends(_auth)])
+async def node_rotate_enroll(name: str) -> dict[str, Any]:
+    """Invalidate the current install command; the old one-liner stops working."""
+    try:
+        app.state.settings_service.rotate_enroll_token(name)
+    except KeyError:
+        raise HTTPException(404, "unknown node") from None
+    return await node_enroll_command(name)
+
+
 @app.get("/api/nodes/{name}/enroll", dependencies=[Depends(_auth)])
 async def node_enroll_command(name: str) -> dict[str, Any]:
     """The single command that turns a bare server into this node.
@@ -578,10 +689,15 @@ async def node_enroll_command(name: str) -> dict[str, Any]:
             409, "请先在「系统设置 → 接入方式」填写面板对外地址，节点需要用它回连"
         )
     token = service.node_enroll_token(name)
+    enrolled = bool(node.first_seen_at)
     return {
         "node": name,
         "command": enroll_command(panel, token),
         "ready": bool(node.pools),
+        "enrolled": enrolled,
+        "pending": not enrolled,
+        "first_seen_at": node.first_seen_at,
+        "enrolled_host": node.enrolled_host,
         "warnings": (
             [] if node.pools else ["该节点尚未配置媒体根，安装后无法提供任何文件"]
         ),
@@ -601,6 +717,21 @@ async def node_install_script(name: str) -> dict[str, Any]:
         "signing_enabled": bool(node.sign_secret),
         "script": install_script(node, panel),
     }
+
+
+@app.post("/api/enroll/{token}/report", include_in_schema=False)
+async def enroll_report(token: str, payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:  # noqa: B008
+    """Public by design: the install token is the credential.
+
+    The node reports the addresses it actually has, so the operator never has
+    to type them. A wrong token is indistinguishable from an expired one.
+    """
+    try:
+        return app.state.settings_service.apply_enroll_report(token, payload or {})
+    except KeyError:
+        raise HTTPException(404, "invalid or expired enrollment token") from None
+    except ConfigError as exc:
+        raise HTTPException(422, str(exc)) from None
 
 
 @app.get("/api/enroll/{token}/script", include_in_schema=False)
@@ -730,3 +861,462 @@ async def emby_apply_policy(user_id: str, policy: dict[str, Any] = Body(...)) ->
     if not await app.state.emby.apply_policy(user_id, patch):
         raise HTTPException(404, "unknown user")
     return {"ok": True}
+
+
+# ---- plans -----------------------------------------------------------------
+@app.get("/api/plans", dependencies=[Depends(_auth)])
+async def plans_list() -> list[dict[str, Any]]:
+    return app.state.plans.list()
+
+
+@app.post("/api/plans", dependencies=[Depends(_auth)])
+async def plans_create(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:  # noqa: B008
+    return app.state.plans.create(payload)
+
+
+@app.put("/api/plans/{plan_id}", dependencies=[Depends(_auth)])
+async def plans_update(plan_id: str, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:  # noqa: B008
+    try:
+        return app.state.plans.update(plan_id, payload)
+    except KeyError:
+        raise HTTPException(404, "unknown plan") from None
+
+
+@app.delete("/api/plans/{plan_id}", dependencies=[Depends(_auth)])
+async def plans_delete(plan_id: str) -> dict[str, bool]:
+    try:
+        app.state.plans.delete(plan_id)
+    except KeyError:
+        raise HTTPException(404, "unknown plan") from None
+    return {"deleted": True}
+
+
+# ---- members ---------------------------------------------------------------
+@app.get("/api/members", dependencies=[Depends(_auth)])
+async def members_list(status: str | None = None, plan_id: str | None = None,
+                       search: str | None = None, limit: int = 500) -> dict[str, Any]:
+    """Members plus the Emby accounts that are not enrolled yet.
+
+    Showing both in one payload is deliberate: the operator needs to see who is
+    *not* being metered, which is exactly the population that costs money
+    silently.
+    """
+    limit = max(1, min(int(limit or 500), 5000))
+    members = app.state.members.list(status=status, plan_id=plan_id,
+                                     search=search, limit=limit)
+    truncated = len(members) >= limit
+    known = {m["emby_user_id"] for m in members}
+    unmanaged: list[dict[str, Any]] = []
+    try:
+        for u in await app.state.emby.list_users():
+            if u["Id"] in known:
+                continue
+            policy = u.get("Policy") or {}
+            unmanaged.append({
+                "emby_user_id": u["Id"],
+                "username": u.get("Name"),
+                "is_admin": bool(policy.get("IsAdministrator")),
+                "disabled": bool(policy.get("IsDisabled")),
+            })
+    except Exception as exc:  # noqa: BLE001 - the member list must still render
+        return {"members": members, "unmanaged": [],
+                "unmanaged_error": str(exc)[:200], "truncated": truncated,
+                "limit": limit}
+    if search:
+        needle = search.lower()
+        unmanaged = [u for u in unmanaged if needle in (u["username"] or "").lower()]
+    return {"members": members, "unmanaged": unmanaged[:500],
+            "unmanaged_total": len(unmanaged), "truncated": truncated,
+            "limit": limit}
+
+
+@app.get("/api/members/{user_id}", dependencies=[Depends(_auth)])
+async def members_get(user_id: str, days: int = 30) -> dict[str, Any]:
+    member = app.state.members.get(user_id)
+    if not member:
+        raise HTTPException(404, "unknown member")
+    detail = app.state.stats.member_detail(user_id, days)
+    sessions = []
+    with contextlib.suppress(Exception):
+        sessions = await app.state.emby.sessions_for_user(user_id)
+    return {
+        "member": member,
+        **detail,
+        "active_sessions": [{
+            "id": s.get("Id"),
+            "client": s.get("Client"),
+            "device": s.get("DeviceName"),
+            "item": (s.get("NowPlayingItem") or {}).get("Name"),
+            "paused": bool((s.get("PlayState") or {}).get("IsPaused")),
+        } for s in sessions],
+        "audit": app.state.members.audit_log(50, subject=user_id),
+    }
+
+
+@app.put("/api/members/{user_id}", dependencies=[Depends(_auth)])
+async def members_upsert(user_id: str, payload: dict[str, Any] = Body(...),  # noqa: B008
+                         user: str = Depends(_auth)) -> dict[str, Any]:
+    username = str(payload.get("username") or "")
+    if not username:
+        with contextlib.suppress(Exception):
+            for u in await app.state.emby.list_users():
+                if u["Id"] == user_id:
+                    username = u.get("Name") or ""
+                    break
+    member = app.state.members.upsert(user_id, username, payload, actor=user)
+    # Apply immediately: an operator who assigns a plan expects the limit to be
+    # live, not to appear at the next housekeeping pass ten minutes later.
+    if app.state.settings_service.membership_config()["enforcement_enabled"]:
+        with contextlib.suppress(Exception):
+            await app.state.enforcement.enforce_now(user_id, "member updated")
+    return member
+
+
+@app.delete("/api/members/{user_id}", dependencies=[Depends(_auth)])
+async def members_delete(user_id: str, delete_emby: bool = False,
+                         user: str = Depends(_auth)) -> dict[str, bool]:
+    """Un-enrol by default. Deleting the Emby account is an explicit extra."""
+    try:
+        app.state.members.delete(user_id, actor=user)
+    except KeyError:
+        raise HTTPException(404, "unknown member") from None
+    emby_deleted = False
+    if delete_emby:
+        with contextlib.suppress(Exception):
+            emby_deleted = bool(await app.state.emby.delete_user(user_id))
+        app.state.members.audit(
+            user, "member.delete_emby", user_id,
+            "Emby account deleted" if emby_deleted else "Emby delete failed",
+            ok=emby_deleted)
+    return {"deleted": True, "emby_deleted": emby_deleted}
+
+
+@app.post("/api/members/{user_id}/renew", dependencies=[Depends(_auth)])
+async def members_renew(user_id: str, payload: dict[str, Any] = Body(default={}),  # noqa: B008
+                        user: str = Depends(_auth)) -> dict[str, Any]:
+    try:
+        member = app.state.members.renew(user_id, payload.get("days"), actor=user)
+    except KeyError:
+        raise HTTPException(404, "unknown member") from None
+    if app.state.settings_service.membership_config()["enforcement_enabled"]:
+        with contextlib.suppress(Exception):
+            await app.state.enforcement.enforce_now(user_id, "renewed")
+    return member
+
+
+@app.post("/api/members/{user_id}/reset-traffic", dependencies=[Depends(_auth)])
+async def members_reset_traffic(user_id: str, user: str = Depends(_auth)) -> dict[str, Any]:
+    try:
+        member = app.state.members.reset_traffic(user_id, actor=user)
+    except KeyError:
+        raise HTTPException(404, "unknown member") from None
+    if app.state.settings_service.membership_config()["enforcement_enabled"]:
+        with contextlib.suppress(Exception):
+            await app.state.enforcement.enforce_now(user_id, "traffic reset")
+    return member
+
+
+@app.post("/api/members/{user_id}/status", dependencies=[Depends(_auth)])
+async def members_status(user_id: str, payload: dict[str, Any] = Body(...),  # noqa: B008
+                         user: str = Depends(_auth)) -> dict[str, Any]:
+    status = str(payload.get("status") or "")
+    try:
+        member = app.state.members.set_status(user_id, status, actor=user)
+    except KeyError:
+        raise HTTPException(404, "unknown member") from None
+    if app.state.settings_service.membership_config()["enforcement_enabled"]:
+        with contextlib.suppress(Exception):
+            await app.state.enforcement.enforce_now(user_id, f"status={status}")
+        if status in ("suspended", "pending"):
+            with contextlib.suppress(Exception):
+                await app.state.enforcement.terminate_sessions(user_id, "账号已停用")
+    return member
+
+
+@app.post("/api/members/{user_id}/password", dependencies=[Depends(_auth)])
+async def members_password(user_id: str, payload: dict[str, Any] = Body(default={}),  # noqa: B008
+                           user: str = Depends(_auth)) -> dict[str, Any]:
+    """Set or randomise a member's Emby password.
+
+    Returned in cleartext exactly once, because the operator has to relay it;
+    it is never stored by the panel.
+    """
+    password = str(payload.get("password") or "") or random_password()
+    if len(password) < 6:
+        raise HTTPException(422, "密码至少 6 位")
+    if not await app.state.emby.set_user_password(user_id, password):
+        raise HTTPException(404, "unknown user")
+    app.state.members.audit(user, "member.password", user_id, "password changed")
+    return {"ok": True, "password": password}
+
+
+@app.post("/api/members/{user_id}/kick", dependencies=[Depends(_auth)])
+async def members_kick(user_id: str, payload: dict[str, Any] = Body(default={}),  # noqa: B008
+                       user: str = Depends(_auth)) -> dict[str, Any]:
+    reason = str(payload.get("reason") or "管理员结束了此次播放")
+    stopped = await app.state.enforcement.terminate_sessions(user_id, reason)
+    app.state.members.audit(user, "member.kick", user_id, f"{stopped} session(s)")
+    return {"stopped": stopped}
+
+
+@app.get("/api/members/{user_id}/devices", dependencies=[Depends(_auth)])
+async def members_devices(user_id: str) -> list[dict[str, Any]]:
+    return app.state.db.query(
+        "SELECT * FROM devices WHERE emby_user_id=? ORDER BY last_seen_at DESC",
+        (user_id,))
+
+
+@app.post("/api/members/{user_id}/devices/{device_id}/block", dependencies=[Depends(_auth)])
+async def members_block_device(user_id: str, device_id: str,
+                               payload: dict[str, Any] = Body(default={}),  # noqa: B008
+                               user: str = Depends(_auth)) -> dict[str, Any]:
+    blocked = 1 if payload.get("blocked", True) else 0
+    changed = app.state.db.execute(
+        "UPDATE devices SET blocked=? WHERE emby_user_id=? AND device_id=?",
+        (blocked, user_id, device_id))
+    if not changed:
+        raise HTTPException(404, "unknown device")
+    app.state.members.audit(user, "device.block" if blocked else "device.unblock",
+                            user_id, device_id)
+    return {"ok": True, "blocked": bool(blocked)}
+
+
+@app.delete("/api/members/{user_id}/devices/{device_id}", dependencies=[Depends(_auth)])
+async def members_forget_device(user_id: str, device_id: str,
+                                user: str = Depends(_auth)) -> dict[str, bool]:
+    changed = app.state.db.execute(
+        "DELETE FROM devices WHERE emby_user_id=? AND device_id=?",
+        (user_id, device_id))
+    if not changed:
+        raise HTTPException(404, "unknown device")
+    app.state.members.audit(user, "device.forget", user_id, device_id)
+    return {"deleted": True}
+
+
+# ---- enforcement -----------------------------------------------------------
+@app.get("/api/enforcement/preview", dependencies=[Depends(_auth)])
+async def enforcement_preview(user_id: str | None = None) -> dict[str, Any]:
+    """Dry-run: exactly what would be written to Emby, and to whom."""
+    return await app.state.enforcement.reconcile(apply=False, user_id=user_id)
+
+
+@app.post("/api/enforcement/apply", dependencies=[Depends(_auth)])
+async def enforcement_apply(payload: dict[str, Any] = Body(default={}),  # noqa: B008
+                            user: str = Depends(_auth)) -> dict[str, Any]:
+    result = await app.state.enforcement.reconcile(
+        apply=True, user_id=payload.get("user_id"), force=bool(payload.get("force")))
+    app.state.members.audit(user, "enforce.manual", payload.get("user_id") or "*",
+                            f"applied={result.get('applied')}")
+    return result
+
+
+# ---- invites ---------------------------------------------------------------
+@app.get("/api/invites", dependencies=[Depends(_auth)])
+async def invites_list() -> list[dict[str, Any]]:
+    return app.state.invites.list()
+
+
+@app.post("/api/invites", dependencies=[Depends(_auth)])
+async def invites_create(payload: dict[str, Any] = Body(...),  # noqa: B008
+                         user: str = Depends(_auth)) -> list[dict[str, Any]]:
+    return app.state.invites.create(
+        plan_id=str(payload.get("plan_id") or ""),
+        max_uses=payload.get("max_uses", 1),
+        valid_days=payload.get("valid_days", 7),
+        note=str(payload.get("note") or ""),
+        count=payload.get("count", 1),
+        actor=user,
+    )
+
+
+@app.post("/api/invites/{code}/revoke", dependencies=[Depends(_auth)])
+async def invites_revoke(code: str, user: str = Depends(_auth)) -> dict[str, bool]:
+    try:
+        app.state.invites.revoke(code, actor=user)
+    except KeyError:
+        raise HTTPException(404, "unknown code") from None
+    return {"revoked": True}
+
+
+@app.delete("/api/invites/{code}", dependencies=[Depends(_auth)])
+async def invites_delete(code: str, user: str = Depends(_auth)) -> dict[str, bool]:
+    try:
+        app.state.invites.delete(code, actor=user)
+    except KeyError:
+        raise HTTPException(404, "unknown code") from None
+    return {"deleted": True}
+
+
+@app.get("/api/invite/{code}", include_in_schema=False)
+async def invite_preview(code: str, request: Request) -> dict[str, Any]:
+    """Public: lets an invitee see what they are about to get before signing up."""
+    app.state.invites.check_rate(code, request.client.host if request.client else "")
+    return app.state.invites.preview(code)
+
+
+@app.post("/api/invite/{code}/redeem", include_in_schema=False)
+async def invite_redeem(code: str, request: Request,
+                        payload: dict[str, Any] = Body(...)) -> dict[str, Any]:  # noqa: B008
+    """Public by necessity: the invitee has no panel account yet.
+
+    The code itself is the credential, and it is single-use by default.
+    """
+    app.state.invites.check_rate(code, request.client.host if request.client else "")
+    return await app.state.invites.redeem(
+        code,
+        str(payload.get("username") or ""),
+        str(payload.get("password") or ""),
+        enforcement=app.state.enforcement,
+    )
+
+
+# ---- statistics ------------------------------------------------------------
+@app.get("/api/stats/overview", dependencies=[Depends(_auth)])
+async def stats_overview(days: int = 30) -> dict[str, Any]:
+    return app.state.stats.overview(days)
+
+
+@app.get("/api/stats/daily", dependencies=[Depends(_auth)])
+async def stats_daily(days: int = 30) -> list[dict[str, Any]]:
+    return app.state.stats.daily_series(days)
+
+
+@app.get("/api/stats/top-users", dependencies=[Depends(_auth)])
+async def stats_top_users(days: int = 30, limit: int = 20) -> list[dict[str, Any]]:
+    return app.state.stats.top_users(days, limit)
+
+
+@app.get("/api/stats/top-titles", dependencies=[Depends(_auth)])
+async def stats_top_titles(days: int = 30, limit: int = 20) -> list[dict[str, Any]]:
+    return app.state.stats.top_titles(days, limit)
+
+
+@app.get("/api/stats/clients", dependencies=[Depends(_auth)])
+async def stats_clients(days: int = 30) -> list[dict[str, Any]]:
+    return app.state.stats.client_breakdown(days)
+
+
+@app.get("/api/stats/nodes", dependencies=[Depends(_auth)])
+async def stats_nodes(days: int = 30) -> list[dict[str, Any]]:
+    return app.state.stats.node_breakdown(days)
+
+
+@app.get("/api/stats/play-methods", dependencies=[Depends(_auth)])
+async def stats_play_methods(days: int = 30) -> dict[str, Any]:
+    return app.state.stats.play_method_breakdown(days)
+
+
+@app.get("/api/audit", dependencies=[Depends(_auth)])
+async def audit_log(limit: int = 100, subject: str | None = None,
+                    actor: str | None = None, action: str | None = None
+                    ) -> list[dict[str, Any]]:
+    return app.state.members.audit_log(limit, subject=subject, actor=actor, action=action)
+
+
+@app.get("/api/usage/status", dependencies=[Depends(_auth)])
+async def usage_status() -> dict[str, Any]:
+    return {
+        **app.state.usage.status(),
+        "membership": app.state.settings_service.membership_config(),
+    }
+
+
+# ---- image cache -----------------------------------------------------------
+@app.get("/api/settings/image-cache", dependencies=[Depends(_auth)])
+async def image_cache_get() -> dict[str, Any]:
+    return {**app.state.settings_service.image_cache_config(),
+            "stats": app.state.images.stats()}
+
+
+@app.put("/api/settings/image-cache", dependencies=[Depends(_auth)])
+async def image_cache_save(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:  # noqa: B008
+    saved = app.state.settings_service.save_image_cache(payload)
+    # Rebuild rather than mutate: the budget and age bounds are constructor
+    # arguments, and a stale sweeper would keep enforcing the old numbers.
+    app.state.images = ImageCache(
+        settings().data_dir / "imagecache",
+        max_bytes=saved["max_bytes"],
+        max_age_seconds=saved["max_age_days"] * 86400,
+    )
+    return {**saved, "stats": app.state.images.stats()}
+
+
+@app.post("/api/settings/image-cache/clear", dependencies=[Depends(_auth)])
+async def image_cache_clear(user: str = Depends(_auth)) -> dict[str, Any]:
+    removed = app.state.images.clear()
+    app.state.members.audit(user, "imagecache.clear", "", f"{removed} entries")
+    return {"removed": removed}
+
+
+@app.post("/api/settings/image-cache/sweep", dependencies=[Depends(_auth)])
+async def image_cache_sweep() -> dict[str, Any]:
+    return app.state.images.sweep(force=True)
+
+
+@app.get("/api/settings/membership", dependencies=[Depends(_auth)])
+async def membership_get() -> dict[str, Any]:
+    return app.state.settings_service.membership_config()
+
+
+@app.put("/api/settings/membership", dependencies=[Depends(_auth)])
+async def membership_save(payload: dict[str, Any] = Body(...),  # noqa: B008
+                          user: str = Depends(_auth)) -> dict[str, Any]:
+    saved = app.state.settings_service.save_membership(payload)
+    app.state.members.audit(user, "settings.membership", "",
+                            f"enforcement={saved['enforcement_enabled']}")
+    return saved
+
+
+@app.get("/emby/Items/{item_id}/Images/{image_type}", include_in_schema=False)
+async def cached_image(item_id: str, image_type: str, request: Request) -> Response:
+    """Serve Emby artwork from local disk.
+
+    A library grid fires dozens of poster requests and Emby re-derives each one
+    every time. Point the front door here and repeat views become disk reads,
+    freeing Emby's CPU exactly when the UI needs to feel instant.
+
+    Unknown image types fall through to Emby rather than erroring: this sits on
+    a public path, so it must never be the reason artwork disappears.
+    """
+    origin = app.state.settings_service.emby_config().get("url", "").rstrip("/")
+    query = dict(request.query_params)
+    passthrough = f"{origin}/emby/Items/{item_id}/Images/{image_type}"
+    if query:
+        passthrough = f"{passthrough}?{urlencode(query)}"
+
+    cfg = app.state.settings_service.image_cache_config()
+    if not cfg["enabled"] or image_type not in ALLOWED_IMAGE_TYPES or not origin:
+        return RedirectResponse(passthrough, status_code=302)
+
+    key = app.state.images.key(item_id, image_type, query)
+
+    async def produce() -> tuple[bytes, str, str] | None:
+        emby_cfg = app.state.settings_service.emby_config()
+        headers = {"X-Emby-Token": emby_cfg.get("api_key", "")}
+        async with httpx.AsyncClient(
+                timeout=20, verify=bool(emby_cfg.get("verify_ssl", True))) as client:
+            r = await client.get(passthrough, headers=headers)
+            if r.status_code != 200 or not r.content:
+                return None
+            return (r.content,
+                    r.headers.get("content-type", "image/jpeg"),
+                    r.headers.get("etag", ""))
+
+    result = await app.state.images.fetch(key, produce)
+    if not result:
+        # Cache miss and upstream had nothing: let Emby answer directly so a
+        # transient failure never becomes a permanently broken image.
+        return RedirectResponse(passthrough, status_code=302)
+
+    data, content_type, etag = result
+    # Honour conditional requests: browsers revalidate artwork constantly, and
+    # a 304 avoids re-sending megabytes of posters on every page load.
+    if etag and request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers={"ETag": etag})
+    headers = {
+        "Cache-Control": "public, max-age=604800",
+        "X-Mediadeck-Cache": "hit",
+    }
+    if etag:
+        headers["ETag"] = etag
+    return Response(content=data, media_type=content_type, headers=headers)

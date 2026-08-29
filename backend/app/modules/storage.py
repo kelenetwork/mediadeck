@@ -12,6 +12,8 @@ import shlex
 import subprocess
 from typing import Any
 
+from app.core.errors import ConflictError
+
 _NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _SECRET_MARKERS = ("token", "secret", "password", "key", "pass")
 _NOT_CONFIGURED = "storage management not configured"
@@ -161,6 +163,10 @@ class StorageManager:
         parser = self._load_parser()
         if not parser.has_section(name):
             raise ValueError("unknown remote")
+        used = [m["name"] for m in self.list_mounts() if m.get("remote") == name]
+        if used:
+            raise ConflictError(
+                f"远程账号仍被挂载点 {', '.join(used)} 引用，请先删除这些挂载点")
         parser.remove_section(name)
         self._write_parser(parser)
         return {"ok": True}
@@ -370,6 +376,10 @@ class MockStorage:
         _validate_name(name)
         if name not in self._remotes:
             raise ValueError("unknown remote")
+        used = [m["name"] for m in self.list_mounts() if m.get("remote") == name]
+        if used:
+            raise ConflictError(
+                f"远程账号仍被挂载点 {', '.join(used)} 引用，请先删除这些挂载点")
         del self._remotes[name]
         return {"ok": True}
 

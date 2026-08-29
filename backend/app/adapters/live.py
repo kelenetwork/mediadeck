@@ -6,6 +6,7 @@ it take effect immediately — no restart, no shell access.
 """
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Callable
 from typing import Any
 
@@ -245,12 +246,52 @@ class LiveEmby:
                     if cr.status_code == 200:
                         count = cr.json().get("TotalRecordCount")
                 out.append({
+                    "id": str(item_id or folder.get("Name") or ""),
                     "name": folder.get("Name"),
                     "type": folder.get("CollectionType") or "mixed",
                     "items": count,
                     "locations": len(folder.get("Locations") or []),
                 })
             return out
+
+    async def active_sessions_raw(self) -> list[dict[str, Any]]:
+        """Full session objects, unfiltered.
+
+        Usage accounting needs fields the dashboard view drops (UserId,
+        DeviceId, PlayState, TranscodingInfo), and device tracking needs to see
+        idle sessions too, so it cannot reuse active_sessions().
+        """
+        base, headers, timeout, verify = self._conn()
+        async with self._client(timeout, verify) as client:
+            r = self._check(await client.get(f"{base}/emby/Sessions", headers=headers))
+            r.raise_for_status()
+            return list(r.json() or [])
+
+    async def stop_session(self, session_id: str, reason: str = "") -> bool:
+        """End a playback session.
+
+        Disabling an account does not interrupt a stream that already started,
+        so a member who exhausts their quota mid-film would otherwise watch it
+        to the end. The message is best-effort: not every client renders it.
+        """
+        if not session_id:
+            return False
+        base, headers, timeout, verify = self._conn()
+        async with self._client(timeout, verify) as client:
+            if reason:
+                with contextlib.suppress(httpx.HTTPError):
+                    await client.post(
+                        f"{base}/emby/Sessions/{session_id}/Message",
+                        headers=headers,
+                        json={"Text": reason, "Header": "mediadeck", "TimeoutMs": 8000},
+                    )
+            r = await client.post(
+                f"{base}/emby/Sessions/{session_id}/Playing/Stop", headers=headers)
+            return r.status_code in (200, 204)
+
+    async def sessions_for_user(self, user_id: str) -> list[dict[str, Any]]:
+        return [s for s in await self.active_sessions_raw()
+                if s.get("UserId") == user_id]
 
     async def active_sessions(self) -> list[dict[str, Any]]:
         base, headers, timeout, verify = self._conn()
@@ -265,11 +306,15 @@ class LiveEmby:
                 transcoding = session.get("TranscodingInfo") or {}
                 bitrate = transcoding.get("Bitrate") or item.get("Bitrate") or 0
                 out.append({
+                    "UserId": session.get("UserId"),
                     "UserName": session.get("UserName"),
                     "Client": session.get("Client"),
+                    "DeviceName": session.get("DeviceName"),
                     "PlayMethod": (session.get("PlayState") or {}).get("PlayMethod"),
                     "BitrateMbps": round(bitrate / 1e6, 1),
                     "Item": item.get("Name"),
+                    "SeriesName": item.get("SeriesName"),
+                    "Paused": bool((session.get("PlayState") or {}).get("IsPaused")),
                 })
             return out
 

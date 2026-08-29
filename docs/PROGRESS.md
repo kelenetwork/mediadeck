@@ -4,6 +4,34 @@ Newest entries first. Every working session appends one entry.
 
 ---
 
+## 2026-08-29 (8) — 运营中枢 UI + membership backend gaps (v0.10)
+**Done**
+- Panel pages for members / plans / invites / stats / storage / audit. NAV
+  entries no longer point at unimplemented views; `PAGES.users` is gone.
+- Public invite redeem page at `/invite/{code}` (no admin auth).
+- Dashboard cards for members, MRR, 即将到期, 超额.
+- Settings page: membership sampling/enforcement + image-cache size/hit-rate.
+- Node add flow is name (+ optional capacity) only; install command polls
+  until the node reports home; enroll token can be rotated.
+- Nodes pick global mounts instead of pasting rclone.conf; legacy inline
+  config is labelled 旧式配置 with a migrate button.
+- Backend gaps closed: HTTP 409 when deleting an in-use plan or remote;
+  invite redeem rate limit; `max_devices` refused + mid-stream kick;
+  enroll report + rotate; `delete_emby` is explicit; libraries expose `id`.
+- Tests: membership suite gained §7 coverage (plan 409, remote 409, public
+  redeem, rate limit, weekly rollover, device cap, enroll report). Baseline
+  before this session was 88 passed.
+
+**Next**
+- Reviewer commit / tag / deploy. Notification center (v0.9 leftover).
+
+**Open questions**
+- Period-over-period stats delta uses `overview(days*2) - overview(days)` as
+  an approximation of the previous window; exact previous-window queries
+  were not added to the stats API.
+
+---
+
 ## 2026-08-29 (7) — storage management backend (v0.8.0)
 **Done**
 - Panel becomes a configuration entry point, not just a viewer: cloud remotes
