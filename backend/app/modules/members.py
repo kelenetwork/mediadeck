@@ -1,32 +1,39 @@
-"""Members — the link between an Emby account and a plan.
+"""Members — the link between an Emby account and a user group.
 
 The single most important rule in this file: **an Emby user with no member row
 is invisible to the panel.**  This server has hundreds of accounts created long
 before the panel existed.  If enforcement iterated over Emby's user list rather
 than over member rows, one bad deploy could disable all of them at once.  So
-membership is opt-in, and every enforcement query starts from `members`.
+membership is opt-in (or explicit bulk enroll), and every enforcement query
+starts from `members`.
 
 The second rule: state is derived, never guessed.  `status` is stored, but
 `effective_state()` recomputes it from expiry and quota every time it is asked,
-so a member whose plan changed or whose period rolled over is correct
+so a member whose group changed or whose month rolled over is correct
 immediately rather than at the next sampler tick.
+
+v0.14: plans (products someone buys) are gone.  A member belongs to exactly one
+*group* — the operator's billing preset (see groups.py) — plus zero or more
+*roles* (admin / uploader), which are job functions, not resource limits.
 """
 from __future__ import annotations
 
 import json
+import secrets
+import string
 import time
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Any
 
 from app.core.db import Database
 from app.core.errors import ConfigError
-from app.modules.plans import PlanService, needs_duration, needs_traffic
+from app.modules.groups import GroupService, needs_duration, needs_traffic
 
 # active    : normal
 # suspended : operator disabled by hand; never auto-cleared
 # expired   : past expires_at
 # exhausted : traffic quota consumed
-# pending   : created but not yet activated (invite redeemed, awaiting payment)
+# pending   : created but not yet activated
 MEMBER_STATES = ("active", "suspended", "expired", "exhausted", "pending")
 
 # Operator-set states that automatic enforcement must never overwrite. Losing
@@ -34,15 +41,18 @@ MEMBER_STATES = ("active", "suspended", "expired", "exhausted", "pending")
 # their quota resets.
 MANUAL_STATES = ("suspended", "pending")
 
+# Additive job functions. admin => may log into the panel with their Emby
+# credentials; uploader => flagged for the future request-intake pipeline.
+ROLES = ("admin", "uploader")
+
 # Keys an operator may put in members.overrides_json. Anything else is rejected
 # so a typo cannot silently invent a new limit that enforcement never reads.
 OVERRIDE_KEYS = (
     "max_streams",
-    "max_bitrate_kbps",
+    "bandwidth_limit_kbps",
     "max_devices",
     "allow_transcode",
     "allow_download",
-    "allow_sync",
     "libraries_mode",
     "libraries",
     "expires_at_override",
@@ -52,25 +62,21 @@ LIBRARY_MODES = ("inherit", "replace", "extend")
 AUDIT_DETAIL_MAX = 4000
 
 
-def period_start(period: str, now: int) -> int:
-    """Start of the current accounting window, in epoch seconds (UTC).
+def random_password(length: int = 12) -> str:
+    """For operator-reset accounts, so nobody reuses '123456'."""
+    pool = string.ascii_letters + string.digits
+    return "".join(secrets.choice(pool) for _ in range(length))
 
-    Anchored to calendar boundaries rather than to signup date so that "monthly
-    500 GiB" means the same window for every member -- otherwise two users on
-    the same plan get quota resets on different days and support becomes
-    guesswork.
+
+def period_start(now: int) -> int:
+    """Start of the current calendar month (UTC), in epoch seconds.
+
+    Traffic always resets on month boundaries (owner decision 2026-08-30) so
+    every member's window is the same and support is never guesswork.
     """
     dt = datetime.fromtimestamp(now, UTC)
-    if period == "daily":
-        start = dt.replace(hour=0, minute=0, second=0, microsecond=0)
-    elif period == "weekly":
-        start = (dt - timedelta(days=dt.weekday())).replace(
-            hour=0, minute=0, second=0, microsecond=0)
-    elif period == "monthly":
-        start = dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    else:  # total -- never rolls over
-        return 0
-    return int(start.timestamp())
+    return int(dt.replace(day=1, hour=0, minute=0, second=0,
+                          microsecond=0).timestamp())
 
 
 def parse_overrides(raw: Any) -> dict[str, Any]:
@@ -84,6 +90,19 @@ def parse_overrides(raw: Any) -> dict[str, Any]:
     except (TypeError, ValueError):
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def parse_roles(raw: Any) -> list[str]:
+    if isinstance(raw, list):
+        items = raw
+    else:
+        items = str(raw or "").split(",")
+    out = []
+    for item in items:
+        role = str(item).strip().lower()
+        if role in ROLES and role not in out:
+            out.append(role)
+    return out
 
 
 def _as_int(raw: Any, label: str, lo: int, hi: int) -> int:
@@ -108,13 +127,13 @@ def validate_overrides(payload: Any) -> dict[str, Any]:
 
     out: dict[str, Any] = {}
     if "max_streams" in payload:
-        out["max_streams"] = _as_int(payload["max_streams"], "并发路数", 1, 100)
-    if "max_bitrate_kbps" in payload:
-        out["max_bitrate_kbps"] = _as_int(
-            payload["max_bitrate_kbps"], "码率上限", 0, 1_000_000)
+        out["max_streams"] = _as_int(payload["max_streams"], "并发路数", 0, 100)
+    if "bandwidth_limit_kbps" in payload:
+        out["bandwidth_limit_kbps"] = _as_int(
+            payload["bandwidth_limit_kbps"], "带宽限速", 0, 10_000_000)
     if "max_devices" in payload:
         out["max_devices"] = _as_int(payload["max_devices"], "设备数上限", 0, 100)
-    for flag in ("allow_transcode", "allow_download", "allow_sync"):
+    for flag in ("allow_transcode", "allow_download"):
         if flag in payload:
             out[flag] = 1 if payload[flag] else 0
     if "libraries_mode" in payload:
@@ -144,37 +163,31 @@ def validate_overrides(payload: Any) -> dict[str, Any]:
     return out
 
 
-def merge_effective(plan: dict[str, Any] | None, overrides: dict[str, Any] | None,
+def merge_effective(group: dict[str, Any] | None, overrides: dict[str, Any] | None,
                     member: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Plan values with per-member overrides applied field-by-field.
+    """Group defaults with per-member overrides applied field-by-field.
 
     A key that is absent from overrides is inherited. Presence — even of a
-    value equal to the plan — is an override, so the UI can show it as such.
+    value equal to the group default — is an override, so the UI can show it
+    as such.
     """
-    plan = plan or {}
+    group = group or {}
     ov = overrides or {}
-    streams = ov["max_streams"] if "max_streams" in ov else int(plan.get("max_streams") or 1)
-    bitrate = ov["max_bitrate_kbps"] if "max_bitrate_kbps" in ov else int(
-        plan.get("max_bitrate_kbps") or 0)
-    devices = ov["max_devices"] if "max_devices" in ov else int(plan.get("max_devices") or 0)
-    transcode = ov["allow_transcode"] if "allow_transcode" in ov else plan.get("allow_transcode", 0)
-    download = ov["allow_download"] if "allow_download" in ov else plan.get("allow_download", 0)
-    sync = ov["allow_sync"] if "allow_sync" in ov else plan.get("allow_sync", 0)
+    streams = ov["max_streams"] if "max_streams" in ov else int(
+        group.get("max_streams") or 0)
+    bandwidth = ov["bandwidth_limit_kbps"] if "bandwidth_limit_kbps" in ov else int(
+        group.get("bandwidth_limit_kbps") or 0)
+    devices = ov["max_devices"] if "max_devices" in ov else int(
+        group.get("max_devices") or 0)
+    transcode = ov["allow_transcode"] if "allow_transcode" in ov else group.get(
+        "allow_transcode", 1)
+    download = ov["allow_download"] if "allow_download" in ov else group.get(
+        "allow_download", 0)
 
-    plan_libs = list(plan.get("libraries") or [])
+    # Groups carry no library restriction; per-member overrides may.
     ov_libs = list(ov.get("libraries") or [])
     mode = ov.get("libraries_mode") or "inherit"
-    if mode == "replace":
-        libraries = ov_libs
-    elif mode == "extend":
-        seen: set[str] = set()
-        libraries = []
-        for item in plan_libs + ov_libs:
-            if item not in seen:
-                seen.add(item)
-                libraries.append(item)
-    else:
-        libraries = plan_libs
+    libraries = ov_libs if mode in ("replace", "extend") else []
 
     stored_expires = (member or {}).get("expires_at")
     if "expires_at_override" in ov:
@@ -183,8 +196,9 @@ def merge_effective(plan: dict[str, Any] | None, overrides: dict[str, Any] | Non
         expires_at = stored_expires
 
     extra = int(ov.get("extra_traffic_bytes") or 0)
-    base_quota = int(plan.get("traffic_quota_bytes") or 0)
-    if plan and needs_traffic(plan.get("billing_type") or "") and (base_quota or extra):
+    base_quota = int(group.get("traffic_quota_bytes") or 0)
+    if group and needs_traffic(group.get("billing_mode") or "") and (
+            base_quota or extra):
         quota = base_quota + extra
     else:
         quota = 0
@@ -192,16 +206,13 @@ def merge_effective(plan: dict[str, Any] | None, overrides: dict[str, Any] | Non
     overridden = [k for k in OVERRIDE_KEYS if k in ov]
     return {
         "max_streams": int(streams),
-        "max_bitrate_kbps": int(bitrate),
+        "bandwidth_limit_kbps": int(bandwidth),
         "max_devices": int(devices),
         "allow_transcode": bool(transcode),
         "allow_download": bool(download),
-        "allow_sync": bool(sync),
         "libraries": libraries,
-        "libraries_mode": mode if "libraries_mode" in ov or "libraries" in ov else "inherit",
         "expires_at": expires_at,
-        "traffic_quota_bytes": int(quota) if quota else 0,
-        "extra_traffic_bytes": extra,
+        "traffic_quota_bytes": quota,
         "overridden_keys": overridden,
     }
 
@@ -233,22 +244,23 @@ def encode_audit_detail(diff: dict[str, Any] | None, extra: str = "") -> str:
 
 
 class MemberService:
-    def __init__(self, db: Database, plans: PlanService) -> None:
+    def __init__(self, db: Database, groups: GroupService) -> None:
         self._db = db
-        self._plans = plans
+        self._groups = groups
 
     # -- read ----------------------------------------------------------------
     def get(self, user_id: str) -> dict[str, Any] | None:
         row = self._db.one("SELECT * FROM members WHERE emby_user_id=?", (user_id,))
         return self._decorate(row) if row else None
 
-    def list(self, status: str | None = None, plan_id: str | None = None,
-             search: str | None = None, limit: int = 500) -> list[dict[str, Any]]:
+    def list(self, status: str | None = None, group_id: str | None = None,
+             role: str | None = None, search: str | None = None,
+             limit: int = 500) -> list[dict[str, Any]]:
         sql = "SELECT * FROM members"
         clauses, params = [], []
-        if plan_id:
-            clauses.append("plan_id=?")
-            params.append(plan_id)
+        if group_id:
+            clauses.append("group_id=?")
+            params.append(group_id)
         if search:
             clauses.append("(username LIKE ? OR note LIKE ? OR contact LIKE ?)")
             like = f"%{search}%"
@@ -258,34 +270,36 @@ class MemberService:
         sql += " ORDER BY username COLLATE NOCASE ASC LIMIT ?"
         params.append(max(1, min(limit, 5000)))
         rows = [self._decorate(r) for r in self._db.query(sql, tuple(params))]
-        # Status is filtered after decoration because the *effective* state can
-        # differ from the stored one (expiry/quota are time-dependent).
+        # Status/role are filtered after decoration: the *effective* state is
+        # time-dependent and roles live in a comma-separated column.
         if status:
             rows = [r for r in rows if r["state"] == status]
+        if role:
+            rows = [r for r in rows if role in r["roles"]]
         return rows
 
     def _decorate(self, row: dict[str, Any]) -> dict[str, Any]:
         out = dict(row)
-        plan = self._plans.get(out["plan_id"]) if out.get("plan_id") else None
-        out["plan"] = plan
-        out["plan_name"] = plan["name"] if plan else "(无套餐)"
+        group = self._groups.get(out.get("group_id") or "")
+        out["group"] = group
+        out["group_name"] = group["name"] if group else "(未分组)"
+        out["billing_mode"] = group["billing_mode"] if group else "none"
+        out["roles"] = parse_roles(out.pop("roles", ""))
         overrides = parse_overrides(out.pop("overrides_json", None))
         out["overrides"] = overrides
-        effective = merge_effective(plan, overrides, out)
+        effective = merge_effective(group, overrides, out)
         out["effective"] = effective
         out["overridden_keys"] = list(effective["overridden_keys"])
-        # Flatten the fields the rest of the panel already reads, so callers
-        # that used plan-derived values keep working and now see overrides.
+        # Flatten the fields the rest of the panel reads.
         out["max_streams"] = effective["max_streams"]
-        out["max_bitrate_kbps"] = effective["max_bitrate_kbps"]
+        out["bandwidth_limit_kbps"] = effective["bandwidth_limit_kbps"]
         out["max_devices"] = effective["max_devices"]
         out["allow_transcode"] = effective["allow_transcode"]
         out["allow_download"] = effective["allow_download"]
-        out["allow_sync"] = effective["allow_sync"]
         out["libraries"] = list(effective["libraries"])
         out["expires_at_effective"] = effective["expires_at"]
 
-        state, reason = self.effective_state(out, plan)
+        state, reason = self.effective_state(out, group)
         out["state"] = state
         out["state_reason"] = reason
 
@@ -315,32 +329,33 @@ class MemberService:
         }
 
     @staticmethod
-    def effective_state(member: dict[str, Any], plan: dict[str, Any] | None,
+    def effective_state(member: dict[str, Any], group: dict[str, Any] | None,
                         now: int | None = None) -> tuple[str, str]:
         """Recompute state from the facts, not from the stored label."""
         now = now or int(time.time())
         stored = str(member.get("status") or "active")
         if stored in MANUAL_STATES:
             return stored, "管理员手动设置"
-        if not plan:
-            return "active", "未分配套餐，不做限制"
+        if not group:
+            return "active", "未分组，不做计费"
 
         effective = member.get("effective")
         if not isinstance(effective, dict):
             effective = merge_effective(
-                plan, member.get("overrides") or parse_overrides(
+                group, member.get("overrides") or parse_overrides(
                     member.get("overrides_json")), member)
 
+        mode = str(group.get("billing_mode") or "none")
         expires = effective.get("expires_at", member.get("expires_at"))
         has_expiry_override = "expires_at_override" in (member.get("overrides") or {})
         if expires and now >= expires and (
-                has_expiry_override or needs_duration(plan["billing_type"])):
+                has_expiry_override or needs_duration(mode)):
             return "expired", "已过期"
 
         quota = int(effective.get("traffic_quota_bytes") or 0)
         used = int(member.get("traffic_used_bytes") or 0)
-        if needs_traffic(plan["billing_type"]) and quota and used >= quota:
-            return "exhausted", "流量已用尽"
+        if needs_traffic(mode) and quota and used >= quota:
+            return "exhausted", "本月流量已用尽"
         return "active", "正常"
 
     # -- write ---------------------------------------------------------------
@@ -352,44 +367,53 @@ class MemberService:
         existing = self._db.one(
             "SELECT * FROM members WHERE emby_user_id=?", (user_id,))
 
-        plan_id = payload.get("plan_id", existing["plan_id"] if existing else None)
-        plan = None
-        if plan_id:
-            plan = self._plans.get(str(plan_id))
-            if not plan:
-                raise ConfigError(f"套餐不存在: {plan_id}")
+        group_id = payload.get(
+            "group_id", existing["group_id"] if existing else None)
+        if group_id is not None:
+            group_id = str(group_id) or None
+        group = None
+        if group_id:
+            group = self._groups.get(group_id)
+            if not group:
+                raise ConfigError(f"用户组不存在: {group_id}")
 
         status = str(payload.get(
             "status", existing["status"] if existing else "active"))
         if status not in MEMBER_STATES:
             raise ConfigError(f"状态必须是 {'/'.join(MEMBER_STATES)} 之一")
 
-        # Expiry: explicit value wins; otherwise derive from the plan when the
-        # member is new or the plan changed, so assigning a 30-day plan does
-        # not silently leave a member with no end date.
+        roles = payload.get("roles", "__keep__")
+        if roles == "__keep__":
+            roles_csv = existing["roles"] if existing else ""
+        else:
+            roles_csv = ",".join(parse_roles(roles))
+
+        # Expiry: explicit value wins; otherwise derive from the group when the
+        # member is new or the group changed, so assigning a timed group never
+        # silently leaves a member with no end date.
         expires_at = payload.get("expires_at", "__keep__")
         if expires_at == "__keep__":
             expires_at = existing["expires_at"] if existing else None
-            plan_changed = bool(existing) and existing["plan_id"] != plan_id
-            if plan and needs_duration(plan["billing_type"]) and (
-                    not existing or plan_changed or not expires_at):
-                expires_at = now + plan["duration_days"] * 86400
-            if plan and not needs_duration(plan["billing_type"]):
+            group_changed = bool(existing) and existing["group_id"] != group_id
+            if group and needs_duration(group["billing_mode"]) and (
+                    not existing or group_changed or not expires_at):
+                expires_at = now + int(group["duration_days"]) * 86400
+            if group and not needs_duration(group["billing_mode"]):
                 expires_at = None
         elif expires_at is not None:
             expires_at = int(expires_at)
 
-        period = plan["traffic_period"] if plan else "monthly"
         p_start = existing["traffic_period_start"] if existing else 0
         if not p_start:
-            p_start = period_start(period, now)
+            p_start = period_start(now)
         used = int(payload.get(
             "traffic_used_bytes",
             existing["traffic_used_bytes"] if existing else 0))
 
         row = (
             username or (existing["username"] if existing else ""),
-            plan_id,
+            group_id,
+            roles_csv,
             status,
             expires_at,
             max(0, used),
@@ -400,27 +424,68 @@ class MemberService:
         )
         if existing:
             self._db.execute(
-                "UPDATE members SET username=?,plan_id=?,status=?,expires_at=?,"
-                "traffic_used_bytes=?,traffic_period_start=?,note=?,contact=?,"
-                "updated_at=? WHERE emby_user_id=?", row + (user_id,))
-            action = "member.update"
-            self.audit(actor, action, user_id, encode_audit_detail(audit_diff(
-                {"plan_id": existing.get("plan_id"),
+                "UPDATE members SET username=?,group_id=?,roles=?,status=?,"
+                "expires_at=?,traffic_used_bytes=?,traffic_period_start=?,"
+                "note=?,contact=?,updated_at=? WHERE emby_user_id=?",
+                row + (user_id,))
+            self.audit(actor, "member.update", user_id, encode_audit_detail(audit_diff(
+                {"group_id": existing.get("group_id"),
+                 "roles": existing.get("roles"),
                  "status": existing.get("status"),
                  "expires_at": existing.get("expires_at")},
-                {"plan_id": plan_id, "status": status, "expires_at": expires_at},
+                {"group_id": group_id, "roles": roles_csv,
+                 "status": status, "expires_at": expires_at},
             )))
         else:
             self._db.execute(
-                "INSERT INTO members (username,plan_id,status,expires_at,"
+                "INSERT INTO members (username,group_id,roles,status,expires_at,"
                 "traffic_used_bytes,traffic_period_start,note,contact,updated_at,"
-                "emby_user_id,created_at,overrides_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                "emby_user_id,created_at,overrides_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 row + (user_id, now, "{}"))
-            action = "member.create"
-            self.audit(actor, action, user_id, encode_audit_detail({
-                "plan_id": {"from": None, "to": plan_id},
+            self.audit(actor, "member.create", user_id, encode_audit_detail({
+                "group_id": {"from": None, "to": group_id},
                 "status": {"from": None, "to": status},
                 "expires_at": {"from": None, "to": expires_at},
+            }))
+        return self.get(user_id)  # type: ignore[return-value]
+
+    def enroll_defaults(self, emby_users: list[dict[str, Any]],
+                        actor: str = "operator") -> int:
+        """Give every unmanaged Emby account a member row in the default group.
+
+        Explicitly operator-triggered (never automatic on list) so that one
+        accidental page load cannot mass-create hundreds of billed accounts.
+        """
+        default_group = self._groups.default_group_id()
+        if not default_group:
+            raise ConfigError("没有默认用户组，先在用户组页设置一个")
+        enrolled = 0
+        for user in emby_users:
+            user_id = str(user.get("Id") or "")
+            if not user_id:
+                continue
+            if self._db.one("SELECT 1 AS x FROM members WHERE emby_user_id=?",
+                            (user_id,)):
+                continue
+            self.upsert(user_id, str(user.get("Name") or ""),
+                        {"group_id": default_group}, actor=actor)
+            enrolled += 1
+        return enrolled
+
+    def set_roles(self, user_id: str, roles: Any,
+                  actor: str = "operator") -> dict[str, Any]:
+        member = self.get(user_id)
+        if not member:
+            raise KeyError(user_id)
+        cleaned = parse_roles(roles)
+        before = ",".join(member.get("roles") or [])
+        after = ",".join(cleaned)
+        if before != after:
+            self._db.execute(
+                "UPDATE members SET roles=?,updated_at=? WHERE emby_user_id=?",
+                (after, int(time.time()), user_id))
+            self.audit(actor, "member.roles", user_id, encode_audit_detail({
+                "roles": {"from": before, "to": after},
             }))
         return self.get(user_id)  # type: ignore[return-value]
 
@@ -438,7 +503,7 @@ class MemberService:
                         device_name: str = "", client: str = "",
                         app_version: str = "", last_ip: str = "",
                         now: int | None = None) -> bool:
-        """Record a device, refusing new ones once the plan's cap is hit.
+        """Record a device, refusing new ones once the member's cap is hit.
 
         Existing devices always refresh: kicking someone off a phone they
         already use because they opened a second app on it would be wrong.
@@ -488,14 +553,13 @@ class MemberService:
     def renew(self, user_id: str, days: int | None = None,
               actor: str = "operator") -> dict[str, Any]:
         """Extend the term. Extends from the later of now and current expiry, so
-        renewing early never costs the member the days they already paid for."""
+        renewing early never costs the member the days they already have."""
         member = self.get(user_id)
         if not member:
             raise KeyError(user_id)
-        plan = member.get("plan")
-        if not plan:
-            raise ConfigError("该用户未分配套餐，无法续期")
-        add_days = int(days if days is not None else plan["duration_days"])
+        group = member.get("group")
+        default_days = int(group["duration_days"]) if group else 0
+        add_days = int(days if days is not None else default_days)
         if add_days <= 0:
             raise ConfigError("续期天数必须大于 0")
         now = int(time.time())
@@ -516,14 +580,12 @@ class MemberService:
         if not member:
             raise KeyError(user_id)
         now = int(time.time())
-        plan = member.get("plan")
-        period = plan["traffic_period"] if plan else "monthly"
         used_before = int(member.get("traffic_used_bytes") or 0)
         self._db.execute(
             "UPDATE members SET traffic_used_bytes=0,traffic_period_start=?,"
             "status=CASE WHEN status='exhausted' THEN 'active' ELSE status END,"
             "updated_at=? WHERE emby_user_id=?",
-            (period_start(period, now), now, user_id))
+            (period_start(now), now, user_id))
         self.audit(actor, "member.reset_traffic", user_id, encode_audit_detail({
             "traffic_used_bytes": {"from": used_before, "to": 0},
         }))
@@ -545,23 +607,16 @@ class MemberService:
         }))
         return self.get(user_id)  # type: ignore[return-value]
 
-    # -- periodic maintenance ------------------------------------------------
     def roll_periods(self, now: int | None = None) -> int:
-        """Reset quotas whose accounting window has rolled over.
-
-        Runs from the sampler rather than from a request so a member on a daily
-        plan is not stuck at "exhausted" until someone opens the panel.
-        """
+        """Monthly reset: zero usage, drop one-off extra traffic, unblock
+        exhausted members. Manual states are never touched."""
         now = now or int(time.time())
         rolled = 0
+        current = period_start(now)
         for member in self.list(limit=5000):
-            plan = member.get("plan")
-            if not plan or not needs_traffic(plan["billing_type"]):
+            group = member.get("group")
+            if not group or not needs_traffic(group["billing_mode"]):
                 continue
-            period = plan["traffic_period"]
-            if period == "total":
-                continue
-            current = period_start(period, now)
             if int(member.get("traffic_period_start") or 0) >= current:
                 continue
             ov = dict(member.get("overrides") or {})
@@ -576,7 +631,6 @@ class MemberService:
                  now, member["emby_user_id"]))
             self.audit("system", "member.period_roll", member["emby_user_id"],
                        encode_audit_detail({
-                           "period": {"from": period, "to": period},
                            "extra_traffic_bytes": {"from": extra_before, "to": 0},
                        }))
             rolled += 1
@@ -608,7 +662,7 @@ class MemberService:
 
     def add_extra_traffic(self, user_id: str, delta_bytes: int,
                           actor: str = "operator") -> dict[str, Any]:
-        """Accumulate extra_traffic_bytes on the overlay (current period)."""
+        """Accumulate extra_traffic_bytes on the overlay (current month)."""
         if delta_bytes < 0:
             raise ConfigError("额外流量必须大于等于 0")
         member = self.get(user_id)

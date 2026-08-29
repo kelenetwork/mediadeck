@@ -133,11 +133,11 @@ class MockEmby:
     async def active_sessions(self) -> list[dict[str, Any]]:
         return [
             {
+                "Id": "mock-session-1",
                 "UserId": "u1",
                 "UserName": "demo-user-1",
                 "Client": "Demo Player",
                 "PlayMethod": "DirectStream",
-                "BitrateMbps": round(random.uniform(3, 20), 1),
                 "Item": "Demo Show S01E01",
             }
         ]

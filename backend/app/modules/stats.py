@@ -7,8 +7,7 @@ counters on a page:
 * Who is costing me the most bandwidth?          (top consumers)
 * What is worth keeping in the library?          (top titles)
 * Is transcoding hurting me?                     (direct vs transcode ratio)
-* How much money is on the books, and what is    (revenue, expiring soon)
-  about to lapse?
+* What is about to lapse?                        (expiring soon)
 
 Every query is bounded and indexed. The tables it reads grow forever, so an
 unbounded `SELECT *` here would quietly become the slowest thing in the panel
@@ -21,7 +20,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from app.core.db import Database
-from app.modules.plans import needs_duration, needs_traffic
+from app.modules.groups import needs_duration, needs_traffic
 
 MAX_DAYS = 366
 
@@ -44,36 +43,31 @@ class StatsService:
         today = datetime.now(UTC).strftime("%Y-%m-%d")
 
         members = self._db.query("SELECT * FROM members")
-        plans = {p["id"]: p for p in self._db.query("SELECT * FROM plans")}
+        groups = {g["id"]: g for g in self._db.query("SELECT * FROM groups")}
 
         active = expired = exhausted = suspended = 0
-        mrr_cents = 0
         expiring_7d = []
         for m in members:
-            plan = plans.get(m.get("plan_id") or "")
+            group = groups.get(m.get("group_id") or "")
+            mode = group["billing_mode"] if group else "none"
             status = m.get("status") or "active"
             if status in ("suspended", "pending"):
                 suspended += 1
-            elif plan and needs_duration(plan["billing_type"]) and \
+            elif group and needs_duration(mode) and \
                     m.get("expires_at") and now >= m["expires_at"]:
                 expired += 1
-            elif plan and needs_traffic(plan["billing_type"]) and \
-                    plan["traffic_quota_bytes"] and \
-                    m.get("traffic_used_bytes", 0) >= plan["traffic_quota_bytes"]:
+            elif group and needs_traffic(mode) and \
+                    group["traffic_quota_bytes"] and \
+                    m.get("traffic_used_bytes", 0) >= group["traffic_quota_bytes"]:
                 exhausted += 1
             else:
                 active += 1
-                if plan:
-                    # Normalise every plan to a monthly figure so plans with
-                    # different terms are comparable in one number.
-                    price, term = plan["price_cents"], plan["duration_days"] or 30
-                    mrr_cents += int(price * 30 / term) if term else 0
 
-            if plan and m.get("expires_at") and 0 < m["expires_at"] - now <= 7 * 86400:
+            if group and m.get("expires_at") and 0 < m["expires_at"] - now <= 7 * 86400:
                 expiring_7d.append({
                     "user_id": m["emby_user_id"],
                     "username": m.get("username"),
-                    "plan": plan["name"],
+                    "group": group["name"],
                     "expires_at": m["expires_at"],
                     "days_left": max(0, int((m["expires_at"] - now) // 86400)),
                 })
@@ -98,11 +92,6 @@ class StatsService:
                 "expired": expired,
                 "exhausted": exhausted,
                 "suspended": suspended,
-            },
-            "revenue": {
-                "mrr_cents": mrr_cents,
-                "currency": (next(iter(plans.values()))["currency"]
-                             if plans else "CNY"),
             },
             "traffic": {
                 "window_bytes": int(totals.get("bytes") or 0),
@@ -148,7 +137,7 @@ class StatsService:
         since = _day_list(days)[0]
         rows = self._db.query(
             "SELECT u.emby_user_id, COALESCE(m.username,'') AS username,"
-            " COALESCE(m.plan_id,'') AS plan_id,"
+            " COALESCE(m.group_id,'') AS group_id,"
             " SUM(u.bytes) AS bytes, SUM(u.seconds) AS secs, SUM(u.plays) AS plays"
             " FROM usage_daily u LEFT JOIN members m ON m.emby_user_id=u.emby_user_id"
             " WHERE u.day >= ? GROUP BY u.emby_user_id"
@@ -156,7 +145,7 @@ class StatsService:
         return [{
             "user_id": r["emby_user_id"],
             "username": r["username"] or r["emby_user_id"][:8],
-            "plan_id": r["plan_id"],
+            "group_id": r["group_id"],
             "bytes": int(r["bytes"] or 0),
             "hours": round(int(r["secs"] or 0) / 3600, 1),
             "plays": int(r["plays"] or 0),
