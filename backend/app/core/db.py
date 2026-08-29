@@ -102,7 +102,9 @@ CREATE TABLE IF NOT EXISTS members (
     group_id            TEXT,
     roles               TEXT NOT NULL DEFAULT ''
 );
-CREATE INDEX IF NOT EXISTS idx_members_group ON members(group_id);
+-- idx_members_group is created in _migrate() *after* _ensure_column: on an
+-- upgraded database the members table predates group_id, and executescript
+-- would fail here before the column migration ever ran.
 CREATE INDEX IF NOT EXISTS idx_members_plan ON members(plan_id);
 CREATE INDEX IF NOT EXISTS idx_members_status ON members(status);
 
@@ -234,6 +236,8 @@ class Database:
             # columns existed, so they must be added here, not in SCHEMA.
             self._ensure_column("members", "group_id", "TEXT")
             self._ensure_column("members", "roles", "TEXT NOT NULL DEFAULT ''")
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_members_group ON members(group_id)")
             self._conn.commit()
 
     def _ensure_column(self, table: str, name: str, ddl: str) -> None:
