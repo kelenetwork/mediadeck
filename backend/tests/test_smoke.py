@@ -50,7 +50,7 @@ def test_emby_mock() -> None:
         users = client.get("/api/emby/users", headers=_basic()).json()
         assert any(u["Name"] == "demo-user-1" for u in users)
         sessions = client.get("/api/emby/sessions", headers=_basic()).json()
-        assert sessions and "SpeedMbps" in sessions[0]
+        assert sessions and "SpeedMBps" in sessions[0]
 
 
 def test_pipeline_mock() -> None:

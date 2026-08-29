@@ -313,8 +313,10 @@ async def _startup() -> None:
 
     app.state.events = EventStream({
         "nodes": _nodes_topic,
-        "sessions": lambda: app.state.cache.resolve(
-            "emby:sessions", app.state.emby.active_sessions, ttl=5),
+        # Must be the *decorated* payload: the live push and the manual
+        # refresh have to agree, otherwise the dashboard shows speeds only
+        # when you hit refresh and looks frozen the rest of the time.
+        "sessions": _sessions_with_speed,
         "pipeline": lambda: asyncio.to_thread(app.state.pipeline.snapshot),
         "tasks": lambda: asyncio.to_thread(app.state.tasks.snapshot),
         "mounts": lambda: asyncio.to_thread(app.state.mounts.snapshot),
@@ -882,33 +884,46 @@ async def emby_libraries() -> list[dict[str, Any]]:
     )
 
 
-@app.get("/api/emby/sessions", dependencies=[Depends(_auth)])
-async def emby_sessions() -> list[dict[str, Any]]:
+async def _sessions_with_speed() -> list[dict[str, Any]]:
+    """Active sessions annotated with live bandwidth.
+
+    Shared by the REST endpoint and the SSE topic on purpose: when only the
+    REST path decorated the payload, speeds appeared on manual refresh and
+    vanished on every live push, which reads as "the number is frozen".
+
+    Speed prefers what the *node* measured on the wire (nginx speed log,
+    keyed by anonymised user tag). Sessions served by the Emby origin have no
+    node measurement and fall back to the usage sampler's estimate, flagged
+    so the UI can mark it approximate.
+    """
     # Short TTL: sessions must still feel live, but a 30s auto-refresh plus
     # page switches should not hammer Emby.
     sessions = await app.state.cache.resolve(
         "emby:sessions", app.state.emby.active_sessions, ttl=5
     )
-    # Live bandwidth prefers what the *node* measured on the wire (collected
-    # from the nginx speed log, keyed by anonymised user tag). Sessions served
-    # by the Emby origin have no node measurement and fall back to the usage
-    # sampler's estimate, marked as such so the UI can say ≈.
     est = app.state.usage.live_speeds()
     node_speeds = app.state.scheduler.user_speeds()
     out = []
-    for s in sessions:
-        s = dict(s)
+    for session in sessions:
+        s = dict(session)
         real = node_speeds.get(user_tag(str(s.get("UserId") or "")))
         if real:
             # Node speeds are per *user*: concurrent sessions of one account
             # share the tag, so both rows show the account's wire rate.
-            s["SpeedMbps"] = round(real * 8 / 1e6, 1)
+            s["SpeedBps"] = int(real)
             s["SpeedSource"] = "node"
         else:
-            s["SpeedMbps"] = round(est.get(str(s.get("Id") or ""), 0) * 8 / 1e6, 1)
+            s["SpeedBps"] = int(est.get(str(s.get("Id") or ""), 0))
             s["SpeedSource"] = "estimate"
+        # MB/s (owner's unit of choice); bytes stay available for precision.
+        s["SpeedMBps"] = round(s["SpeedBps"] / 1048576, 1)
         out.append(s)
     return out
+
+
+@app.get("/api/emby/sessions", dependencies=[Depends(_auth)])
+async def emby_sessions() -> list[dict[str, Any]]:
+    return await _sessions_with_speed()
 
 
 @app.post("/api/emby/users", dependencies=[Depends(_auth)])

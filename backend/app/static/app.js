@@ -104,6 +104,15 @@ function fmtMoney(cents, currency) {
 function fmtQuota(n) {
   return n ? fmtBytes(n) : '不限';
 }
+function sessionSpeedCell(s) {
+  /* MB/s: the unit the owner reads on his own devices. A node-measured value
+     is real wire bytes; the sampler fallback is an estimate and says so,
+     because showing a guess as if it were measured is what misled before. */
+  if (s.Paused) return '<span class="muted">0 MB/s · 已暂停</span>';
+  const v = Number(s.SpeedMBps || 0).toFixed(1);
+  if (s.SpeedSource === 'node') return `${esc(v)} MB/s`;
+  return `<span title="源站会话，按码率估算">≈ ${esc(v)} MB/s</span>`;
+}
 function pageError(err) {
   return `<div class="card"><div class="page-error">
     <div class="t">加载失败</div>
@@ -243,10 +252,10 @@ PAGES.dashboard = async () => {
       ${stat('⚠', alerts.length + limited + expiring.length + exhaustedN, '待处理事项', limited ? `${limited} 个上传身份受限` : '系统关键状态')}
     </div>
     <div class="grid-2">
-      ${tableCard('当前播放', '实时会话 · 按采样窗口计算', ['用户', '客户端', '方式', '实时带宽'],
+      ${tableCard('当前播放', '实时会话 · 节点实测速率', ['用户', '客户端', '方式', '实时速度'],
         sessions.map((s) => `<tr><td>${esc(s.UserName)}</td><td>${esc(s.Client)}</td>
           <td>${esc(s.PlayMethod)}${s.Paused ? ' · 已暂停' : ''}</td>
-          <td>${s.Paused ? '<span class="muted">0 Mbps</span>' : esc(s.SpeedMbps || 0) + ' Mbps'}</td></tr>`).join(''))}
+          <td>${sessionSpeedCell(s)}</td></tr>`).join(''))}
       ${tableCard('管线队列', pipe.available ? `快照 ${Math.round(pipe.snapshot_age_seconds)}s 前` : '快照不可用',
         ['队列', '条目', '体积', '最老'],
         queues.map((q) => `<tr><td>${esc(q.name)}</td><td>${q.items}</td>
@@ -348,7 +357,7 @@ PAGES.nodes = async () => {
     <div class="stat-grid">
       ${stat('⛁', `${online} / ${ns.length}`, '在线节点', '可用于分发')}
       ${stat('▶', streams, '活跃流', '所有节点合计')}
-      ${stat('⇅', egress.toFixed(1), '出口 Mbps', '实时带宽')}
+      ${stat('⇅', (egress / 8).toFixed(1), '出口 MB/s', '节点实时出口')}
       ${stat('⚖', policyLabel, '调度策略', dispatch.policy === 'affinity'
         ? `占用率阈值 ${Math.round(dispatch.load_threshold * 100)}%` : '按容量占用率择优')}
     </div>

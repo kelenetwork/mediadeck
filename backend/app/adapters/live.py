@@ -240,19 +240,33 @@ class LiveEmby:
         if not token:
             return None
         base, _, timeout, verify = self._conn()
+        # Two shapes, because clients differ: a *user session* token answers
+        # /Users/Me, while an api_key (what many clients put in the query
+        # string) does not and needs the session lookup instead. Getting this
+        # wrong leaves the URL unsigned-for-user, which silently disables
+        # per-user rate limiting -- exactly the failure seen in production.
         try:
             async with self._client(timeout, verify) as client:
                 r = await client.get(f"{base}/emby/Users/Me",
                                      headers={"X-Emby-Token": token})
+                if r.status_code == 200:
+                    with contextlib.suppress(ValueError):
+                        uid = (r.json() or {}).get("Id")
+                        if uid:
+                            return str(uid)
+                # api_key path: ask Emby which session owns this token.
+                s = await client.get(f"{base}/emby/Sessions",
+                                     headers={"X-Emby-Token": token})
+                if s.status_code == 200:
+                    with contextlib.suppress(ValueError):
+                        for session in (s.json() or []):
+                            if str(session.get("AccessToken") or "") == token:
+                                uid = session.get("UserId")
+                                if uid:
+                                    return str(uid)
         except httpx.HTTPError:
             return None
-        if r.status_code != 200:
-            return None
-        try:
-            uid = (r.json() or {}).get("Id")
-        except ValueError:
-            return None
-        return str(uid) if uid else None
+        return None
 
     async def item_media_paths(self, item_id: str) -> dict[str, str]:
         """Map MediaSourceId -> on-disk file path for one item.
