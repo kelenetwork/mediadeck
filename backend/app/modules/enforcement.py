@@ -57,10 +57,11 @@ MANAGED_KEYS = (
 
 
 def desired_policy(member: dict[str, Any]) -> dict[str, Any]:
-    """The Emby policy fields implied by this member's plan and state."""
+    """The Emby policy fields implied by this member's effective limits."""
     plan = member.get("plan") or {}
     state = member.get("state", "active")
     blocked = state in BLOCKING_STATES
+    effective = member.get("effective") or {}
 
     policy: dict[str, Any] = {"IsDisabled": blocked}
 
@@ -69,21 +70,29 @@ def desired_policy(member: dict[str, Any]) -> dict[str, Any]:
         # operator can park an account without inheriting arbitrary limits.
         return policy
 
-    policy["SimultaneousStreamLimit"] = int(plan.get("max_streams") or 1)
-    # Emby treats 0 as "no limit" for bitrate, which matches our convention.
-    policy["RemoteClientBitrateLimit"] = int(plan.get("max_bitrate_kbps") or 0) * 1000
+    # Prefer the merged overlay; fall back to the plan so a caller that only
+    # passed the raw member+plan still produces the historical mapping.
+    streams = effective.get("max_streams", plan.get("max_streams") or 1)
+    bitrate = effective.get("max_bitrate_kbps", plan.get("max_bitrate_kbps") or 0)
+    transcode = effective.get("allow_transcode", plan.get("allow_transcode"))
+    download = effective.get("allow_download", plan.get("allow_download"))
+    sync = effective.get("allow_sync", plan.get("allow_sync"))
+    libraries = list(effective.get("libraries", plan.get("libraries") or []))
 
-    transcode = bool(plan.get("allow_transcode"))
+    policy["SimultaneousStreamLimit"] = int(streams or 1)
+    # Emby treats 0 as "no limit" for bitrate, which matches our convention.
+    policy["RemoteClientBitrateLimit"] = int(bitrate or 0) * 1000
+
+    transcode = bool(transcode)
     policy["EnableVideoPlaybackTranscoding"] = transcode
     policy["EnableAudioPlaybackTranscoding"] = transcode
     policy["EnablePlaybackRemuxing"] = transcode
 
-    policy["EnableContentDownloading"] = bool(plan.get("allow_download"))
-    sync = bool(plan.get("allow_sync"))
+    policy["EnableContentDownloading"] = bool(download)
+    sync = bool(sync)
     policy["EnableSyncTranscoding"] = sync
     policy["EnableMediaConversion"] = sync
 
-    libraries = list(plan.get("libraries") or [])
     if libraries:
         policy["EnableAllFolders"] = False
         policy["EnabledFolders"] = libraries

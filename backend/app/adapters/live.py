@@ -145,6 +145,43 @@ class LiveEmby:
             )
             return r.status_code in (200, 204)
 
+    async def authenticate_user(self, username: str, password: str) -> dict[str, Any] | None:
+        """Validate Emby credentials for the public redeem form.
+
+        Uses AuthenticateByName so a wrong password is just a 401, never an
+        exception that would leak whether the username exists. The admin API
+        key is deliberately omitted: sending it can make Emby skip the password
+        check and accept any username.
+        """
+        if not (username or "").strip() or not password:
+            return None
+        base, _headers, timeout, verify = self._conn()
+        client_auth = (
+            'MediaBrowser Client="mediadeck", Device="redeem", '
+            'DeviceId="mediadeck-redeem", Version="0.1.0"'
+        )
+        try:
+            async with self._client(timeout, verify) as client:
+                r = await client.post(
+                    f"{base}/emby/Users/AuthenticateByName",
+                    headers={"X-Emby-Authorization": client_auth},
+                    json={"Username": username.strip(), "Pw": password},
+                )
+        except httpx.HTTPError:
+            return None
+        if r.status_code in (401, 403):
+            return None
+        if r.status_code != 200:
+            return None
+        try:
+            data = r.json() or {}
+        except ValueError:
+            return None
+        user = data.get("User") or {}
+        if not user.get("Id"):
+            return None
+        return user
+
     async def apply_policy(self, user_id: str, policy_patch: dict[str, Any]) -> bool:
         base, headers, timeout, verify = self._conn()
         async with self._client(timeout, verify) as client:
@@ -287,6 +324,19 @@ class LiveEmby:
                     )
             r = await client.post(
                 f"{base}/emby/Sessions/{session_id}/Playing/Stop", headers=headers)
+            stopped = r.status_code in (200, 204)
+            with contextlib.suppress(httpx.HTTPError):
+                await client.delete(
+                    f"{base}/emby/Sessions/{session_id}", headers=headers)
+            return stopped
+
+    async def delete_session(self, session_id: str) -> bool:
+        if not session_id:
+            return False
+        base, headers, timeout, verify = self._conn()
+        async with self._client(timeout, verify) as client:
+            r = await client.delete(
+                f"{base}/emby/Sessions/{session_id}", headers=headers)
             return r.status_code in (200, 204)
 
     async def sessions_for_user(self, user_id: str) -> list[dict[str, Any]]:
