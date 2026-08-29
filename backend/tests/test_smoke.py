@@ -784,6 +784,96 @@ def test_client_token_is_read_from_every_shape_emby_uses() -> None:
     assert caller_token({}, {}) == ""
 
 
+def test_client_device_is_read_from_every_shape_emby_uses() -> None:
+    """The device id is what breaks the shared-api_key tie.
+
+    Emby scopes /Sessions to the presented credential, so a fleet-wide key
+    sees every session and names nobody. Without the device id the panel
+    cannot tell which member is streaming and signs the URL uncapped.
+    """
+    from app.modules.playback import caller_device
+    assert caller_device({"x-emby-device-id": "a"}, {}) == "a"
+    assert caller_device({"x-mediabrowser-device-id": "b"}, {}) == "b"
+    assert caller_device(
+        {"authorization": 'MediaBrowser Client="Emby", DeviceId="c"'}, {}) == "c"
+    assert caller_device({}, {"DeviceId": "d"}) == "d"
+    assert caller_device({}, {"deviceId": "e"}) == "e"
+    assert caller_device({}, {}) == ""
+
+
+def test_member_rate_cap_is_signed_into_the_node_url() -> None:
+    """Regression: every real playback was signed r=0 with an empty user tag.
+
+    The panel resolved the caller through Emby's ``/Users/Me``, which only
+    exists on Jellyfin -- Emby parses "Me" as a Guid and answers 500 -- then
+    fell back to matching ``AccessToken`` in ``/Sessions``, which Emby never
+    populates. Both lookups failing left every stream uncapped *and*
+    unattributed, so caps looked ignored and the dashboard speed read wrong.
+    """
+    with TestClient(app) as client:
+        for node in client.get("/api/nodes", headers=_basic()).json():
+            client.delete(f"/api/nodes/{node['name']}", headers=_basic())
+        _node(client, "edge-rate", sign_secret="topsecret",
+              sign_arg_digest="k", sign_arg_expires="e")
+        client.put("/api/settings/playback", headers=_basic(), json={"enabled": True})
+
+        # 8 Mbps cap on the member behind the mock's default token ("u1").
+        client.put("/api/members/u1", headers=_basic(),
+                   json={"group_id": "standard"})
+        client.put("/api/members/u1/overrides", headers=_basic(),
+                   json={"bandwidth_limit_kbps": 8000})
+
+        r = client.get("/emby/Videos/item42/stream.mkv?Static=true",
+                       headers=_play(), follow_redirects=False)
+        location = r.headers["location"]
+        # kbps -> bytes/s is *125, and nginx reads that as limit_rate.
+        assert "r=1000000" in location, location
+        # A non-empty tag is what lets the node attribute wire bytes back.
+        assert "u=" in location and "u=&" not in location
+        assert not location.rstrip().endswith("u=")
+
+
+def test_shared_key_is_attributed_by_device_not_by_first_caller() -> None:
+    """A fleet-wide credential must never inherit another member's cap.
+
+    Caching the resolution by token alone would hand the first resolved
+    user's rate to every other stream sharing that key.
+    """
+    with TestClient(app) as client:
+        for node in client.get("/api/nodes", headers=_basic()).json():
+            client.delete(f"/api/nodes/{node['name']}", headers=_basic())
+        _node(client, "edge-dev", sign_secret="topsecret",
+              sign_arg_digest="k", sign_arg_expires="e")
+        client.put("/api/settings/playback", headers=_basic(), json={"enabled": True})
+
+        client.put("/api/members/u1", headers=_basic(),
+                   json={"group_id": "standard"})
+        client.put("/api/members/u1/overrides", headers=_basic(),
+                   json={"bandwidth_limit_kbps": 8000})
+        client.put("/api/members/u2", headers=_basic(),
+                   json={"group_id": "standard"})
+        client.put("/api/members/u2/overrides", headers=_basic(),
+                   json={"bandwidth_limit_kbps": 2000})
+
+        headers = _play("admin-key")
+        headers["X-Emby-Device-Id"] = "dev:u1"
+        first = client.get("/emby/Videos/item42/stream.mkv?Static=true",
+                           headers=headers, follow_redirects=False)
+        assert "r=1000000" in first.headers["location"]
+
+        headers["X-Emby-Device-Id"] = "dev:u2"
+        second = client.get("/emby/Videos/item42/stream.mkv?Static=true",
+                            headers=headers, follow_redirects=False)
+        # Same token, different device: bob's 2 Mbps, not alice's 8.
+        assert "r=250000" in second.headers["location"]
+
+        # Unidentifiable on that shared key -> fail open, never guess.
+        headers.pop("X-Emby-Device-Id")
+        third = client.get("/emby/Videos/item42/stream.mkv?Static=true",
+                           headers=headers, follow_redirects=False)
+        assert "r=0" in third.headers["location"]
+
+
 def test_real_client_path_shapes_reach_the_edge() -> None:
     """Regression: real playback never matched the route at all.
 

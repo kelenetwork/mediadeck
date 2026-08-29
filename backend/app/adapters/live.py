@@ -229,43 +229,72 @@ class LiveEmby:
         except ValueError:
             return False
 
-    async def user_for_token(self, token: str) -> str | None:
-        """Resolve a caller's Emby token to their user id.
+    async def user_for_token(self, token: str,
+                             device_id: str = "") -> str | None:
+        """Resolve a caller's playback credential to their Emby user id.
 
         Needed to look up the member's bandwidth cap when signing a node URL.
-        Uses the caller's own credential (/Users/Me), so it can never resolve
-        to anyone but the token's owner.
+        A wrong answer here is not cosmetic: an unresolved caller is signed
+        ``r=0`` with an empty user tag, which silently disables *both*
+        per-user rate limiting and per-user speed attribution.
+
+        Emby is not Jellyfin, and two plausible-looking lookups do not work:
+
+        * ``/emby/Users/Me`` does not exist on Emby. It routes into the
+          by-id handler, which tries to parse ``"Me"`` as a Guid and answers
+          **500 Unrecognized Guid format** for every token.
+        * ``/emby/Sessions`` never populates ``AccessToken``, so matching a
+          session by token can never succeed either.
+
+        What does work is ``/emby/Sessions?api_key=<token>``, because Emby
+        scopes that response to the credential presented:
+
+        * a *user* token sees only its own sessions -> exactly one distinct
+          ``UserId``, which is its owner;
+        * an *admin* api_key sees the whole fleet, so the owner is ambiguous
+          from the token alone and must be identified by the ``DeviceId``
+          the playback request carried.
+
+        Anything still ambiguous returns None and the caller signs uncapped:
+        guessing would apply one member's cap to another member's stream.
         """
         token = (token or "").strip()
         if not token:
             return None
+        device_id = (device_id or "").strip()
         base, _, timeout, verify = self._conn()
-        # Two shapes, because clients differ: a *user session* token answers
-        # /Users/Me, while an api_key (what many clients put in the query
-        # string) does not and needs the session lookup instead. Getting this
-        # wrong leaves the URL unsigned-for-user, which silently disables
-        # per-user rate limiting -- exactly the failure seen in production.
         try:
             async with self._client(timeout, verify) as client:
-                r = await client.get(f"{base}/emby/Users/Me",
-                                     headers={"X-Emby-Token": token})
-                if r.status_code == 200:
-                    with contextlib.suppress(ValueError):
-                        uid = (r.json() or {}).get("Id")
-                        if uid:
-                            return str(uid)
-                # api_key path: ask Emby which session owns this token.
                 s = await client.get(f"{base}/emby/Sessions",
-                                     headers={"X-Emby-Token": token})
-                if s.status_code == 200:
-                    with contextlib.suppress(ValueError):
-                        for session in (s.json() or []):
-                            if str(session.get("AccessToken") or "") == token:
-                                uid = session.get("UserId")
-                                if uid:
-                                    return str(uid)
+                                     params={"api_key": token})
+                if s.status_code != 200:
+                    return None
+                try:
+                    sessions = s.json() or []
+                except ValueError:
+                    return None
         except httpx.HTTPError:
             return None
+        if not isinstance(sessions, list):
+            return None
+
+        # Exact match first: it is the only branch that stays correct when the
+        # credential can see more than its own sessions.
+        if device_id:
+            for session in sessions:
+                if not isinstance(session, dict):
+                    continue
+                if str(session.get("DeviceId") or "") == device_id:
+                    uid = session.get("UserId")
+                    if uid:
+                        return str(uid)
+
+        uids = {
+            str(session["UserId"]) for session in sessions
+            if isinstance(session, dict) and session.get("UserId")
+        }
+        if len(uids) == 1:
+            return uids.pop()
         return None
 
     async def item_media_paths(self, item_id: str) -> dict[str, str]:
