@@ -20,8 +20,14 @@ from app.core.errors import ConfigError, ConflictError
 from app.main import app
 from app.modules.enforcement import EnforcementService, desired_policy
 from app.modules.imagecache import ImageCache
-from app.modules.members import MemberService, period_start
+from app.modules.members import (
+    MemberService,
+    merge_effective,
+    period_start,
+    validate_overrides,
+)
 from app.modules.plans import PlanService
+from app.modules.redeem import RedeemService
 from app.modules.stats import StatsService
 from app.modules.usage import UsageSampler, is_playing, session_bitrate
 
@@ -42,8 +48,10 @@ def stack():
     members = MemberService(db, plans)
     emby = MockEmby()
     enforcement = EnforcementService(db, members, emby)
+    redeem = RedeemService(db, plans, members, emby)
     return {"db": db, "plans": plans, "members": members,
-            "emby": emby, "enforcement": enforcement, "tmp": tmp}
+            "emby": emby, "enforcement": enforcement, "redeem": redeem,
+            "tmp": tmp}
 
 
 # ---- plans -----------------------------------------------------------------
@@ -666,3 +674,184 @@ def test_enroll_report_and_rotate_token() -> None:
             f"/api/enroll/{token}/report", json={"base_url": "https://x.example"},
         ).status_code == 404
         client.delete("/api/nodes/edge-home", headers=_basic())
+
+
+# ---- member overlays + redeem ----------------------------------------------
+def test_overrides_reject_unknown_keys(stack) -> None:
+    with pytest.raises(ConfigError):
+        validate_overrides({"not_a_real_field": 1})
+    cleaned = validate_overrides({"max_streams": 4, "allow_transcode": True})
+    assert cleaned["max_streams"] == 4 and cleaned["allow_transcode"] == 1
+
+
+def test_merge_extend_unions_libraries(stack) -> None:
+    stack["plans"].create({
+        "id": "libby", "name": "库套餐", "billing_type": "unlimited",
+        "libraries": ["lib-a"], "max_streams": 2,
+    })
+    plan = stack["plans"].get("libby")
+    merged = merge_effective(plan, {
+        "libraries_mode": "extend", "libraries": ["lib-b", "lib-a"],
+    })
+    assert merged["libraries"] == ["lib-a", "lib-b"]
+    replaced = merge_effective(plan, {
+        "libraries_mode": "replace", "libraries": ["lib-b"],
+    })
+    assert replaced["libraries"] == ["lib-b"]
+
+
+def test_expires_at_override_can_expire_a_member(stack) -> None:
+    m = stack["members"]
+    m.upsert("u1", "alice", {"plan_id": "monthly",
+                             "expires_at": int(time.time()) + 30 * 86400})
+    assert m.get("u1")["state"] == "active"
+    m.set_overrides("u1", {"expires_at_override": int(time.time()) - 10})
+    after = m.get("u1")
+    assert after["state"] == "expired"
+    assert "expires_at_override" in after["overridden_keys"]
+
+
+def test_extra_traffic_raises_the_exhausted_threshold(stack) -> None:
+    m = stack["members"]
+    m.upsert("u1", "alice", {"plan_id": "monthly",
+                             "traffic_used_bytes": 500 * GIB})
+    assert m.get("u1")["state"] == "exhausted"
+    m.set_overrides("u1", {"extra_traffic_bytes": 100 * GIB})
+    after = m.get("u1")
+    assert after["traffic_quota_bytes"] == 600 * GIB
+    assert after["state"] == "active"
+    m.upsert("u1", "alice", {"traffic_used_bytes": 600 * GIB})
+    assert m.get("u1")["state"] == "exhausted"
+
+
+def test_desired_policy_uses_effective_overlay(stack) -> None:
+    m = stack["members"]
+    m.upsert("u1", "alice", {"plan_id": "trial"})
+    m.set_overrides("u1", {"max_streams": 5, "allow_transcode": 1,
+                           "max_bitrate_kbps": 12000})
+    policy = desired_policy(m.get("u1"))
+    assert policy["SimultaneousStreamLimit"] == 5
+    assert policy["RemoteClientBitrateLimit"] == 12_000_000
+    assert policy["EnableVideoPlaybackTranscoding"] is True
+
+
+def test_redeem_three_kinds(stack) -> None:
+    m = stack["members"]
+    redeem = stack["redeem"]
+    now = int(time.time())
+    m.upsert("u1", "alice", {"plan_id": "trial", "expires_at": now + 86400})
+    before = m.get("u1")["expires_at"]
+
+    extend = redeem.generate({"kind": "extend_days", "extend_days": 10, "count": 1})
+    out = redeem.redeem(extend["codes"][0]["id"], "u1")
+    assert out["kind"] == "extend_days"
+    assert m.get("u1")["expires_at"] >= before + 10 * 86400 - 2
+
+    plan_code = redeem.generate(
+        {"kind": "plan", "plan_id": "monthly", "count": 1})["codes"][0]["id"]
+    out = redeem.redeem(plan_code, "u1")
+    assert out["kind"] == "plan" and m.get("u1")["plan_id"] == "monthly"
+
+    traffic = redeem.generate(
+        {"kind": "add_traffic", "add_traffic_bytes": 50 * GIB, "count": 1})
+    out = redeem.redeem(traffic["codes"][0]["id"], "u1")
+    assert out["kind"] == "add_traffic"
+    assert m.get("u1")["overrides"]["extra_traffic_bytes"] == 50 * GIB
+
+
+def test_redeem_rejects_expired_exhausted_and_deleted(stack) -> None:
+    m = stack["members"]
+    redeem = stack["redeem"]
+    m.upsert("u1", "alice", {"plan_id": "monthly"})
+
+    expired = redeem.generate(
+        {"kind": "extend_days", "extend_days": 3, "count": 1})["codes"][0]
+    stack["db"].execute(
+        "UPDATE redeem_codes SET expires_at=? WHERE id=?",
+        (int(time.time()) - 10, expired["id"]))
+    with pytest.raises(ConfigError, match="过期"):
+        redeem.redeem(expired["id"], "u1")
+
+    limited = redeem.generate(
+        {"kind": "extend_days", "extend_days": 3, "max_uses": 1, "count": 1})
+    code = limited["codes"][0]["id"]
+    redeem.redeem(code, "u1")
+    with pytest.raises(ConfigError, match="用完"):
+        redeem.redeem(code, "u1")
+
+    doomed = redeem.generate(
+        {"kind": "extend_days", "extend_days": 3, "count": 1})["codes"][0]["id"]
+    redeem.delete(doomed)
+    with pytest.raises(ConfigError, match="不存在"):
+        redeem.redeem(doomed, "u1")
+
+
+def test_public_redeem_rejects_bad_credentials(stack) -> None:
+    m = stack["members"]
+    redeem = stack["redeem"]
+    m.upsert("u1", "demo-user-1", {"plan_id": "monthly"})
+    asyncio.run(stack["emby"].set_user_password("u1", "right-password"))
+    code = redeem.generate(
+        {"kind": "extend_days", "extend_days": 5, "count": 1})["codes"][0]["id"]
+    with pytest.raises(ConfigError, match="用户名或密码"):
+        asyncio.run(redeem.redeem_public(code, "demo-user-1", "wrong-password"))
+    ok = asyncio.run(redeem.redeem_public(code, "demo-user-1", "right-password"))
+    assert ok["ok"] is True
+
+
+def test_overrides_and_action_endpoints() -> None:
+    with TestClient(app) as client:
+        client.put("/api/members/u1", headers=_basic(),
+                   json={"plan_id": "monthly", "username": "demo-user-1"})
+        bad = client.put("/api/members/u1/overrides", headers=_basic(),
+                         json={"mystery": 1})
+        assert bad.status_code == 400
+
+        saved = client.put("/api/members/u1/overrides", headers=_basic(),
+                           json={"max_streams": 6}).json()
+        assert saved["effective"]["max_streams"] == 6
+        assert "max_streams" in saved["overridden_keys"]
+
+        detail = client.get("/api/members/u1?days=30", headers=_basic()).json()
+        assert "devices" in detail and "usage" in detail and "plays" in detail
+        assert detail["usage"]["days"] == 30
+
+        app.state.emby.set_sessions([{"Id": "s1", "UserId": "u1"}])
+        kicked = client.post("/api/members/u1/actions/kick", headers=_basic(),
+                             json={})
+        assert kicked.status_code == 200 and kicked.json()["stopped"] == 1
+
+        reset = client.post("/api/members/u1/actions/reset-password",
+                            headers=_basic(), json={"password": "secret123"})
+        assert reset.status_code == 200 and reset.json()["ok"] is True
+
+        app.state.members.register_device("u1", "phone", device_name="Phone")
+        blocked = client.post("/api/members/u1/devices/phone/block",
+                              headers=_basic(), json={"blocked": True})
+        assert blocked.status_code == 200 and blocked.json()["blocked"] is True
+        unblocked = client.post("/api/members/u1/devices/phone/unblock",
+                                headers=_basic())
+        assert unblocked.status_code == 200 and unblocked.json()["blocked"] is False
+
+        gen = client.post("/api/redeem-codes/generate", headers=_basic(),
+                          json={"kind": "extend_days", "extend_days": 7,
+                                "count": 1}).json()
+        code = gen["codes"][0]["id"]
+        used = client.post("/api/members/u1/redeem", headers=_basic(),
+                           json={"code": code})
+        assert used.status_code == 200 and used.json()["ok"] is True
+
+        listing = client.get("/api/redeem-codes", headers=_basic()).json()
+        assert "codes" in listing and "batches" in listing
+
+        page = client.get("/redeem")
+        assert page.status_code == 200 and "兑换续费码" in page.text
+
+        public_bad = client.post("/api/public/redeem",
+                                 json={"username": "demo-user-1",
+                                       "password": "nope-nope",
+                                       "code": "x" * 22})
+        assert public_bad.status_code == 422
+
+        audit = client.get("/api/audit?limit=10&offset=0", headers=_basic()).json()
+        assert "items" in audit and "total" in audit
