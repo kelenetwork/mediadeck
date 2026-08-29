@@ -229,6 +229,11 @@ class Database:
                 )
             self._ensure_column(
                 "members", "overrides_json", "TEXT NOT NULL DEFAULT '{}'")
+            # v0.14: groups replace plans; roles are additive job functions.
+            # Upgraded databases created the members table long before these
+            # columns existed, so they must be added here, not in SCHEMA.
+            self._ensure_column("members", "group_id", "TEXT")
+            self._ensure_column("members", "roles", "TEXT NOT NULL DEFAULT ''")
             self._conn.commit()
 
     def _ensure_column(self, table: str, name: str, ddl: str) -> None:
