@@ -626,8 +626,8 @@ def test_enroll_defaults_endpoint() -> None:
 def test_sessions_report_speed_not_bitrate() -> None:
     with TestClient(app) as client:
         sessions = client.get("/api/emby/sessions", headers=_basic()).json()
-        assert sessions and "SpeedMbps" in sessions[0]
-        assert "BitrateMbps" not in sessions[0]
+        assert sessions and "SpeedMBps" in sessions[0]
+        assert "BitrateMbps" not in sessions[0] and "SpeedSource" in sessions[0]
 
 
 def test_group_in_use_delete_is_http_422() -> None:
