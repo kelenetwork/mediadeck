@@ -1,16 +1,16 @@
 """Enforcement — project member state onto the Emby account.
 
-A plan is only a promise until something writes it into Emby.  This module is
-that something.  It maps every limit onto the Emby policy field that actually
-enforces it, so limits hold even when the panel is down:
+A group default is only a promise until something writes it into Emby.  This
+module is that something.  It maps every effective limit onto the Emby policy
+field that actually enforces it, so limits hold even when the panel is down:
 
-    max_streams      -> SimultaneousStreamLimit
-    max_bitrate_kbps -> RemoteClientBitrateLimit
-    allow_transcode  -> Enable{Video,Audio}PlaybackTranscoding + Remuxing
-    allow_download   -> EnableContentDownloading
-    allow_sync       -> EnableSyncTranscoding
-    libraries        -> EnableAllFolders / EnabledFolders
-    expired/exhausted-> IsDisabled
+    max_streams          -> SimultaneousStreamLimit
+    bandwidth_limit_kbps -> RemoteClientBitrateLimit (Emby's per-user
+                            remote *bandwidth* cap, bits/second)
+    allow_transcode      -> Enable{Video,Audio}PlaybackTranscoding + Remuxing
+    allow_download       -> EnableContentDownloading + sync conversion
+    libraries            -> EnableAllFolders / EnabledFolders
+    expired/exhausted    -> IsDisabled
 
 Three rules keep this safe on a server with hundreds of pre-existing accounts:
 
@@ -58,40 +58,41 @@ MANAGED_KEYS = (
 
 def desired_policy(member: dict[str, Any]) -> dict[str, Any]:
     """The Emby policy fields implied by this member's effective limits."""
-    plan = member.get("plan") or {}
+    group = member.get("group") or {}
     state = member.get("state", "active")
     blocked = state in BLOCKING_STATES
     effective = member.get("effective") or {}
 
     policy: dict[str, Any] = {"IsDisabled": blocked}
 
-    if not plan:
-        # Enrolled but no plan: manage nothing except the block flag, so an
-        # operator can park an account without inheriting arbitrary limits.
+    if not group:
+        # Enrolled but not grouped: manage nothing except the block flag, so
+        # an operator can park an account without inheriting limits.
         return policy
 
-    # Prefer the merged overlay; fall back to the plan so a caller that only
-    # passed the raw member+plan still produces the historical mapping.
-    streams = effective.get("max_streams", plan.get("max_streams") or 1)
-    bitrate = effective.get("max_bitrate_kbps", plan.get("max_bitrate_kbps") or 0)
-    transcode = effective.get("allow_transcode", plan.get("allow_transcode"))
-    download = effective.get("allow_download", plan.get("allow_download"))
-    sync = effective.get("allow_sync", plan.get("allow_sync"))
-    libraries = list(effective.get("libraries", plan.get("libraries") or []))
+    # Prefer the merged overlay; fall back to the group so a caller that only
+    # passed the raw member+group still produces the same mapping.
+    streams = effective.get("max_streams", group.get("max_streams") or 0)
+    bandwidth = effective.get(
+        "bandwidth_limit_kbps", group.get("bandwidth_limit_kbps") or 0)
+    transcode = effective.get("allow_transcode", group.get("allow_transcode"))
+    download = effective.get("allow_download", group.get("allow_download"))
+    libraries = list(effective.get("libraries") or [])
 
-    policy["SimultaneousStreamLimit"] = int(streams or 1)
-    # Emby treats 0 as "no limit" for bitrate, which matches our convention.
-    policy["RemoteClientBitrateLimit"] = int(bitrate or 0) * 1000
+    # Emby treats 0 as "no limit" for both fields, matching our convention.
+    policy["SimultaneousStreamLimit"] = int(streams or 0)
+    policy["RemoteClientBitrateLimit"] = int(bandwidth or 0) * 1000
 
     transcode = bool(transcode)
     policy["EnableVideoPlaybackTranscoding"] = transcode
     policy["EnableAudioPlaybackTranscoding"] = transcode
     policy["EnablePlaybackRemuxing"] = transcode
 
-    policy["EnableContentDownloading"] = bool(download)
-    sync = bool(sync)
-    policy["EnableSyncTranscoding"] = sync
-    policy["EnableMediaConversion"] = sync
+    download = bool(download)
+    policy["EnableContentDownloading"] = download
+    # Offline sync is part of the download permission in the group model.
+    policy["EnableSyncTranscoding"] = download
+    policy["EnableMediaConversion"] = download
 
     if libraries:
         policy["EnableAllFolders"] = False
@@ -173,7 +174,7 @@ class EnforcementService:
                 "user_id": uid,
                 "username": member.get("username"),
                 "state": member.get("state"),
-                "plan": member.get("plan_name"),
+                "group": member.get("group_name"),
                 "changes": diff,
             })
 

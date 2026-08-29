@@ -11,11 +11,9 @@ const NAV = [
     { id: 'dashboard', icon: '▦', label: '仪表盘', sub: '集中查看系统运行、播放使用和待处理事项' },
   ]},
   { group: '运营', items: [
-    { id: 'members', icon: '☺', label: '用户管理', sub: '套餐、流量、到期与设备' },
-    { id: 'plans', icon: '▣', label: '套餐管理', sub: '用户组、计费方式与限制' },
-    { id: 'invites', icon: '✦', label: '邀请码', sub: '发码开通与用量追踪' },
-    { id: 'redeem', icon: '♻', label: '续费码', sub: '延期、换套餐与流量补充' },
-    { id: 'stats', icon: '📈', label: '运营统计', sub: '流量、时长、热门内容与收入' },
+    { id: 'members', icon: '☺', label: '用户管理', sub: '用户组、角色、流量与设备' },
+    { id: 'groups', icon: '▣', label: '用户组', sub: '计费模式与默认限制' },
+    { id: 'stats', icon: '📈', label: '运营统计', sub: '流量、时长与热门内容' },
     { id: 'audit', icon: '☰', label: '审计日志', sub: '操作记录与变更追踪' },
   ]},
   { group: '工作台', items: [
@@ -233,23 +231,22 @@ PAGES.dashboard = async () => {
   const limited = (d.quota || []).filter((q) => q.state !== 'ok').length;
   const alerts = d.alerts || [];
   const mem = (overview && overview.members) || {};
-  const rev = (overview && overview.revenue) || {};
   const expiring = (overview && overview.expiring_7d) || [];
   const exhaustedN = mem.exhausted || 0;
 
   $('#view').innerHTML = `
     <div class="stat-grid">
       ${stat('☺', mem.total || 0, '成员', `${mem.active || 0} 正常 · ${mem.expired || 0} 过期`)}
-      ${stat('¥', overview ? fmtMoney(rev.mrr_cents, rev.currency) : '-', '月经常性收入', '按套餐折算')}
       ${stat('⛁', `${online} / ${nodes.length}`, '在线节点', nodes.length ? '推流节点健康状态' : '尚未配置节点')}
       ${stat('▶', sessions.length, '当前播放', sessions.length ? '正在进行的会话' : '暂无活跃会话')}
       ${stat('⇄', queued, '管线待处理', pipe.available ? '整理与上传队列' : '快照不可用')}
       ${stat('⚠', alerts.length + limited + expiring.length + exhaustedN, '待处理事项', limited ? `${limited} 个上传身份受限` : '系统关键状态')}
     </div>
     <div class="grid-2">
-      ${tableCard('当前播放', '实时会话', ['用户', '客户端', '方式', '码率'],
+      ${tableCard('当前播放', '实时会话 · 按采样窗口计算', ['用户', '客户端', '方式', '实时带宽'],
         sessions.map((s) => `<tr><td>${esc(s.UserName)}</td><td>${esc(s.Client)}</td>
-          <td>${esc(s.PlayMethod)}</td><td>${esc(s.BitrateMbps)} Mbps</td></tr>`).join(''))}
+          <td>${esc(s.PlayMethod)}${s.Paused ? ' · 已暂停' : ''}</td>
+          <td>${s.Paused ? '<span class="muted">0 Mbps</span>' : esc(s.SpeedMbps || 0) + ' Mbps'}</td></tr>`).join(''))}
       ${tableCard('管线队列', pipe.available ? `快照 ${Math.round(pipe.snapshot_age_seconds)}s 前` : '快照不可用',
         ['队列', '条目', '体积', '最老'],
         queues.map((q) => `<tr><td>${esc(q.name)}</td><td>${q.items}</td>
@@ -269,9 +266,9 @@ PAGES.dashboard = async () => {
           : `<div class="empty">当前没有待处理事项</div>`)}
     </div>
     <div class="grid-2">
-      ${tableCard('即将到期', '7 天内 · 点用户名进入用户管理', ['用户', '套餐', '剩余'],
+      ${tableCard('即将到期', '7 天内 · 点用户名进入用户管理', ['用户', '用户组', '剩余'],
         expiring.map((m) => `<tr><td><a href="#/members">${esc(m.username)}</a></td>
-          <td>${esc(m.plan)}</td><td class="${m.days_left <= 1 ? 'danger-text' : ''}">${esc(m.days_left)} 天</td></tr>`).join(''))}
+          <td>${esc(m.group || '-')}</td><td class="${m.days_left <= 1 ? 'danger-text' : ''}">${esc(m.days_left)} 天</td></tr>`).join(''))}
       ${card('超额 / 过期', '需要处理的账号',
         (mem.exhausted || mem.expired)
           ? `<div class="card-body"><a href="#/members">超额 ${esc(mem.exhausted || 0)} · 过期 ${esc(mem.expired || 0)} · 停用 ${esc(mem.suspended || 0)}</a></div>`
@@ -1072,7 +1069,7 @@ function isEditing() {
 }
 
 /* ---------------- boot ---------------- */
-/* ops.js registers PAGES.members/plans/invites/redeem/stats/storage/audit and then
+/* ops.js registers PAGES.members/groups/stats/storage/audit and then
    calls bootPanel(). Starting here would paint those NAV entries as 页面不存在. */
 function bootPanel() {
   if (bootPanel.done) return;

@@ -353,15 +353,13 @@ class LiveEmby:
                 item = session.get("NowPlayingItem")
                 if not item:
                     continue
-                transcoding = session.get("TranscodingInfo") or {}
-                bitrate = transcoding.get("Bitrate") or item.get("Bitrate") or 0
                 out.append({
+                    "Id": session.get("Id"),
                     "UserId": session.get("UserId"),
                     "UserName": session.get("UserName"),
                     "Client": session.get("Client"),
                     "DeviceName": session.get("DeviceName"),
                     "PlayMethod": (session.get("PlayState") or {}).get("PlayMethod"),
-                    "BitrateMbps": round(bitrate / 1e6, 1),
                     "Item": item.get("Name"),
                     "SeriesName": item.get("SeriesName"),
                     "Paused": bool((session.get("PlayState") or {}).get("IsPaused")),

@@ -175,6 +175,7 @@ class UsageSampler:
             delta = now - float(state["last_ts"])
             state["last_ts"] = now
             if not playing:
+                state["speed_bps"] = 0
                 continue
             if delta <= 0:
                 continue
@@ -186,6 +187,9 @@ class UsageSampler:
             chunk = int(rate / 8 * delta)
             state["seconds"] = float(state["seconds"]) + delta
             state["bytes"] = int(state["bytes"]) + chunk
+            # Bytes/second over the last sampled window: what the dashboard
+            # shows as the session's live bandwidth.
+            state["speed_bps"] = int(chunk / delta) if delta else 0
             if session.get("TranscodingInfo"):
                 state["transcoded"] = True
             if node_of:
@@ -233,6 +237,11 @@ class UsageSampler:
                     "UPDATE members SET traffic_used_bytes=traffic_used_bytes+?,"
                     "last_seen_at=? WHERE emby_user_id=?",
                     (chunk, int(now), user_id))
+
+    def live_speeds(self) -> dict[str, int]:
+        """session id -> bytes/second over the last sample window."""
+        return {sid: int(s.get("speed_bps") or 0)
+                for sid, s in self._live.items()}
 
     def _finish(self, sid: str, state: dict[str, Any], now: float) -> None:
         seconds = int(state.get("seconds") or 0)

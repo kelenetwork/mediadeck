@@ -25,7 +25,30 @@ from typing import Any
 SCHEMA_VERSION = 1
 
 SCHEMA = """
+-- A group is the operator's billing/limit preset for a class of accounts.
+-- Not a product: nothing is bought. billing_mode arms the meters (time /
+-- traffic / both / none); limits are defaults every member inherits and may
+-- override field-by-field.
+CREATE TABLE IF NOT EXISTS groups (
+    id                   TEXT PRIMARY KEY,
+    name                 TEXT NOT NULL,
+    description          TEXT NOT NULL DEFAULT '',
+    billing_mode         TEXT NOT NULL DEFAULT 'both',
+    duration_days        INTEGER NOT NULL DEFAULT 30,
+    traffic_quota_bytes  INTEGER NOT NULL DEFAULT 0,
+    bandwidth_limit_kbps INTEGER NOT NULL DEFAULT 0,
+    max_streams          INTEGER NOT NULL DEFAULT 2,
+    max_devices          INTEGER NOT NULL DEFAULT 0,
+    allow_download       INTEGER NOT NULL DEFAULT 0,
+    allow_transcode      INTEGER NOT NULL DEFAULT 1,
+    is_default           INTEGER NOT NULL DEFAULT 0,
+    created_at           INTEGER NOT NULL,
+    updated_at           INTEGER NOT NULL
+);
+
 -- A plan is a template: the limits and billing rules a member inherits.
+-- DEPRECATED (v0.14): superseded by groups; kept so existing rows survive a
+-- downgrade and so old audit references stay resolvable.
 CREATE TABLE IF NOT EXISTS plans (
     id                  TEXT PRIMARY KEY,
     name                TEXT NOT NULL,
@@ -70,10 +93,16 @@ CREATE TABLE IF NOT EXISTS members (
     -- on every pass.
     applied_fingerprint TEXT NOT NULL DEFAULT '',
     applied_at          INTEGER,
-    -- Per-member permission overlay. Missing keys inherit the plan; '{}' means
-    -- fully inherited. Validated in members.py, never trusted as raw input.
-    overrides_json      TEXT NOT NULL DEFAULT '{}'
+    -- Per-member permission overlay. Missing keys inherit the group; '{}'
+    -- means fully inherited. Validated in members.py, never trusted as raw
+    -- input.
+    overrides_json      TEXT NOT NULL DEFAULT '{}',
+    -- v0.14: group replaces plan; roles are additive job functions
+    -- (comma-separated: admin, uploader).
+    group_id            TEXT,
+    roles               TEXT NOT NULL DEFAULT ''
 );
+CREATE INDEX IF NOT EXISTS idx_members_group ON members(group_id);
 CREATE INDEX IF NOT EXISTS idx_members_plan ON members(plan_id);
 CREATE INDEX IF NOT EXISTS idx_members_status ON members(status);
 
@@ -145,39 +174,9 @@ CREATE TABLE IF NOT EXISTS audit_log (
 );
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts);
 CREATE INDEX IF NOT EXISTS idx_audit_subject ON audit_log(subject);
-
--- Invitation codes: how a new member is created without the operator handing
--- out passwords by hand.
-CREATE TABLE IF NOT EXISTS invites (
-    code            TEXT PRIMARY KEY,
-    plan_id         TEXT NOT NULL,
-    created_at      INTEGER NOT NULL,
-    expires_at      INTEGER,
-    max_uses        INTEGER NOT NULL DEFAULT 1,
-    used_count      INTEGER NOT NULL DEFAULT 0,
-    note            TEXT NOT NULL DEFAULT '',
-    created_by      TEXT NOT NULL DEFAULT '',
-    revoked         INTEGER NOT NULL DEFAULT 0
-);
-
--- Renewal / top-up codes. Distinct from invites: invites create accounts,
--- these mutate an existing member (switch plan, extend days, add traffic).
-CREATE TABLE IF NOT EXISTS redeem_codes (
-    id                  TEXT PRIMARY KEY,
-    batch_id            TEXT NOT NULL,
-    kind                TEXT NOT NULL,
-    plan_id             TEXT,
-    extend_days         INTEGER NOT NULL DEFAULT 0,
-    add_traffic_bytes   INTEGER NOT NULL DEFAULT 0,
-    max_uses            INTEGER NOT NULL DEFAULT 1,
-    used_count          INTEGER NOT NULL DEFAULT 0,
-    expires_at          INTEGER,
-    created_at          INTEGER NOT NULL,
-    created_by          TEXT NOT NULL DEFAULT '',
-    note                TEXT NOT NULL DEFAULT ''
-);
-CREATE INDEX IF NOT EXISTS idx_redeem_batch ON redeem_codes(batch_id);
-CREATE INDEX IF NOT EXISTS idx_redeem_kind ON redeem_codes(kind);
+-- Invite and redeem-code tables from v0.13 were dropped in v0.14 (owner
+-- decision 2026-08-30): accounts are operator-created, codes are gone.
+-- Existing rows in old databases are left in place but never read.
 
 CREATE TABLE IF NOT EXISTS redeem_log (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,

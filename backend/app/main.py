@@ -13,6 +13,7 @@ import httpx
 from fastapi import Body, Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.responses import (
     FileResponse,
+    HTMLResponse,
     JSONResponse,
     PlainTextResponse,
     RedirectResponse,
@@ -30,20 +31,18 @@ from app.core.errors import ConfigError, ConflictError, NotConfigured, UpstreamE
 from app.core.store import SettingsStore
 from app.modules.enforcement import EnforcementService
 from app.modules.events import EventStream, safe_stream
+from app.modules.groups import GroupService
 from app.modules.imagecache import ALLOWED_IMAGE_TYPES, ImageCache
 from app.modules.imports import ImportManager, JobKind, MockExecutor
-from app.modules.invites import InviteService, random_password
-from app.modules.members import MemberService
+from app.modules.members import MemberService, random_password
 from app.modules.mounts import MockMounts, MountsReader
 from app.modules.pipeline import MockPipeline, PipelineReader
-from app.modules.plans import PlanService
 from app.modules.playback import PlaybackRouter, caller_token
 from app.modules.provisioning import (
     emby_frontend_snippet,
     enroll_command,
     install_script,
 )
-from app.modules.redeem import RedeemService
 from app.modules.scheduler import Scheduler
 from app.modules.settings import SettingsService
 from app.modules.stats import StatsService
@@ -56,13 +55,52 @@ app = FastAPI(title="mediadeck", version="0.1.0")
 security = HTTPBasic()
 
 
-def _auth(credentials: HTTPBasicCredentials = Depends(security)) -> str:  # noqa: B008
+async def _auth(credentials: HTTPBasicCredentials = Depends(security)) -> str:  # noqa: B008
     cfg = settings()
     user_ok = secrets.compare_digest(credentials.username, cfg.mediadeck_admin_user)
     pass_ok = secrets.compare_digest(credentials.password, cfg.mediadeck_admin_password)
-    if not (user_ok and pass_ok):
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, headers={"WWW-Authenticate": "Basic"})
-    return credentials.username
+    if user_ok and pass_ok:
+        return credentials.username
+    # Members holding the admin *role* may operate the panel with their Emby
+    # credentials (owner decision 2026-08-30). The role check runs first and
+    # reads only our own DB, so a random visitor cannot use the panel login
+    # form to brute-force Emby passwords of non-admin accounts.
+    member_user = await _role_admin_auth(credentials.username, credentials.password)
+    if member_user:
+        return member_user
+    raise HTTPException(status.HTTP_401_UNAUTHORIZED, headers={"WWW-Authenticate": "Basic"})
+
+
+async def _role_admin_auth(username: str, password: str) -> str | None:
+    members = getattr(app.state, "members", None)
+    emby = getattr(app.state, "emby", None)
+    if not members or not emby or not username or not password:
+        return None
+    candidates = [m for m in members.list(role="admin", limit=200)
+                  if (m.get("username") or "").lower() == username.lower()
+                  and m.get("state") == "active"]
+    if not candidates:
+        return None
+    # Positive results are cached briefly so every API call in a browsing
+    # session does not become an Emby authentication round-trip.
+    cache_key = f"panelauth:{username}"
+    entry = app.state.cache.get(cache_key) if hasattr(app.state, "cache") else None
+    if entry and secrets.compare_digest(entry, _digest(password)):
+        return username
+    try:
+        user = await emby.authenticate_user(username, password)
+    except Exception:  # noqa: BLE001 - Emby down must read as 401, not 500
+        return None
+    if not user or str(user.get("Id")) != str(candidates[0]["emby_user_id"]):
+        return None
+    if hasattr(app.state, "cache"):
+        app.state.cache.set(cache_key, _digest(password), ttl=300)
+    return username
+
+
+def _digest(secret_text: str) -> str:
+    import hashlib
+    return hashlib.sha256(secret_text.encode()).hexdigest()
 
 
 def _storage_call(fn: Any, *args: Any, **kwargs: Any) -> Any:
@@ -159,15 +197,11 @@ async def _startup() -> None:
     # accounting appends continuously and has to answer aggregate questions,
     # which a rewritten-in-full document cannot do safely.
     app.state.db = Database(cfg.data_dir / "mediadeck.db")
-    app.state.plans = PlanService(app.state.db)
-    app.state.plans.seed_defaults()
-    app.state.members = MemberService(app.state.db, app.state.plans)
+    app.state.groups = GroupService(app.state.db)
+    app.state.groups.seed_defaults()
+    app.state.members = MemberService(app.state.db, app.state.groups)
     app.state.enforcement = EnforcementService(
         app.state.db, app.state.members, app.state.emby)
-    app.state.invites = InviteService(
-        app.state.db, app.state.plans, app.state.members, app.state.emby)
-    app.state.redeem = RedeemService(
-        app.state.db, app.state.plans, app.state.members, app.state.emby)
     app.state.stats = StatsService(app.state.db)
     app.state.usage = UsageSampler(
         app.state.db, app.state.members, app.state.emby, app.state.enforcement)
@@ -272,20 +306,18 @@ async def whoami() -> dict[str, str]:
 
 
 @app.get("/", include_in_schema=False)
-async def root(_: str = Depends(_auth)) -> FileResponse:
-    return FileResponse(STATIC_DIR / "index.html")
-
-
-@app.get("/invite/{code}", include_in_schema=False)
-async def invite_page(code: str) -> FileResponse:
-    """Public redeem page: no admin session, the code is the credential."""
-    return FileResponse(STATIC_DIR / "invite.html")
-
-
-@app.get("/redeem", include_in_schema=False)
-async def redeem_page() -> FileResponse:
-    """Public renewal-code page: the member authenticates with Emby credentials."""
-    return FileResponse(STATIC_DIR / "redeem.html")
+async def root(_: str = Depends(_auth)) -> HTMLResponse:
+    # Cache-busting: stamp static asset URLs with the deployed commit so a
+    # release is visible on the next reload without a forced refresh.
+    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    try:
+        ver = str(app.state.updater.version().get("commit") or "")
+    except Exception:  # noqa: BLE001 - version stamping must never break the page
+        ver = ""
+    if ver:
+        for asset in ("app.css", "app.js", "ops.js"):
+            html = html.replace(f"/static/{asset}", f"/static/{asset}?v={ver}")
+    return HTMLResponse(html)
 
 
 @app.get("/healthz")
@@ -828,9 +860,19 @@ async def emby_libraries() -> list[dict[str, Any]]:
 async def emby_sessions() -> list[dict[str, Any]]:
     # Short TTL: sessions must still feel live, but a 30s auto-refresh plus
     # page switches should not hammer Emby.
-    return await app.state.cache.resolve(
+    sessions = await app.state.cache.resolve(
         "emby:sessions", app.state.emby.active_sessions, ttl=5
     )
+    # Live bandwidth comes from the usage sampler (bytes actually billed over
+    # the last sample window), not from media bitrate: the dashboard shows
+    # what the wire carries, and a paused session shows 0.
+    speeds = app.state.usage.live_speeds()
+    out = []
+    for s in sessions:
+        s = dict(s)
+        s["SpeedMbps"] = round(speeds.get(str(s.get("Id") or ""), 0) * 8 / 1e6, 1)
+        out.append(s)
+    return out
 
 
 @app.post("/api/emby/users", dependencies=[Depends(_auth)])
@@ -872,38 +914,40 @@ async def emby_apply_policy(user_id: str, policy: dict[str, Any] = Body(...)) ->
     return {"ok": True}
 
 
-# ---- plans -----------------------------------------------------------------
-@app.get("/api/plans", dependencies=[Depends(_auth)])
-async def plans_list() -> list[dict[str, Any]]:
-    return app.state.plans.list()
+# ---- user groups -----------------------------------------------------------
+@app.get("/api/groups", dependencies=[Depends(_auth)])
+async def groups_list() -> list[dict[str, Any]]:
+    return app.state.groups.list()
 
 
-@app.post("/api/plans", dependencies=[Depends(_auth)])
-async def plans_create(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:  # noqa: B008
-    return app.state.plans.create(payload)
+@app.post("/api/groups", dependencies=[Depends(_auth)])
+async def groups_create(payload: dict[str, Any] = Body(...),  # noqa: B008
+                        user: str = Depends(_auth)) -> dict[str, Any]:
+    group = app.state.groups.create(payload)
+    app.state.members.audit(user, "group.create", group["id"], group["name"])
+    return group
 
 
-@app.put("/api/plans/{plan_id}", dependencies=[Depends(_auth)])
-async def plans_update(plan_id: str, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:  # noqa: B008
-    try:
-        return app.state.plans.update(plan_id, payload)
-    except KeyError:
-        raise HTTPException(404, "unknown plan") from None
+@app.put("/api/groups/{group_id}", dependencies=[Depends(_auth)])
+async def groups_update(group_id: str, payload: dict[str, Any] = Body(...),  # noqa: B008
+                        user: str = Depends(_auth)) -> dict[str, Any]:
+    group = app.state.groups.update(group_id, payload)
+    app.state.members.audit(user, "group.update", group_id, group["name"])
+    return group
 
 
-@app.delete("/api/plans/{plan_id}", dependencies=[Depends(_auth)])
-async def plans_delete(plan_id: str) -> dict[str, bool]:
-    try:
-        app.state.plans.delete(plan_id)
-    except KeyError:
-        raise HTTPException(404, "unknown plan") from None
+@app.delete("/api/groups/{group_id}", dependencies=[Depends(_auth)])
+async def groups_delete(group_id: str, user: str = Depends(_auth)) -> dict[str, bool]:
+    app.state.groups.delete(group_id)
+    app.state.members.audit(user, "group.delete", group_id)
     return {"deleted": True}
 
 
 # ---- members ---------------------------------------------------------------
 @app.get("/api/members", dependencies=[Depends(_auth)])
-async def members_list(status: str | None = None, plan_id: str | None = None,
-                       search: str | None = None, limit: int = 500) -> dict[str, Any]:
+async def members_list(status: str | None = None, group_id: str | None = None,
+                       role: str | None = None, search: str | None = None,
+                       limit: int = 500) -> dict[str, Any]:
     """Members plus the Emby accounts that are not enrolled yet.
 
     Showing both in one payload is deliberate: the operator needs to see who is
@@ -911,8 +955,8 @@ async def members_list(status: str | None = None, plan_id: str | None = None,
     silently.
     """
     limit = max(1, min(int(limit or 500), 5000))
-    members = app.state.members.list(status=status, plan_id=plan_id,
-                                     search=search, limit=limit)
+    members = app.state.members.list(status=status, group_id=group_id,
+                                     role=role, search=search, limit=limit)
     truncated = len(members) >= limit
     known = {m["emby_user_id"] for m in members}
     unmanaged: list[dict[str, Any]] = []
@@ -937,6 +981,24 @@ async def members_list(status: str | None = None, plan_id: str | None = None,
     return {"members": members, "unmanaged": unmanaged[:500],
             "unmanaged_total": len(unmanaged), "truncated": truncated,
             "limit": limit}
+
+
+@app.post("/api/members/enroll-defaults", dependencies=[Depends(_auth)])
+async def members_enroll_defaults(user: str = Depends(_auth)) -> dict[str, Any]:
+    """Put every unmanaged, non-admin Emby account into the default group."""
+    users = [u for u in await app.state.emby.list_users()
+             if not (u.get("Policy") or {}).get("IsAdministrator")]
+    enrolled = app.state.members.enroll_defaults(users, actor=user)
+    return {"enrolled": enrolled}
+
+
+@app.post("/api/members/{user_id}/roles", dependencies=[Depends(_auth)])
+async def members_roles(user_id: str, payload: dict[str, Any] = Body(...),  # noqa: B008
+                        user: str = Depends(_auth)) -> dict[str, Any]:
+    try:
+        return app.state.members.set_roles(user_id, payload.get("roles"), actor=user)
+    except KeyError:
+        raise HTTPException(404, "unknown member") from None
 
 
 @app.get("/api/members/{user_id}", dependencies=[Depends(_auth)])
@@ -1176,66 +1238,6 @@ async def enforcement_apply(payload: dict[str, Any] = Body(default={}),  # noqa:
     return result
 
 
-# ---- invites ---------------------------------------------------------------
-@app.get("/api/invites", dependencies=[Depends(_auth)])
-async def invites_list() -> list[dict[str, Any]]:
-    return app.state.invites.list()
-
-
-@app.post("/api/invites", dependencies=[Depends(_auth)])
-async def invites_create(payload: dict[str, Any] = Body(...),  # noqa: B008
-                         user: str = Depends(_auth)) -> list[dict[str, Any]]:
-    return app.state.invites.create(
-        plan_id=str(payload.get("plan_id") or ""),
-        max_uses=payload.get("max_uses", 1),
-        valid_days=payload.get("valid_days", 7),
-        note=str(payload.get("note") or ""),
-        count=payload.get("count", 1),
-        actor=user,
-    )
-
-
-@app.post("/api/invites/{code}/revoke", dependencies=[Depends(_auth)])
-async def invites_revoke(code: str, user: str = Depends(_auth)) -> dict[str, bool]:
-    try:
-        app.state.invites.revoke(code, actor=user)
-    except KeyError:
-        raise HTTPException(404, "unknown code") from None
-    return {"revoked": True}
-
-
-@app.delete("/api/invites/{code}", dependencies=[Depends(_auth)])
-async def invites_delete(code: str, user: str = Depends(_auth)) -> dict[str, bool]:
-    try:
-        app.state.invites.delete(code, actor=user)
-    except KeyError:
-        raise HTTPException(404, "unknown code") from None
-    return {"deleted": True}
-
-
-@app.get("/api/invite/{code}", include_in_schema=False)
-async def invite_preview(code: str, request: Request) -> dict[str, Any]:
-    """Public: lets an invitee see what they are about to get before signing up."""
-    app.state.invites.check_rate(code, request.client.host if request.client else "")
-    return app.state.invites.preview(code)
-
-
-@app.post("/api/invite/{code}/redeem", include_in_schema=False)
-async def invite_redeem(code: str, request: Request,
-                        payload: dict[str, Any] = Body(...)) -> dict[str, Any]:  # noqa: B008
-    """Public by necessity: the invitee has no panel account yet.
-
-    The code itself is the credential, and it is single-use by default.
-    """
-    app.state.invites.check_rate(code, request.client.host if request.client else "")
-    return await app.state.invites.redeem(
-        code,
-        str(payload.get("username") or ""),
-        str(payload.get("password") or ""),
-        enforcement=app.state.enforcement,
-    )
-
-
 # ---- statistics ------------------------------------------------------------
 @app.get("/api/stats/overview", dependencies=[Depends(_auth)])
 async def stats_overview(days: int = 30) -> dict[str, Any]:
@@ -1287,68 +1289,6 @@ async def audit_log(limit: int = 100, offset: int = 0, subject: str | None = Non
         "total": total,
         "limit": limit,
         "offset": offset,
-    }
-
-
-# ---- redeem codes ----------------------------------------------------------
-@app.post("/api/redeem-codes/generate", dependencies=[Depends(_auth)])
-async def redeem_generate(payload: dict[str, Any] = Body(...),  # noqa: B008
-                          user: str = Depends(_auth)) -> dict[str, Any]:
-    return app.state.redeem.generate(payload, actor=user)
-
-
-@app.get("/api/redeem-codes", dependencies=[Depends(_auth)])
-async def redeem_list(batch_id: str | None = None, status: str | None = None,
-                      limit: int = 500) -> dict[str, Any]:
-    return {
-        "codes": app.state.redeem.list(batch_id=batch_id, status=status, limit=limit),
-        "batches": app.state.redeem.batches(),
-        "logs": app.state.redeem.logs(limit=200),
-    }
-
-
-@app.delete("/api/redeem-codes/{code}", dependencies=[Depends(_auth)])
-async def redeem_delete(code: str, user: str = Depends(_auth)) -> dict[str, bool]:
-    try:
-        app.state.redeem.delete(code, actor=user)
-    except KeyError:
-        raise HTTPException(404, "unknown code") from None
-    return {"deleted": True}
-
-
-@app.post("/api/members/{user_id}/redeem", dependencies=[Depends(_auth)])
-async def members_redeem(user_id: str, payload: dict[str, Any] = Body(...),  # noqa: B008
-                         user: str = Depends(_auth)) -> dict[str, Any]:
-    result = app.state.redeem.redeem(
-        str(payload.get("code") or ""), user_id, actor=user)
-    if app.state.settings_service.membership_config()["enforcement_enabled"]:
-        with contextlib.suppress(Exception):
-            await app.state.enforcement.enforce_now(user_id, "redeem")
-    return result
-
-
-@app.post("/api/public/redeem", include_in_schema=False)
-async def public_redeem(request: Request,
-                        payload: dict[str, Any] = Body(...)) -> dict[str, Any]:  # noqa: B008
-    """Public: a member proves they own the Emby account, then consumes a code."""
-    app.state.redeem.check_rate(request.client.host if request.client else "")
-    result = await app.state.redeem.redeem_public(
-        str(payload.get("code") or ""),
-        str(payload.get("username") or ""),
-        str(payload.get("password") or ""),
-        actor="public",
-    )
-    member = result.get("member") or {}
-    user_id = member.get("emby_user_id")
-    if user_id and app.state.settings_service.membership_config()["enforcement_enabled"]:
-        with contextlib.suppress(Exception):
-            await app.state.enforcement.enforce_now(user_id, "public redeem")
-    # Do not echo the full member record to an unauthenticated caller.
-    return {
-        "ok": True,
-        "kind": result.get("kind"),
-        "result": result.get("result"),
-        "username": member.get("username"),
     }
 
 
