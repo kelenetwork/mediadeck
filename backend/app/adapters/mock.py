@@ -88,6 +88,17 @@ class MockEmby:
         # Mirrors the live adapter: only a non-empty token is ever accepted.
         return bool((token or "").strip()) and token != "invalid-token"
 
+    async def user_for_token(self, token: str) -> str | None:
+        """Deterministic mock: "tok:<uid>" resolves to that user, anything
+        else non-empty resolves to u1 so existing playback tests keep working."""
+        token = (token or "").strip()
+        if not token or token == "invalid-token":
+            return None
+        if token.startswith("tok:"):
+            uid = token[4:]
+            return uid if uid in self._users else None
+        return "u1"
+
     async def item_media_paths(self, item_id: str) -> dict[str, str]:
         if item_id == "unknown":
             return {}

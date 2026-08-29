@@ -55,10 +55,13 @@ def nginx_site(node: Any) -> str:
 
     if secret:
         secure = f"""
-    # Signed URLs. The panel generates ?{node.sign_arg_expires}=&{node.sign_arg_digest}=;
-    # digest = md5("<expires><decoded-uri> <secret>") — must match the panel.
+    # Signed URLs. The panel generates ?r=&u=&{node.sign_arg_expires}=&{node.sign_arg_digest}=;
+    # digest = md5("<expires><decoded-uri><r><u> <secret>") — must match the panel.
+    # r/u sit inside the digest, so a client cannot edit its own rate cap or
+    # identity off the URL. Legacy links without r/u still verify: empty args
+    # reduce the string to the old form.
     secure_link $arg_{node.sign_arg_digest},$arg_{node.sign_arg_expires};
-    secure_link_md5 "$secure_link_expires$uri {secret}";
+    secure_link_md5 "$secure_link_expires$uri$arg_r$arg_u {secret}";
 """
         guard = """
         if ($secure_link = "")  { return 403; }   # bad or missing signature
@@ -80,6 +83,17 @@ def nginx_site(node: Any) -> str:
     location {str(pool.url_prefix).rstrip('/')}/ {{{guard}
         alias {node_path}/;
 
+        # Per-user bandwidth cap, taken from the *signed* r argument
+        # (bytes/second, 0 = uncapped). Enforced per connection, so the
+        # burst window must stay small: every seek opens a new connection
+        # and a large limit_rate_after would hand each one a free sprint.
+        limit_conn mediadeck_perip 8;
+        limit_rate_after 2m;
+        limit_rate $mediadeck_rate;
+
+        # Real transfer bytes per user for the panel's live-speed display.
+        access_log /var/log/nginx/mediadeck-speed.log mediadeck_speed;
+
         # Emby clients seek constantly; byte ranges are mandatory.
         add_header Accept-Ranges bytes;
         add_header X-Mediadeck-Node "{node.name}" always;
@@ -89,6 +103,22 @@ def nginx_site(node: Any) -> str:
 
     return f"""# /etc/nginx/sites-available/mediadeck-{node.name}
 # Media delivery for streaming node "{node.name}". Managed by mediadeck.
+
+# Effective per-connection rate. The signed r argument is the member's cap in
+# bytes/second; "0" means the operator chose uncapped. A link with no r at all
+# predates the rate rollout and gets a conservative safety cap instead.
+map $arg_r $mediadeck_rate {{
+    ""      15728640;
+    default $arg_r;
+}}
+
+# One line per completed request: unix-time, anonymised user tag, bytes,
+# request seconds. The loadprobe agent tails this to report real per-user
+# wire speed; tags are hashes, so the log never names an account.
+log_format mediadeck_speed '$msec $arg_u $bytes_sent $request_time';
+
+limit_conn_zone $binary_remote_addr zone=mediadeck_perip:10m;
+
 server {{
     listen 80;
     listen [::]:80;

@@ -564,12 +564,37 @@ def test_signing_digest_matches_nginx_and_survives_cjk() -> None:
     url = sign_url("https://n.test", "/s/main/TV/My Show/第01集.mkv",
                    "s3cr3t", 600, arg_digest="k", arg_expires="e", now=1000)
     assert "e=1600" in url and "k=" in url
+    assert "r=0" in url and "u=" in url            # rate/tag ride in the URL
     assert "%E7%AC%AC01" in url                    # url-encoded in the URL...
-    digest = compute_digest("/s/main/TV/My Show/第01集.mkv", 1600, "s3cr3t")
+    digest = compute_digest("/s/main/TV/My Show/第01集.mkv", 1600, "s3cr3t",
+                            rate_bps=0, utag="")
     assert f"k={digest}" in url                    # ...but digest over decoded
-    assert verify("/s/main/TV/My Show/第01集.mkv", digest, 1600, "s3cr3t", now=1000)
-    assert not verify("/s/main/TV/My Show/第01集.mkv", digest, 1600, "s3cr3t", now=2000)
-    assert not verify("/other.mkv", digest, 1600, "s3cr3t", now=1000)
+    assert verify("/s/main/TV/My Show/第01集.mkv", digest, 1600, "s3cr3t",
+                  now=1000, rate_bps=0, utag="")
+    assert not verify("/s/main/TV/My Show/第01集.mkv", digest, 1600, "s3cr3t",
+                      now=2000, rate_bps=0, utag="")
+    assert not verify("/other.mkv", digest, 1600, "s3cr3t", now=1000,
+                      rate_bps=0, utag="")
+
+
+def test_signing_rate_is_tamper_proof_and_legacy_links_still_verify() -> None:
+    from app.modules.signing import compute_digest, sign_url, verify
+    path = "/s/main/Movies/Demo.mkv"
+    url = sign_url("https://n.test", path, "s3cr3t", 600, now=1000,
+                   rate_bps=2_500_000, utag="ab12cd34ef")
+    assert "r=2500000" in url and "u=ab12cd34ef" in url
+    signed = compute_digest(path, 1600, "s3cr3t",
+                            rate_bps=2_500_000, utag="ab12cd34ef")
+    # Editing the rate off (or up) breaks the signature — nginx would 403.
+    assert verify(path, signed, 1600, "s3cr3t", now=1000,
+                  rate_bps=2_500_000, utag="ab12cd34ef")
+    assert not verify(path, signed, 1600, "s3cr3t", now=1000,
+                      rate_bps=0, utag="ab12cd34ef")
+    assert not verify(path, signed, 1600, "s3cr3t", now=1000,
+                      rate_bps=2_500_000, utag="other")
+    # Links minted before the rollout (no r/u at all) must still verify.
+    legacy = compute_digest(path, 1600, "s3cr3t")
+    assert verify(path, legacy, 1600, "s3cr3t", now=1000)
 
 
 def test_new_node_gets_a_signing_key_automatically() -> None:
