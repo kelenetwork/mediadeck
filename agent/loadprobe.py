@@ -14,11 +14,14 @@ Response:
 
 - active_streams: ESTABLISHED TCP connections on the given service ports
   (default 443,80) — a good proxy for concurrent media streams.
-- egress_mbps: TX rate of the interface, sampled over a sliding 5s window.
-- user_speeds: real bytes/second per anonymised user tag over the last
-  window, tailed from nginx's mediadeck_speed log
-  (format: "$msec $arg_u $bytes_sent $request_time").  This is what the
-  panel shows as live bandwidth — actual wire bytes, not an estimate.
+- egress_mbps: TX rate of the interface, sampled every second over a sliding
+  3s window.
+- user_speeds: real bytes/second per anonymised user tag, taken from the
+  kernel's bytes_acked on sockets that are open *right now*. nginx logs a
+  request only when it ends, and in production the median request runs 27s
+  with 46% over a minute, so completed lines alone leave most active viewers
+  unmeasured. The access log supplies peer-address -> user tag; the rate
+  itself comes from live sockets.
 - Optional bearer token via --token / LOADPROBE_TOKEN.
 """
 from __future__ import annotations
@@ -26,6 +29,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -71,30 +75,126 @@ def established_count(ports: set[int]) -> int:
     return count
 
 
+def conn_bytes(ports: set[int]) -> dict[str, tuple[str, int]]:
+    """Established sockets -> {peer: (peer_ip, bytes_acked)} on service ports.
+
+    ``bytes_acked`` is the kernel's count of payload the peer has actually
+    acknowledged, so sampling its delta measures a transfer *while it is
+    still running* -- which nginx's access log, written only at request
+    completion, structurally cannot do.
+    """
+    out: dict[str, tuple[str, int]] = {}
+    try:
+        proc = subprocess.run(
+            ["ss", "-tinH", "state", "established"],
+            capture_output=True, text=True, timeout=8, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return out
+    if proc.returncode != 0:
+        return out
+
+    key: str | None = None
+    for line in proc.stdout.splitlines():
+        if not line:
+            continue
+        if not line[0].isspace():
+            # Address line: Recv-Q Send-Q Local:Port Peer:Port [Process]
+            key = None
+            fields = line.split()
+            if len(fields) < 4:
+                continue
+            local, peer = fields[2], fields[3]
+            try:
+                if int(local.rsplit(":", 1)[1]) not in ports:
+                    continue
+            except (IndexError, ValueError):
+                continue
+            key = peer
+            continue
+        if key is None:
+            continue
+        # Metric line belonging to the address line above.
+        marker = "bytes_acked:"
+        idx = line.find(marker)
+        if idx == -1:
+            continue
+        digits = ""
+        for ch in line[idx + len(marker):]:
+            if not ch.isdigit():
+                break
+            digits += ch
+        if digits:
+            out[key] = (key.rsplit(":", 1)[0], int(digits))
+        key = None
+    return out
+
+
 class SpeedLog:
-    """Tail nginx's per-request speed log into per-user live rates.
+    """Per-user live rates, measured on in-flight connections.
 
-    Each completed request logs "<msec> <utag> <bytes_sent> <request_time>".
-    A request that took R seconds and sent B bytes contributed B/R bytes/s
-    while it ran; summing the contributions of requests that overlap the
-    current window approximates each user's wire rate well enough for a
-    dashboard, without packet capture or nginx modules.
+    Two sources, because neither alone is correct:
 
-    A long-running request (one big Range read) only logs when it *ends*, so
-    completed lines alone would show 0 mid-transfer.  Nothing to be done
-    stdlib-side cheaply — but media players issue frequent bounded Range
-    reads, so in practice lines arrive every few seconds during playback.
+    * **Who** a connection belongs to is only knowable from nginx's log,
+      which carries the signed ``u=`` tag (and now the peer address).
+    * **How fast** it is going right now is only knowable from the kernel,
+      because nginx logs a request when it *ends*.
+
+    Trying to derive live speed from completed log lines alone is what made
+    the dashboard wrong: in production the median request runs 27s and 46%
+    of them run over a minute (observed max: 3869s), so at any instant most
+    active viewers had no completed line inside the window and were reported
+    as having no measurement at all. The panel then fell back to its
+    estimate for nearly every session.
+
+    So: learn peer-IP -> user tag from the log, and take the actual rate from
+    ``bytes_acked`` deltas on live sockets. An IP seen with more than one tag
+    (carrier NAT, shared household) is left unattributed rather than credited
+    to the wrong member.
     """
 
-    WINDOW = 15.0  # seconds of history that count toward "current" speed
+    WINDOW = 15.0        # seconds of completed-request history retained
+    OWNER_TTL = 3600.0   # how long a peer IP stays associated with a tag
+    RATE_WINDOW = 5.0    # seconds of socket samples averaged into a rate
 
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, ports: set[int] | None = None) -> None:
         self.path = path
+        self.ports = ports or {443, 80}
         self._lock = threading.Lock()
         # list of (end_ts, start_ts, utag, bytes)
         self._events: list[tuple[float, float, str, int]] = []
+        # peer_ip -> {utag: last_seen_ts}
+        self._owners: dict[str, dict[str, float]] = {}
+        # peer socket -> (ts, bytes_acked) samples over RATE_WINDOW
+        self._conns: dict[str, list[tuple[float, int]]] = {}
         if path:
             threading.Thread(target=self._tail, daemon=True).start()
+        threading.Thread(target=self._sample_conns, daemon=True).start()
+
+    def _sample_conns(self) -> None:
+        while True:
+            now = time.time()
+            seen = conn_bytes(self.ports)
+            with self._lock:
+                for peer, (_ip, acked) in seen.items():
+                    samples = self._conns.setdefault(peer, [])
+                    samples.append((now, acked))
+                    cutoff = now - self.RATE_WINDOW
+                    while len(samples) > 2 and samples[1][0] < cutoff:
+                        samples.pop(0)
+                # Drop sockets that have closed.
+                for peer in [p for p in self._conns if p not in seen]:
+                    del self._conns[peer]
+            time.sleep(1.0)
+
+    def _owner_of(self, peer_ip: str, now: float) -> str | None:
+        """The single user tag this IP belongs to, or None if ambiguous."""
+        tags = self._owners.get(peer_ip)
+        if not tags:
+            return None
+        live = {t: ts for t, ts in tags.items() if ts >= now - self.OWNER_TTL}
+        if len(live) != 1:
+            return None
+        return next(iter(live))
 
     def _tail(self) -> None:
         fh = None
@@ -124,20 +224,20 @@ class SpeedLog:
                 time.sleep(5)
 
     @staticmethod
-    def parse(line: str) -> tuple[float, str, int, float] | None:
-        """Parse one access-log line into (end_ts, utag, bytes, seconds).
+    def parse(line: str) -> tuple[float, str, int, float, str] | None:
+        """Parse a log line into (end_ts, utag, bytes, seconds, peer_ip).
 
         Deliberately tolerant of *which* mediadeck_speed format a node runs.
         Nodes provisioned at different times write different shapes:
 
-            <msec> u=<tag> r=<rate> <bytes> <secs>   # current, self-labelling
-            <msec> <tag> <bytes> <secs>              # original, positional
+            <msec> a=<ip> u=<tag> r=<rate> <bytes> <secs>  # current
+            <msec> u=<tag> r=<rate> <bytes> <secs>         # no peer address
+            <msec> <tag> <bytes> <secs>                    # original
 
         Parsing only the positional form against a labelled log made every
         line raise ValueError on int("r=10000000"), so every line was dropped
-        and user_speeds stayed empty forever -- the panel then fell back to
-        its estimate and live speed silently read wrong. Accept both rather
-        than couple the agent to one nginx template version.
+        and user_speeds stayed empty forever. Accept all of them rather than
+        couple the agent to one nginx template version.
         """
         parts = line.split()
         if len(parts) < 4:
@@ -148,10 +248,13 @@ class SpeedLog:
             return None
 
         utag = ""
+        peer_ip = ""
         rest: list[str] = []
         for token in parts[1:]:
             if token.startswith("u="):
                 utag = token[2:]
+            elif token.startswith("a="):
+                peer_ip = token[2:]
             elif token.startswith("r="):
                 continue          # the rate cap is not needed for speed
             else:
@@ -170,38 +273,79 @@ class SpeedLog:
             return None
         if not utag or utag == "-" or sent <= 0:
             return None
-        return end_ts, utag, sent, took
+        if peer_ip == "-":
+            peer_ip = ""
+        return end_ts, utag, sent, took, peer_ip
 
     def _ingest(self, line: str) -> None:
         parsed = self.parse(line)
         if parsed is None:
             return
-        end_ts, utag, sent, took = parsed
+        end_ts, utag, sent, took, peer_ip = parsed
         with self._lock:
             self._events.append((end_ts, end_ts - took, utag, sent))
             if len(self._events) > 10000:
                 del self._events[:5000]
+            if peer_ip:
+                # Remember which member this address belongs to so in-flight
+                # sockets from the same client can be attributed live.
+                self._owners.setdefault(peer_ip, {})[utag] = end_ts
+                if len(self._owners) > 5000:
+                    stale = end_ts - self.OWNER_TTL
+                    self._owners = {
+                        ip: tags for ip, tags in self._owners.items()
+                        if any(ts >= stale for ts in tags.values())
+                    }
 
     def speeds(self) -> dict:
-        """utag -> bytes/second over the last WINDOW seconds.
+        """utag -> bytes/second, measured on connections that are live now.
 
-        Each request transferred at ``sent/duration`` bytes/s while it ran;
-        its contribution to "current speed" is that rate weighted by how much
-        of the request overlaps the window. Requests fully inside the window
-        contribute rate*(duration/WINDOW), which sums to bytes/WINDOW — the
-        honest average, immune to double-counting bursts of tiny Range reads.
+        Primary source is the kernel: for every established socket, the delta
+        in ``bytes_acked`` over the sampling window is what that client is
+        actually receiving *at this moment*, whether or not its request has
+        finished. Sockets are attributed to a member via the peer address
+        learned from the access log.
+
+        Completed log lines remain the fallback for clients whose address is
+        not yet known (the very first request of a session) so a new viewer is
+        not invisible until their first request ends.
         """
         now = time.time()
         cutoff = now - self.WINDOW
         out: dict[str, float] = {}
+
         with self._lock:
+            # --- live sockets (authoritative) --------------------------------
+            attributed_ips: set[str] = set()
+            for peer, samples in self._conns.items():
+                if len(samples) < 2:
+                    continue
+                peer_ip = peer.rsplit(":", 1)[0]
+                utag = self._owner_of(peer_ip, now)
+                if not utag:
+                    continue
+                span = samples[-1][0] - samples[0][0]
+                delta = samples[-1][1] - samples[0][1]
+                if span <= 0 or delta <= 0:
+                    continue
+                out[utag] = out.get(utag, 0.0) + delta / span
+                attributed_ips.add(peer_ip)
+
+            # --- completed requests (fallback for unknown addresses) ---------
             self._events = [e for e in self._events if e[0] >= cutoff]
+            fallback: dict[str, float] = {}
             for end_ts, start_ts, utag, sent in self._events:
+                if utag in out:
+                    continue  # already measured on the wire
                 duration = max(0.05, end_ts - start_ts)
                 overlap = max(0.0, min(end_ts, now) - max(start_ts, cutoff))
                 if overlap <= 0:
                     continue
-                out[utag] = out.get(utag, 0.0) + (sent / duration) * (overlap / self.WINDOW)
+                fallback[utag] = fallback.get(utag, 0.0) + \
+                    (sent / duration) * (overlap / self.WINDOW)
+
+        for utag, rate in fallback.items():
+            out.setdefault(utag, rate)
         return {k: int(v) for k, v in out.items() if v >= 1}
 
 
@@ -287,7 +431,7 @@ def main() -> None:
     args = parser.parse_args()
 
     ports = {int(p) for p in args.service_ports.split(",") if p.strip()}
-    sampler = Sampler(args.iface, ports, SpeedLog(args.speed_log))
+    sampler = Sampler(args.iface, ports, SpeedLog(args.speed_log, ports))
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802
