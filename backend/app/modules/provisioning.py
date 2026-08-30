@@ -119,7 +119,8 @@ map $arg_r $mediadeck_rate {{
 # cannot show what a viewer is doing right now. Tags are hashes, so the log
 # never names an account.
 log_format mediadeck_speed
-    '$msec a=$remote_addr u=$arg_u r=$arg_r $bytes_sent $request_time';
+    '$msec a=$remote_addr p=$remote_port u=$arg_u r=$arg_r '
+    '$bytes_sent $request_time';
 
 limit_conn_zone $binary_remote_addr zone=mediadeck_perip:10m;
 
