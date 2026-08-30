@@ -40,6 +40,12 @@ class TTLCache:
     def clear(self) -> None:
         self._data.clear()
 
+    def drop_prefix(self, prefix: str) -> None:
+        """Drop every key with this prefix. Used when a rate cap changes."""
+        if not prefix:
+            return
+        self._data = {k: v for k, v in self._data.items() if not k.startswith(prefix)}
+
     async def resolve(self, key: str, producer: Callable[[], Awaitable[Any]],
                       ttl: float | None = None) -> Any:
         """Return the cached value, else await the producer and cache it."""

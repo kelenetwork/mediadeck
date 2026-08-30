@@ -19,6 +19,19 @@ def _load():
     return module
 
 
+def test_user_and_egress_windows_stay_aligned_and_long_enough() -> None:
+    """A 3s window made a buffered viewer jump 0 <-> peak every poll.
+
+    Players fill, go quiet, burst again. Averaging over a few seconds still
+    tracks the wire, but is long enough that the dashboard does not read as
+    a different movie every refresh. User rate and node egress must stay on
+    the same span or attributed traffic disagrees with the node total.
+    """
+    module = _load()
+    assert module.SpeedLog.RATE_WINDOW == module.Sampler.WINDOW
+    assert module.Sampler.WINDOW >= 8.0
+
+
 def test_parses_every_log_shape_nodes_actually_write() -> None:
     """Regression: live speed was permanently blank on every node.
 

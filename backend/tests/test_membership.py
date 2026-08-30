@@ -26,6 +26,7 @@ from app.modules.members import (
     merge_effective,
     parse_roles,
     period_start,
+    rate_bytes_per_sec,
     validate_overrides,
 )
 from app.modules.stats import StatsService
@@ -274,6 +275,25 @@ def test_policy_prefers_member_overrides(stack) -> None:
     policy = desired_policy(stack["members"].get("u1"))
     assert policy["RemoteClientBitrateLimit"] == 20000 * 1000
     assert policy["SimultaneousStreamLimit"] == 5
+
+
+def test_rate_bytes_per_sec_is_what_nginx_limit_rate_reads() -> None:
+    assert rate_bytes_per_sec(0) == 0
+    assert rate_bytes_per_sec(8000) == 1_000_000
+    kbps = round(15 * 1048576 / 125)
+    assert rate_bytes_per_sec(kbps) == kbps * 125
+
+
+def test_terminate_users_stops_only_matching_sessions(stack) -> None:
+    stack["emby"].set_sessions([
+        {"Id": "s1", "UserId": "u1"},
+        {"Id": "s2", "UserId": "u2"},
+    ])
+    stopped = asyncio.run(
+        stack["enforcement"].terminate_users({"u1"}, "限速已更新"))
+    assert stopped == 1
+    assert stack["emby"].stopped == [("s1", "限速已更新")]
+    assert [s["Id"] for s in stack["emby"]._sessions] == ["s2"]
 
 
 def test_zero_means_unlimited_in_both_fields(stack) -> None:

@@ -34,7 +34,7 @@ from app.modules.events import EventStream, safe_stream
 from app.modules.groups import GroupService
 from app.modules.imagecache import ALLOWED_IMAGE_TYPES, ImageCache
 from app.modules.imports import ImportManager, JobKind, MockExecutor
-from app.modules.members import MemberService, random_password
+from app.modules.members import MemberService, random_password, rate_bytes_per_sec
 from app.modules.mounts import MockMounts, MountsReader
 from app.modules.pipeline import MockPipeline, PipelineReader
 from app.modules.playback import PlaybackRouter, caller_device, caller_token
@@ -207,8 +207,7 @@ async def _startup() -> None:
             if uid:
                 member = app.state.members.get(uid)
                 kbps = int((member or {}).get("bandwidth_limit_kbps") or 0)
-                # nginx limit_rate takes bytes/second; kbps -> B/s is *125.
-                result = (kbps * 125, user_tag(uid))
+                result = (rate_bytes_per_sec(kbps), user_tag(uid))
         except Exception:  # noqa: BLE001 - fail open: sign uncapped
             result = (0, "")
         # An unresolved caller is cached only briefly: it means the stream is
@@ -911,10 +910,19 @@ async def _sessions_with_speed() -> list[dict[str, Any]]:
     )
     est = app.state.usage.live_speeds()
     node_speeds = app.state.scheduler.user_speeds()
+    # A 302 to a node that the probe has not attributed yet is still on the
+    # node. Showing the sampler's bitrate estimate made those rows look like
+    # origin traffic (the ≈ the operator read as "did not go through ca1").
+    redirected_tags = {
+        str(entry.get("utag") or "")
+        for entry in app.state.playback.recent(200)
+        if entry.get("redirected") and entry.get("utag")
+    }
     out = []
     for session in sessions:
         s = dict(session)
-        real = node_speeds.get(user_tag(str(s.get("UserId") or "")))
+        tag = user_tag(str(s.get("UserId") or ""))
+        real = node_speeds.get(tag)
         if real is not None:
             # Node speeds are per *user*: concurrent sessions of one account
             # share the tag, so both rows show the account's wire rate.
@@ -924,6 +932,9 @@ async def _sessions_with_speed() -> list[dict[str, Any]]:
             # as falsy pushed every buffered viewer back to the bitrate
             # estimate, which is exactly the wrong number being reported.
             s["SpeedBps"] = int(real)
+            s["SpeedSource"] = "node"
+        elif tag and tag in redirected_tags:
+            s["SpeedBps"] = 0
             s["SpeedSource"] = "node"
         else:
             s["SpeedBps"] = int(est.get(str(s.get("Id") or ""), 0))
@@ -978,6 +989,45 @@ async def emby_apply_policy(user_id: str, policy: dict[str, Any] = Body(...)) ->
     return {"ok": True}
 
 
+async def _reissue_rate_caps(
+    *,
+    user_id: str | None = None,
+    group_id: str | None = None,
+    reason: str = "",
+    enforce: bool | None = None,
+    kick: bool = True,
+) -> None:
+    """Drop cached signatures and stop playback so a new cap is picked up.
+
+    The signed URL carries ``r=`` for up to six hours. Changing the number in
+    the panel does nothing until the client asks for a new URL, which is why
+    a 15 MB/s save looked ignored: every in-flight link was still ``r=0``.
+    """
+    app.state.cache.drop_prefix("rate:")
+    if enforce is None:
+        enforce = bool(
+            app.state.settings_service.membership_config().get(
+                "enforcement_enabled"))
+    uids: set[str] = set()
+    if user_id:
+        uids.add(str(user_id))
+    elif group_id:
+        for member in app.state.members.list(group_id=group_id, limit=5000):
+            overrides = member.get("overrides") or {}
+            if "bandwidth_limit_kbps" in overrides:
+                continue
+            uid = member.get("emby_user_id")
+            if uid:
+                uids.add(str(uid))
+    if enforce:
+        for uid in uids:
+            with contextlib.suppress(Exception):
+                await app.state.enforcement.enforce_now(uid, reason)
+    if kick and uids:
+        with contextlib.suppress(Exception):
+            await app.state.enforcement.terminate_users(uids, reason)
+
+
 # ---- user groups -----------------------------------------------------------
 @app.get("/api/groups", dependencies=[Depends(_auth)])
 async def groups_list() -> list[dict[str, Any]]:
@@ -995,8 +1045,12 @@ async def groups_create(payload: dict[str, Any] = Body(...),  # noqa: B008
 @app.put("/api/groups/{group_id}", dependencies=[Depends(_auth)])
 async def groups_update(group_id: str, payload: dict[str, Any] = Body(...),  # noqa: B008
                         user: str = Depends(_auth)) -> dict[str, Any]:
+    before = app.state.groups.get(group_id) or {}
     group = app.state.groups.update(group_id, payload)
     app.state.members.audit(user, "group.update", group_id, group["name"])
+    if before.get("bandwidth_limit_kbps") != group.get("bandwidth_limit_kbps"):
+        await _reissue_rate_caps(
+            group_id=group_id, reason="用户组限速已更新")
     return group
 
 
@@ -1104,14 +1158,20 @@ async def members_get(user_id: str, days: int = 30) -> dict[str, Any]:
 async def members_overrides(user_id: str, payload: dict[str, Any] = Body(...),  # noqa: B008
                             user: str = Depends(_auth)) -> dict[str, Any]:
     try:
+        before = app.state.members.get(user_id) or {}
         member = app.state.members.set_overrides(user_id, payload, actor=user)
     except KeyError:
         raise HTTPException(404, "unknown member") from None
     except ConfigError as exc:
         raise HTTPException(400, str(exc)) from None
-    if app.state.settings_service.membership_config()["enforcement_enabled"]:
-        with contextlib.suppress(Exception):
-            await app.state.enforcement.enforce_now(user_id, "overrides updated")
+    rate_changed = (
+        before.get("bandwidth_limit_kbps") != member.get("bandwidth_limit_kbps"))
+    if rate_changed or app.state.settings_service.membership_config()["enforcement_enabled"]:
+        await _reissue_rate_caps(
+            user_id=user_id, reason="成员限速已更新",
+            enforce=app.state.settings_service.membership_config()[
+                "enforcement_enabled"],
+            kick=rate_changed)
     return member
 
 
@@ -1125,10 +1185,14 @@ async def members_upsert(user_id: str, payload: dict[str, Any] = Body(...),  # n
                 if u["Id"] == user_id:
                     username = u.get("Name") or ""
                     break
+    before = app.state.members.get(user_id)
     member = app.state.members.upsert(user_id, username, payload, actor=user)
-    # Apply immediately: an operator who assigns a plan expects the limit to be
-    # live, not to appear at the next housekeeping pass ten minutes later.
-    if app.state.settings_service.membership_config()["enforcement_enabled"]:
+    rate_changed = bool(
+        before and before.get("bandwidth_limit_kbps") != member.get(
+            "bandwidth_limit_kbps"))
+    if rate_changed:
+        await _reissue_rate_caps(user_id=user_id, reason="成员限速已更新")
+    elif app.state.settings_service.membership_config()["enforcement_enabled"]:
         with contextlib.suppress(Exception):
             await app.state.enforcement.enforce_now(user_id, "member updated")
     return member

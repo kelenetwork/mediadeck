@@ -4,6 +4,28 @@ Newest entries first. Every working session appends one entry.
 
 ---
 
+## 2026-08-30 — per-user rate cap actually holds (panel MB/s + node nginx)
+**Done**
+- Panel bandwidth field is MB/s, matching the live speed column. Stored
+  column stays kbps for Emby `RemoteClientBitrateLimit`.
+- Saving a group/member cap drops the signed-URL cache and stops in-flight
+  sessions so the next 302 carries the new `r=`.
+- Node nginx template: HTTP/1.1 (no multiplexed Range streams), one live
+  connection per member, no `limit_rate_after` burst.
+- Already-302 viewers are labelled node speed (0 while the probe catches
+  up) instead of the sampler `≈` bitrate guess.
+- Probe user/egress window 3s -> 8s so a buffer burst does not read as a
+  different movie every refresh.
+
+**Next**
+- ruff + pytest, PR, tag, deploy panel, apply nginx on the live node.
+
+**Open questions**
+- Uncapped (`r=0`) still means nginx `limit_rate 0` = unlimited. That is
+  the operator choosing no cap, not a bug.
+
+---
+
 ## 2026-08-29 (8) — 运营中枢 UI + membership backend gaps (v0.10)
 **Done**
 - Panel pages for members / plans / invites / stats / storage / audit. NAV

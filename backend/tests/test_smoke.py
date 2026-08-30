@@ -696,6 +696,12 @@ def test_enroll_script_is_token_authenticated_and_self_contained() -> None:
         assert "/s/main/" in script and "/s/gd3/" in script
 
         assert client.get("/api/enroll/not-a-real-token/script").status_code == 404
+        # Rate cap is per member, not per multiplexed HTTP/2 stream, and
+        # there is no free burst window on every seek.
+        assert "listen 443 ssl http2" not in script
+        assert "limit_rate_after 2m" not in script
+        assert "limit_conn mediadeck_peruser 1" in script
+        assert "mediadeck_user_key" in script
 
 
 def test_install_script_warns_when_unsigned() -> None:
@@ -872,6 +878,61 @@ def test_shared_key_is_attributed_by_device_not_by_first_caller() -> None:
         third = client.get("/emby/Videos/item42/stream.mkv?Static=true",
                            headers=headers, follow_redirects=False)
         assert "r=0" in third.headers["location"]
+
+
+def test_group_rate_is_signed_and_changing_it_stops_inheriting_sessions() -> None:
+    """Regression: a 15 MB/s save never reached the node.
+
+    Groups defaulted to 0, every URL was signed r=0 (uncapped), and the old
+    signed link lived for six hours, so changing the number in the panel
+    looked ignored. The cap must be in the next 302, and in-flight playback
+    must be stopped so the client picks up a new signature.
+    """
+    with TestClient(app) as client:
+        for node in client.get("/api/nodes", headers=_basic()).json():
+            client.delete(f"/api/nodes/{node['name']}", headers=_basic())
+        _node(client, "edge-group-rate", sign_secret="topsecret",
+              sign_arg_digest="k", sign_arg_expires="e")
+        client.put("/api/settings/playback", headers=_basic(), json={"enabled": True})
+        client.put("/api/members/u1", headers=_basic(),
+                   json={"group_id": "standard"})
+        # 15 MB/s in the panel unit: 15 * 1048576 / 125 kbps.
+        kbps = round(15 * 1048576 / 125)
+        client.put("/api/groups/standard", headers=_basic(),
+                   json={"bandwidth_limit_kbps": kbps})
+        app.state.emby.set_sessions([{"Id": "live-u1", "UserId": "u1"}])
+
+        r = client.get("/emby/Videos/item42/stream.mkv?Static=true",
+                       headers=_play(), follow_redirects=False)
+        assert f"r={kbps * 125}" in r.headers["location"], r.headers["location"]
+
+        # Saving the same group again with a new cap must kick the live session
+        # so it cannot keep the previous signed r=.
+        client.put("/api/groups/standard", headers=_basic(),
+                   json={"bandwidth_limit_kbps": 8000})
+        assert ("live-u1", "用户组限速已更新") in app.state.emby.stopped
+
+
+def test_redirected_viewer_is_not_shown_as_estimate() -> None:
+    """A 302 the probe has not attributed yet is still on the node.
+
+    Showing the sampler bitrate made those rows look like origin traffic
+    (the ≈ the operator read as "did not go through the node").
+    """
+    with TestClient(app) as client:
+        for node in client.get("/api/nodes", headers=_basic()).json():
+            client.delete(f"/api/nodes/{node['name']}", headers=_basic())
+        _node(client, "edge-attr", sign_secret="topsecret",
+              sign_arg_digest="k", sign_arg_expires="e")
+        client.put("/api/settings/playback", headers=_basic(), json={"enabled": True})
+        client.put("/api/members/u1", headers=_basic(),
+                   json={"group_id": "standard"})
+        r = client.get("/emby/Videos/item42/stream.mkv?Static=true",
+                       headers=_play(), follow_redirects=False)
+        assert r.status_code == 302 and "u=" in r.headers["location"]
+        sessions = client.get("/api/emby/sessions", headers=_basic()).json()
+        assert sessions and sessions[0]["SpeedSource"] == "node"
+        assert sessions[0]["SpeedMBps"] == 0.0
 
 
 def test_real_client_path_shapes_reach_the_edge() -> None:
