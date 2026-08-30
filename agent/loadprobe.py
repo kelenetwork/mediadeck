@@ -34,6 +34,11 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+#: How much of the tail of the speed log to replay on startup when rebuilding
+#: the peer-address -> user map. Large enough to cover a busy hour, small
+#: enough to read instantly on a multi-hundred-MB log.
+SEED_BYTES = 4 * 1024 * 1024
+
 
 def default_iface() -> str:
     try:
@@ -153,7 +158,10 @@ class SpeedLog:
     """
 
     WINDOW = 15.0        # seconds of completed-request history retained
-    OWNER_TTL = 3600.0   # how long a peer IP stays associated with a tag
+    OWNER_TTL = 21600.0  # how long a peer IP stays associated with a tag
+    #: A viewer can hold one connection open for a very long time (observed
+    #: max request duration in production: 3869s) and log nothing meanwhile,
+    #: so the association has to outlive a whole watching session.
     # Must match Sampler.WINDOW. The panel shows per-user rates and node
     # egress side by side, so measuring them over different spans makes the
     # two disagree whenever throughput is changing: a 5s user window against
@@ -172,8 +180,46 @@ class SpeedLog:
         # peer socket -> (ts, bytes_acked) samples over RATE_WINDOW
         self._conns: dict[str, list[tuple[float, int]]] = {}
         if path:
+            self._seed_owners()
             threading.Thread(target=self._tail, daemon=True).start()
         threading.Thread(target=self._sample_conns, daemon=True).start()
+
+    def _seed_owners(self) -> None:
+        """Learn peer-IP -> user tag from recent history before tailing.
+
+        The tail starts at end-of-file, so without this the address map is
+        empty on every restart and can only be refilled by requests that
+        *complete* afterwards. Playback requests run for minutes, so a viewer
+        already streaming would stay unattributed for their whole session:
+        measured right after a restart, 9 of 9 live sockets had a tag sitting
+        in the log yet only 2 were being reported.
+
+        Reads the tail of the log rather than the whole file: it grows
+        continuously, and anything older than OWNER_TTL is ignored anyway.
+        """
+        try:
+            size = os.path.getsize(self.path)
+            with open(self.path, "rb") as fh:
+                if size > SEED_BYTES:
+                    fh.seek(-SEED_BYTES, os.SEEK_END)
+                    fh.readline()          # drop the partial first line
+                blob = fh.read().decode("utf-8", errors="replace")
+        except OSError:
+            return
+        cutoff = time.time() - self.OWNER_TTL
+        learned = 0
+        for line in blob.splitlines():
+            parsed = self.parse(line)
+            if parsed is None:
+                continue
+            end_ts, utag, _sent, _took, peer_ip = parsed
+            if not peer_ip or end_ts < cutoff:
+                continue
+            self._owners.setdefault(peer_ip, {})[utag] = end_ts
+            learned += 1
+        if learned:
+            print(f"seeded {len(self._owners)} peer addresses from "
+                  f"{learned} recent log lines", flush=True)
 
     def _sample_conns(self) -> None:
         while True:
