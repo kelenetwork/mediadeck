@@ -246,6 +246,26 @@ class SpeedLog:
                     del self._conns[peer]
             time.sleep(1.0)
 
+    def learn(self, peer_ip: str, peer_port: str, utag: str) -> None:
+        """Attribute one live socket to a member, at request *start*.
+
+        Called from nginx via a mirror subrequest the moment a media request
+        begins. This is the only timely source for long transfers: the access
+        log line does not exist until the request ends, and a playback
+        connection's first request can run for an hour -- measured live,
+        7 of 9 streaming IPs had no log line at all, so log-taught
+        attribution structurally cannot cover them.
+        """
+        peer_ip = (peer_ip or "").strip()
+        peer_port = (peer_port or "").strip()
+        utag = (utag or "").strip()
+        if not peer_ip or not utag or not peer_port.isdigit():
+            return
+        now = time.time()
+        with self._lock:
+            self._owners.setdefault(peer_ip, {})[utag] = now
+            self._sock_owners[f"{peer_ip}:{peer_port}"] = (utag, now)
+
     def _owner_of(self, peer_ip: str, now: float) -> str | None:
         """The single user tag this IP belongs to, or None if ambiguous."""
         tags = self._owners.get(peer_ip)
@@ -516,8 +536,21 @@ def main() -> None:
     ports = {int(p) for p in args.service_ports.split(",") if p.strip()}
     sampler = Sampler(args.iface, ports, SpeedLog(args.speed_log, ports))
 
+    speedlog = sampler.speedlog
+
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802
+            # Request-start attribution ping, mirrored by nginx on every media
+            # request. Loopback-only in practice (nginx runs on the same box)
+            # and carries no secrets: a hashed tag and a socket address.
+            if self.path.startswith("/announce"):
+                from urllib.parse import parse_qs, urlsplit
+                q = parse_qs(urlsplit(self.path).query)
+                speedlog.learn(q.get("a", [""])[0], q.get("p", [""])[0],
+                               q.get("u", [""])[0])
+                self.send_response(204)
+                self.end_headers()
+                return
             if self.path.rstrip("/") not in ("", "/load", "/healthz"):
                 self.send_response(404)
                 self.end_headers()

@@ -94,6 +94,13 @@ def nginx_site(node: Any) -> str:
         # Real transfer bytes per user for the panel's live-speed display.
         access_log /var/log/nginx/mediadeck-speed.log mediadeck_speed;
 
+        # Tell the probe who owns this socket the moment the request STARTS.
+        # The access log alone cannot do this: nginx writes it only when a
+        # request ends, and one playback request can run for an hour, so a
+        # viewer would stay "estimated" for their whole session otherwise.
+        mirror /_mediadeck/announce;
+        mirror_request_body off;
+
         # Emby clients seek constantly; byte ranges are mandatory.
         add_header Accept-Ranges bytes;
         add_header X-Mediadeck-Node "{node.name}" always;
@@ -159,6 +166,18 @@ server {{
     add_header Cache-Control "no-store" always;
 {secure}
 {"".join(locations) or "    # NOTE: no media roots configured for this node yet."}
+
+    # Async request-start ping to the local probe (see mirror above). Fire
+    # and forget: if the probe is down the main media request is unaffected.
+    location = /_mediadeck/announce {{
+        internal;
+        proxy_pass http://127.0.0.1:9800/announce?a=$remote_addr&p=$remote_port&u=$arg_u;
+        proxy_connect_timeout 300ms;
+        proxy_read_timeout 500ms;
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length "";
+        access_log off;
+    }}
 
     location = /healthz {{
         access_log off;
