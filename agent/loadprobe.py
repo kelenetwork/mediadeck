@@ -152,9 +152,13 @@ class SpeedLog:
     estimate for nearly every session.
 
     So: learn peer-IP -> user tag from the log, and take the actual rate from
-    ``bytes_acked`` deltas on live sockets. An IP seen with more than one tag
-    (carrier NAT, shared household) is left unattributed rather than credited
-    to the wrong member.
+    ``bytes_acked`` deltas on live sockets. Sockets are matched to a member by
+    exact ``ip:port`` where the log has taught us one, because a single egress
+    address routinely carries several members (household, CGNAT, office) --
+    measured in production, one address appeared under four different tags
+    within a few hours. Where only the address is known, it is used solely if
+    unambiguous; otherwise the traffic is left unattributed rather than
+    credited to the wrong member.
     """
 
     WINDOW = 15.0        # seconds of completed-request history retained
@@ -177,6 +181,8 @@ class SpeedLog:
         self._events: list[tuple[float, float, str, int]] = []
         # peer_ip -> {utag: last_seen_ts}
         self._owners: dict[str, dict[str, float]] = {}
+        # "peer_ip:peer_port" -> (utag, last_seen_ts); exact, survives sharing
+        self._sock_owners: dict[str, tuple[str, float]] = {}
         # peer socket -> (ts, bytes_acked) samples over RATE_WINDOW
         self._conns: dict[str, list[tuple[float, int]]] = {}
         if path:
@@ -212,13 +218,16 @@ class SpeedLog:
             parsed = self.parse(line)
             if parsed is None:
                 continue
-            end_ts, utag, _sent, _took, peer_ip = parsed
+            end_ts, utag, _sent, _took, peer_ip, peer_port = parsed
             if not peer_ip or end_ts < cutoff:
                 continue
             self._owners.setdefault(peer_ip, {})[utag] = end_ts
+            if peer_port:
+                self._sock_owners[f"{peer_ip}:{peer_port}"] = (utag, end_ts)
             learned += 1
         if learned:
-            print(f"seeded {len(self._owners)} peer addresses from "
+            print(f"seeded {len(self._owners)} peer addresses / "
+                  f"{len(self._sock_owners)} sockets from "
                   f"{learned} recent log lines", flush=True)
 
     def _sample_conns(self) -> None:
@@ -300,12 +309,15 @@ class SpeedLog:
 
         utag = ""
         peer_ip = ""
+        peer_port = ""
         rest: list[str] = []
         for token in parts[1:]:
             if token.startswith("u="):
                 utag = token[2:]
             elif token.startswith("a="):
                 peer_ip = token[2:]
+            elif token.startswith("p="):
+                peer_port = token[2:]
             elif token.startswith("r="):
                 continue          # the rate cap is not needed for speed
             else:
@@ -326,13 +338,15 @@ class SpeedLog:
             return None
         if peer_ip == "-":
             peer_ip = ""
-        return end_ts, utag, sent, took, peer_ip
+        if peer_port in ("-", "0") or not peer_port.isdigit():
+            peer_port = ""
+        return end_ts, utag, sent, took, peer_ip, peer_port
 
     def _ingest(self, line: str) -> None:
         parsed = self.parse(line)
         if parsed is None:
             return
-        end_ts, utag, sent, took, peer_ip = parsed
+        end_ts, utag, sent, took, peer_ip, peer_port = parsed
         with self._lock:
             self._events.append((end_ts, end_ts - took, utag, sent))
             if len(self._events) > 10000:
@@ -346,6 +360,19 @@ class SpeedLog:
                     self._owners = {
                         ip: tags for ip, tags in self._owners.items()
                         if any(ts >= stale for ts in tags.values())
+                    }
+            if peer_ip and peer_port:
+                # Exact socket -> member. A request and the streaming that
+                # follows it share one connection (keep-alive / HTTP2), so
+                # the port learned here identifies that same socket later.
+                # This is what keeps a shared egress address (household,
+                # CGNAT, office) attributable instead of ambiguous.
+                self._sock_owners[f"{peer_ip}:{peer_port}"] = (utag, end_ts)
+                if len(self._sock_owners) > 20000:
+                    stale = end_ts - self.OWNER_TTL
+                    self._sock_owners = {
+                        k: v for k, v in self._sock_owners.items()
+                        if v[1] >= stale
                     }
 
     def speeds(self) -> dict:
@@ -372,7 +399,12 @@ class SpeedLog:
                 if len(samples) < 2:
                     continue
                 peer_ip = peer.rsplit(":", 1)[0]
-                utag = self._owner_of(peer_ip, now)
+                # Exact socket match first: it stays correct when one address
+                # carries several members. Fall back to the address-level map
+                # only for sockets that have not logged a request yet, and
+                # that fallback still refuses ambiguous addresses.
+                exact = self._sock_owners.get(peer)
+                utag = exact[0] if exact else self._owner_of(peer_ip, now)
                 if not utag:
                     continue
                 span = samples[-1][0] - samples[0][0]
