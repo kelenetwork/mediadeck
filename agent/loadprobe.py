@@ -154,7 +154,12 @@ class SpeedLog:
 
     WINDOW = 15.0        # seconds of completed-request history retained
     OWNER_TTL = 3600.0   # how long a peer IP stays associated with a tag
-    RATE_WINDOW = 5.0    # seconds of socket samples averaged into a rate
+    # Must match Sampler.WINDOW. The panel shows per-user rates and node
+    # egress side by side, so measuring them over different spans makes the
+    # two disagree whenever throughput is changing: a 5s user window against
+    # a 3s egress window reported 117%-176% of egress as "attributed" while
+    # speeds were falling, which reads as a plainly wrong number.
+    RATE_WINDOW = 3.0
 
     def __init__(self, path: str, ports: set[int] | None = None) -> None:
         self.path = path
