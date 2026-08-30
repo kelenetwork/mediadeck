@@ -62,6 +62,8 @@ class Decision:
     media_path: str | None = None
     pool: str | None = None
     signed: bool = False
+    utag: str = ""
+    rate_bps: int = 0
 
 
 class TTLCache:
@@ -223,6 +225,8 @@ class PlaybackRouter:
             "reason": decision.reason,
             "media_path": decision.media_path,
             "signed": decision.signed,
+            "utag": decision.utag,
+            "rate_bps": decision.rate_bps,
         })
         if len(self._log) > 500:
             del self._log[:-500]
@@ -330,11 +334,11 @@ class PlaybackRouter:
 
         url_path = f"{str(pool.url_prefix).rstrip('/')}/{relative}"
         secret = str(getattr(chosen.node, "sign_secret", "") or "")
+        rate_bps, utag = 0, ""
         if secret:
             # Per-user bandwidth cap and anonymised tag ride inside the
             # signature: the node enforces the cap and attributes real bytes
             # to the user, and neither can be edited off the URL.
-            rate_bps, utag = 0, ""
             if self._rate_resolver is not None and caller_token:
                 try:
                     rate_bps, utag = await self._rate_resolver(
@@ -355,6 +359,8 @@ class PlaybackRouter:
             redirected=True, target=target, reason="redirected",
             node=chosen.node.name, media_path=media_path,
             pool=pool.name, signed=bool(secret),
+            utag=utag,
+            rate_bps=int(rate_bps),
         )
         self._record(decision, item_id)
         return decision

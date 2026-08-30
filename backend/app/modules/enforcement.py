@@ -239,30 +239,46 @@ class EnforcementService:
 
         Disabling an account does not end sessions that already hold a stream,
         so a user who exhausts their quota would otherwise finish the film.
+        The same path is used when a rate cap changes: the signed URL carries
+        the old r= for up to six hours, so the client must be told to start
+        again and pick up a freshly signed cap.
         """
-        stopped = 0
+        return await self.terminate_users({user_id}, reason)
+
+    async def terminate_users(self, user_ids: set[str], reason: str = "") -> int:
+        """Stop every active session belonging to any of these members.
+
+        One Emby session list, then stop matching rows. Calling terminate per
+        member would re-fetch the whole fleet hundreds of times on a group
+        rate change.
+        """
+        wanted = {str(uid) for uid in user_ids if uid}
+        if not wanted:
+            return 0
         try:
             sessions = await self._emby.active_sessions_raw()
         except Exception:  # noqa: BLE001
             return 0
-        failures = 0
-        for s in sessions:
-            if s.get("UserId") != user_id:
+        stopped_by: dict[str, int] = {}
+        failures_by: dict[str, int] = {}
+        for session in sessions:
+            uid = str(session.get("UserId") or "")
+            if uid not in wanted:
                 continue
             try:
-                if await self._emby.stop_session(s.get("Id"), reason):
-                    stopped += 1
+                if await self._emby.stop_session(session.get("Id"), reason):
+                    stopped_by[uid] = stopped_by.get(uid, 0) + 1
             except Exception:  # noqa: BLE001
-                # One unstoppable session must not prevent stopping the rest;
-                # the count is audited below so failures stay visible.
-                failures += 1
-        if failures:
-            self._members.audit("system", "enforce.terminate_partial", user_id,
-                                f"{failures} session(s) could not be stopped", ok=False)
-        if stopped:
-            self._members.audit("system", "enforce.terminate", user_id,
-                                f"{stopped} session(s): {reason}")
-        return stopped
+                failures_by[uid] = failures_by.get(uid, 0) + 1
+        for uid, count in failures_by.items():
+            self._members.audit(
+                "system", "enforce.terminate_partial", uid,
+                f"{count} session(s) could not be stopped", ok=False)
+        for uid, count in stopped_by.items():
+            self._members.audit(
+                "system", "enforce.terminate", uid,
+                f"{count} session(s): {reason}")
+        return sum(stopped_by.values())
 
 
 def _normalise(value: Any) -> Any:

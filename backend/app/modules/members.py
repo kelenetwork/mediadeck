@@ -61,6 +61,24 @@ OVERRIDE_KEYS = (
 LIBRARY_MODES = ("inherit", "replace", "extend")
 AUDIT_DETAIL_MAX = 4000
 
+# Panel and nginx speak different units. The stored column stays kbps so Emby
+# RemoteClientBitrateLimit (bits/s = kbps * 1000) and historical rows keep
+# working. The operator reads and types MB/s, matching the live speed column.
+# nginx limit_rate wants bytes/second: kbps * 125.
+BYTES_PER_KBPS = 125
+
+
+def rate_bytes_per_sec(kbps: int) -> int:
+    """Convert stored kbps to nginx limit_rate bytes/second.
+
+    0 stays 0 (uncapped). The panel displays MB/s; this is the unit the
+    node actually enforces.
+    """
+    kbps = int(kbps or 0)
+    if kbps <= 0:
+        return 0
+    return kbps * BYTES_PER_KBPS
+
 
 def random_password(length: int = 12) -> str:
     """For operator-reset accounts, so nobody reuses '123456'."""

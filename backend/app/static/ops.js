@@ -332,11 +332,21 @@ async function memberDelete(id, username) {
     renderPage('members');
   } catch (e) { toast('失败: ' + e.message, 1); }
 }
+function kbpsToMBps(n) {
+  n = Number(n || 0);
+  if (!n) return 0;
+  return Math.round((n * 125 / 1048576) * 10) / 10;
+}
+function mBpsToKbps(n) {
+  n = Number(n || 0);
+  if (!n) return 0;
+  return Math.round(n * 1048576 / 125);
+}
 function fmtKbps(n) {
   n = Number(n || 0);
   if (!n) return '不限';
-  if (n >= 1000) return (n / 1000) + ' Mbps';
-  return n + ' kbps';
+  const mb = kbpsToMBps(n);
+  return (Number.isInteger(mb) ? String(mb) : mb.toFixed(1)) + ' MB/s';
 }
 function boolLabel(v) { return v ? '允许' : '禁止'; }
 function localInputFromTs(ts) {
@@ -362,14 +372,15 @@ function ovSource(m, key, groupVal, effVal, fmt) {
   return `<span class="tag inherit">继承用户组(${esc(inherited)})</span>`;
 }
 const BW_PRESETS = [
-  { label: '不限速', kbps: 0 },
-  { label: '4K (80 Mbps)', kbps: 80000 },
-  { label: '1080p (20 Mbps)', kbps: 20000 },
-  { label: '720p (8 Mbps)', kbps: 8000 },
+  { label: '不限速', mbps: 0 },
+  { label: '5 MB/s', mbps: 5 },
+  { label: '10 MB/s', mbps: 10 },
+  { label: '15 MB/s', mbps: 15 },
+  { label: '20 MB/s', mbps: 20 },
 ];
 function bwPresetButtons(inputId) {
   return BW_PRESETS.map((p) =>
-    `<button class="btn sm" type="button" onclick="document.getElementById('${inputId}').value='${p.kbps}'">${esc(p.label)}</button>`).join(' ');
+    `<button class="btn sm" type="button" onclick="document.getElementById('${inputId}').value='${p.mbps}'">${esc(p.label)}</button>`).join(' ');
 }
 function overrideEditor(m, libs) {
   const ov = m.overrides || {};
@@ -394,8 +405,8 @@ function overrideEditor(m, libs) {
       <div class="ov-src">${ovSource(m, 'bandwidth_limit_kbps', grp.bandwidth_limit_kbps || 0, eff.bandwidth_limit_kbps, fmtKbps)}</div>
       <div class="ov-controls">
         <div style="margin-bottom:4px">${bwPresetButtons('ov-bandwidth')}</div>
-        <input id="ov-bandwidth" type="number" min="0" placeholder="继承" value="${esc(num('bandwidth_limit_kbps'))}" style="width:110px">
-        <span class="muted">kbps，0=不限速</span>
+        <input id="ov-bandwidth" type="number" min="0" step="0.1" placeholder="继承" value="${esc(num('bandwidth_limit_kbps') === '' ? '' : kbpsToMBps(num('bandwidth_limit_kbps')))}" style="width:110px">
+        <span class="muted">MB/s，0=不限速。保存后正在播放的人会重签限速。</span>
         <button class="btn sm" type="button" onclick="clearOverrideField('bandwidth_limit_kbps')">还原</button></div></div>
     <div class="ov-row"><div class="ov-label">设备</div>
       <div class="ov-src">${ovSource(m, 'max_devices', grp.max_devices || 0, eff.max_devices, (v) => v ? v + ' 台' : '不限')}</div>
@@ -438,7 +449,7 @@ function collectOverridesFromForm(existing) {
   else ov.max_streams = parseInt(streams, 10);
   const bandwidth = ($('#ov-bandwidth') || {}).value;
   if (bandwidth === '' || bandwidth == null) delete ov.bandwidth_limit_kbps;
-  else ov.bandwidth_limit_kbps = parseInt(bandwidth, 10);
+  else ov.bandwidth_limit_kbps = mBpsToKbps(parseFloat(bandwidth));
   const devices = ($('#ov-devices') || {}).value;
   if (devices === '' || devices == null) delete ov.max_devices;
   else ov.max_devices = parseInt(devices, 10);
@@ -725,8 +736,8 @@ function groupForm(prefix, g) {
     <div class="help">默认限制。0 = 不限。成员详情里可以逐个覆盖。</div>
     <div class="form-row"><label>带宽限速</label>
       <div><div style="margin-bottom:4px">${bwPresetButtons(prefix + '-bandwidth')}</div>
-      <input id="${prefix}-bandwidth" type="number" min="0" value="${v('bandwidth_limit_kbps', 0)}" style="width:110px">
-      <span class="muted">kbps，0 = 不限速</span></div></div>
+      <input id="${prefix}-bandwidth" type="number" min="0" step="0.1" value="${esc(kbpsToMBps(g.bandwidth_limit_kbps || 0))}" style="width:110px">
+      <span class="muted">MB/s，0 = 不限速。保存后该组未覆盖成员会重签限速。</span></div></div>
     <div class="form-row"><label>并发</label><input id="${prefix}-streams" type="number" min="0" value="${v('max_streams', 2)}" style="width:90px"><span class="muted">路，0 = 不限</span></div>
     <div class="form-row"><label>设备</label><input id="${prefix}-devices" type="number" min="0" value="${v('max_devices', 3)}" style="width:90px"><span class="muted">台，0 = 不限</span></div>
     <div class="form-row"><label>权限</label>
@@ -743,7 +754,7 @@ function groupPayload(prefix) {
     billing_mode: $(`#${prefix}-billing`).value,
     duration_days: parseInt($(`#${prefix}-days`).value, 10) || 0,
     traffic_quota_bytes: Math.round(gib * 1024 ** 3),
-    bandwidth_limit_kbps: parseInt($(`#${prefix}-bandwidth`).value, 10) || 0,
+    bandwidth_limit_kbps: mBpsToKbps(parseFloat($(`#${prefix}-bandwidth`).value) || 0),
     max_streams: parseInt($(`#${prefix}-streams`).value, 10) || 0,
     max_devices: parseInt($(`#${prefix}-devices`).value, 10) || 0,
     allow_transcode: $(`#${prefix}-transcode`).checked,
@@ -754,7 +765,7 @@ async function submitGroup(prefix, existingId) {
   const payload = groupPayload(prefix);
   try {
     if (existingId) {
-      if (!confirm('保存后会在下一次策略下发时更新该组所有未覆盖成员的限制。')) return;
+      if (!confirm('保存后会立即更新该组未单独覆盖限速的成员，正在播放的人会重签限速。')) return;
       await api(`/api/groups/${encodeURIComponent(existingId)}`, { method: 'PUT', body: JSON.stringify(payload) });
       toast('已保存'); closeModal();
     } else {

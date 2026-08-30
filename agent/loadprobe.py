@@ -171,7 +171,7 @@ class SpeedLog:
     # two disagree whenever throughput is changing: a 5s user window against
     # a 3s egress window reported 117%-176% of egress as "attributed" while
     # speeds were falling, which reads as a plainly wrong number.
-    RATE_WINDOW = 3.0
+    RATE_WINDOW = 8.0
     #: Players buffer in bursts and may CLOSE the connection between bursts,
     #: reopening it a minute later for the next range. While no socket exists
     #: the viewer's true wire speed is zero -- keep reporting that zero for a
@@ -495,7 +495,7 @@ class Sampler:
     """
 
     INTERVAL = 1.0   # seconds between counter reads
-    WINDOW = 3.0     # seconds of counter history averaged into the reading
+    WINDOW = 8.0     # seconds of counter history averaged into the reading
 
     def __init__(self, iface: str, ports: set[int], speedlog: "SpeedLog") -> None:
         self.iface = iface

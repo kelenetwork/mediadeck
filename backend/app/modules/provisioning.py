@@ -83,12 +83,12 @@ def nginx_site(node: Any) -> str:
     location {str(pool.url_prefix).rstrip('/')}/ {{{guard}
         alias {node_path}/;
 
-        # Per-user bandwidth cap, taken from the *signed* r argument
-        # (bytes/second, 0 = uncapped). Enforced per connection, so the
-        # burst window must stay small: every seek opens a new connection
-        # and a large limit_rate_after would hand each one a free sprint.
-        limit_conn mediadeck_perip 8;
-        limit_rate_after 2m;
+        # Per-user cap from the signed r argument (bytes/second, 0 =
+        # uncapped). limit_rate is per request, so a second Range socket
+        # would double the number on the panel. HTTP/1.1 plus one live
+        # connection is what makes 15 MB/s mean 15 MB/s; players abort the
+        # previous request on seek. No burst window.
+        limit_conn mediadeck_peruser 1;
         limit_rate $mediadeck_rate;
 
         # Real transfer bytes per user for the panel's live-speed display.
@@ -111,12 +111,19 @@ def nginx_site(node: Any) -> str:
     return f"""# /etc/nginx/sites-available/mediadeck-{node.name}
 # Media delivery for streaming node "{node.name}". Managed by mediadeck.
 
-# Effective per-connection rate. The signed r argument is the member's cap in
-# bytes/second; "0" means the operator chose uncapped. A link with no r at all
-# predates the rate rollout and gets a conservative safety cap instead.
+# Effective rate. The signed r argument is the member's cap in bytes/second;
+# "0" means the operator chose uncapped. A link with no r at all predates the
+# rate rollout and gets a conservative safety cap instead.
 map $arg_r $mediadeck_rate {{
     ""      15728640;
     default $arg_r;
+}}
+
+# Cap is per member, not per TCP connection. Empty u (unsigned / unresolved)
+# falls back to the client address so those sockets do not share one bucket.
+map $arg_u $mediadeck_user_key {{
+    ""      $remote_addr;
+    default $arg_u;
 }}
 
 # One line per completed request: unix-time, peer address, anonymised user
@@ -129,7 +136,7 @@ log_format mediadeck_speed
     '$msec a=$remote_addr p=$remote_port u=$arg_u r=$arg_r '
     '$bytes_sent $request_time';
 
-limit_conn_zone $binary_remote_addr zone=mediadeck_perip:10m;
+limit_conn_zone $mediadeck_user_key zone=mediadeck_peruser:10m;
 
 server {{
     listen 80;
@@ -140,8 +147,11 @@ server {{
 }}
 
 server {{
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
+    # HTTP/1.1 on purpose. HTTP/2 multiplexes many Range requests onto one
+    # TCP connection; nginx limit_rate then applies per stream, so a 15 MB/s
+    # cap becomes 15 x N. Players already speak Range over HTTP/1.1.
+    listen 443 ssl;
+    listen [::]:443 ssl;
     server_name {host};
 
     # Direct TLS. This hostname must be DNS-only (grey cloud): video traffic
