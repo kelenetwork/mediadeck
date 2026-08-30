@@ -915,9 +915,14 @@ async def _sessions_with_speed() -> list[dict[str, Any]]:
     for session in sessions:
         s = dict(session)
         real = node_speeds.get(user_tag(str(s.get("UserId") or "")))
-        if real:
+        if real is not None:
             # Node speeds are per *user*: concurrent sessions of one account
             # share the tag, so both rows show the account's wire rate.
+            # ZERO is a real measurement, not an absence: a player fills its
+            # buffer and then reads nothing for a minute, and during that
+            # pause the wire truly carries 0 B/s for this viewer. Treating 0
+            # as falsy pushed every buffered viewer back to the bitrate
+            # estimate, which is exactly the wrong number being reported.
             s["SpeedBps"] = int(real)
             s["SpeedSource"] = "node"
         else:

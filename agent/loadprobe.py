@@ -172,6 +172,12 @@ class SpeedLog:
     # a 3s egress window reported 117%-176% of egress as "attributed" while
     # speeds were falling, which reads as a plainly wrong number.
     RATE_WINDOW = 3.0
+    #: Players buffer in bursts and may CLOSE the connection between bursts,
+    #: reopening it a minute later for the next range. While no socket exists
+    #: the viewer's true wire speed is zero -- keep reporting that zero for a
+    #: while instead of vanishing, because vanishing sends the panel back to
+    #: its bitrate estimate, which is the wrong number.
+    LINGER = 600.0
 
     def __init__(self, path: str, ports: set[int] | None = None) -> None:
         self.path = path
@@ -185,6 +191,8 @@ class SpeedLog:
         self._sock_owners: dict[str, tuple[str, float]] = {}
         # peer socket -> (ts, bytes_acked) samples over RATE_WINDOW
         self._conns: dict[str, list[tuple[float, int]]] = {}
+        # utag -> last time we saw an attributed live socket for them
+        self._tag_last_live: dict[str, float] = {}
         if path:
             self._seed_owners()
             threading.Thread(target=self._tail, daemon=True).start()
@@ -411,6 +419,7 @@ class SpeedLog:
         now = time.time()
         cutoff = now - self.WINDOW
         out: dict[str, float] = {}
+        live_tags: set[str] = set()
 
         with self._lock:
             # --- live sockets (authoritative) --------------------------------
@@ -429,10 +438,30 @@ class SpeedLog:
                     continue
                 span = samples[-1][0] - samples[0][0]
                 delta = samples[-1][1] - samples[0][1]
-                if span <= 0 or delta <= 0:
+                if span <= 0:
                     continue
-                out[utag] = out.get(utag, 0.0) + delta / span
+                # An attributed socket that moved nothing is a real
+                # measurement of ZERO, and it is the normal state of a
+                # media player: fill the buffer, go quiet for a minute,
+                # burst again. Dropping these made the panel fall back to
+                # its bitrate estimate for every buffered viewer, which is
+                # exactly the wrong number the owner kept seeing.
+                live_tags.add(utag)
+                self._tag_last_live[utag] = now
+                out[utag] = out.get(utag, 0.0) + max(0.0, delta) / span
                 attributed_ips.add(peer_ip)
+
+            # Players may CLOSE the connection between buffer bursts and
+            # reopen it a minute later for the next range. While no socket
+            # exists the viewer's true wire speed IS zero -- keep saying so
+            # for a while instead of vanishing, because vanishing sends the
+            # panel back to its bitrate estimate.
+            for utag, ts in list(self._tag_last_live.items()):
+                if now - ts > self.LINGER:
+                    del self._tag_last_live[utag]
+                elif utag not in out:
+                    out[utag] = 0.0
+                    live_tags.add(utag)
 
             # --- completed requests (fallback for unknown addresses) ---------
             self._events = [e for e in self._events if e[0] >= cutoff]
@@ -449,7 +478,9 @@ class SpeedLog:
 
         for utag, rate in fallback.items():
             out.setdefault(utag, rate)
-        return {k: int(v) for k, v in out.items() if v >= 1}
+        # Zero is kept for live-socket users (measured idle); the completed-
+        # request fallback still drops dust so finished viewers age out.
+        return {k: int(v) for k, v in out.items() if v >= 1 or k in live_tags}
 
 
 class Sampler:
