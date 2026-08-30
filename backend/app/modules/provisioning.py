@@ -112,10 +112,14 @@ map $arg_r $mediadeck_rate {{
     default $arg_r;
 }}
 
-# One line per completed request: unix-time, anonymised user tag, bytes,
-# request seconds. The loadprobe agent tails this to report real per-user
-# wire speed; tags are hashes, so the log never names an account.
-log_format mediadeck_speed '$msec $arg_u $bytes_sent $request_time';
+# One line per completed request: unix-time, peer address, anonymised user
+# tag, rate cap, bytes, request seconds. The loadprobe agent uses the address
+# to map live sockets to a member, because a request is only logged when it
+# *ends* -- most playback requests run for minutes, so completed lines alone
+# cannot show what a viewer is doing right now. Tags are hashes, so the log
+# never names an account.
+log_format mediadeck_speed
+    '$msec a=$remote_addr u=$arg_u r=$arg_r $bytes_sent $request_time';
 
 limit_conn_zone $binary_remote_addr zone=mediadeck_perip:10m;
 
