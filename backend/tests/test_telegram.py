@@ -75,10 +75,24 @@ def test_registration_cannot_be_opened_on_a_stopped_bot() -> None:
     """Advertising a door nobody can walk through would just confuse members."""
     with TestClient(app) as client:
         client.post("/api/settings/telegram", auth=ADMIN,
-                    json={"bot_token": "", "enabled": False})
+                    json={"bot_token": "", "enabled": False,
+                          "allow_admin_grant": False, "allow_invite": False,
+                          "allow_redeem": False})
         r = client.post("/api/settings/telegram", auth=ADMIN,
-                        json={"enabled": False, "registration_enabled": True})
+                        json={"enabled": False, "allow_invite": True})
         assert r.status_code >= 400
+
+
+def test_the_old_single_registration_switch_is_gone() -> None:
+    """One switch could only be open to everyone or closed to everyone.
+
+    It is replaced by three channel switches; leaving the old key in the
+    payload would let a stale UI reopen a door the operator shut.
+    """
+    with TestClient(app) as client:
+        cfg = client.get("/api/settings/telegram", auth=ADMIN).json()
+        assert "registration_enabled" not in cfg
+        assert {"allow_admin_grant", "allow_invite", "allow_redeem"} <= set(cfg)
 
 
 def test_settings_bounds_are_enforced() -> None:
@@ -169,7 +183,8 @@ class _FakeMembers:
 
 def _bot(members=None, emby=None, cfg=None, db=None) -> TelegramBot:
     base = {"enabled": True, "bot_token": FAKE_CRED,
-            "registration_enabled": True, "register_days": 30,
+            "allow_admin_grant": True, "allow_invite": True,
+            "allow_redeem": True, "register_days": 30,
             "max_users": 0, "require_group": "", "default_group_id": "",
             "emby_public_url": "https://emby.example"}
     base.update(cfg or {})
@@ -263,11 +278,24 @@ def test_a_taken_username_fails_without_creating_a_member() -> None:
 
 
 def test_registration_closed_is_refused() -> None:
+    """Every channel shut is a shut door, and it has to say so."""
     emby = _FakeEmby()
-    bot = _bot(_FakeMembers(), emby, cfg={"registration_enabled": False})
+    bot = _bot(_FakeMembers(), emby,
+               cfg={"allow_admin_grant": False, "allow_invite": False,
+                    "allow_redeem": False})
     asyncio.run(bot._start_registration(1, "42"))
     assert emby.created == []
     assert any("暂停注册" in m for m in bot.sent)  # type: ignore[attr-defined]
+
+
+def test_one_open_channel_keeps_registration_reachable() -> None:
+    """The inverse: shutting two channels must not close the third."""
+    emby = _FakeEmby()
+    bot = _bot(_FakeMembers(), emby,
+               cfg={"allow_admin_grant": False, "allow_invite": False,
+                    "allow_redeem": True})
+    asyncio.run(bot._start_registration(1, "42"))
+    assert not any("暂停注册" in m for m in bot.sent)  # type: ignore[attr-defined]
 
 
 def test_a_full_slot_cap_blocks_registration() -> None:
@@ -502,3 +530,249 @@ def test_a_bot_without_a_credential_reports_disabled_and_does_not_call_out() -> 
 
 def test_generated_passwords_differ() -> None:
     assert generate_password() != generate_password()
+
+
+# -- registration channels in the conversation ------------------------------
+# The ordering contract: resolve() decides, the account is created, and only
+# then is the credential spent. Reversed, a member whose chosen username turns
+# out to be taken loses the card they paid for and gets no account.
+
+class _FakeRegistration:
+    """Records what was resolved and what was consumed, in order."""
+
+    def __init__(self, verdict=None) -> None:
+        self.verdict = verdict
+        self.resolved: list[tuple] = []
+        self.consumed: list[tuple] = []
+        self.quota = 0
+        self.minted: list[str] = []
+
+    def resolve(self, tg_user_id, credential=None):
+        self.resolved.append((str(tg_user_id), credential))
+        if self.verdict is None:
+            return _Verdict(allowed=False, reason="没有可用的凭证")
+        return self.verdict
+
+    def consume(self, admission, new_user_id):
+        self.consumed.append((getattr(admission, "via", ""), new_user_id))
+        return True
+
+    def invite_quota(self, user_id):
+        return self.quota
+
+    def list_invites(self, user_id, limit=10):
+        return [{"code": c, "uses_left": 1, "expires_at": None,
+                 "revoked": 0, "usable": True} for c in self.minted]
+
+    def spend_quota_for_invite(self, user_id, ttl_days=0):
+        if self.quota <= 0:
+            raise ValueError("你没有可用的邀请名额。")
+        self.quota -= 1
+        made = "INVITE" + str(len(self.minted) + 1)
+        self.minted.append(made)
+        return {"code": made}
+
+
+class _Verdict:
+    def __init__(self, allowed=True, via="invite", reason="", group_id="",
+                 days=30, inviter_id="", credential="") -> None:
+        self.allowed = allowed
+        self.via = via
+        self.reason = reason or ("邀请码有效" if allowed else "无效")
+        self.group_id = group_id
+        self.days = days
+        self.inviter_id = inviter_id
+        self.credential = credential
+        self.tg_user_id = ""
+
+
+def test_registration_asks_for_a_credential_before_a_username() -> None:
+    members, emby = _FakeMembers(), _FakeEmby()
+    reg = _FakeRegistration()
+    bot = _bot(members, emby)
+    bot._registration = reg
+
+    asyncio.run(bot._start_registration(1, "42"))
+
+    assert emby.created == []
+    assert any("邀请码" in m for m in bot.sent)  # type: ignore[attr-defined]
+    assert bot._pending["1"][0] == "credential"
+
+
+def test_a_pre_authorised_chat_skips_straight_to_the_username() -> None:
+    """Asking someone the operator already named for a code is a dead end."""
+    members, emby = _FakeMembers(), _FakeEmby()
+    reg = _FakeRegistration(_Verdict(via="admin"))
+    bot = _bot(members, emby)
+    bot._registration = reg
+
+    asyncio.run(bot._start_registration(1, "42"))
+
+    assert bot._pending["1"][0] == "username"
+    assert any("用户名" in m for m in bot.sent)  # type: ignore[attr-defined]
+
+
+def test_a_bad_credential_keeps_the_conversation_open() -> None:
+    """A mistyped code should cost one message, not the whole flow."""
+    members, emby = _FakeMembers(), _FakeEmby()
+    reg = _FakeRegistration(_Verdict(allowed=False, reason="这个邀请码已被作废。"))
+    bot = _bot(members, emby)
+    bot._registration = reg
+    bot._pending["1"] = ("credential", time.time() + 600, {})
+
+    asyncio.run(bot._submit_credential(1, "42", "BADCODE1"))
+
+    assert emby.created == []
+    assert reg.consumed == []
+    assert any("已被作废" in m for m in bot.sent)  # type: ignore[attr-defined]
+    assert bot._pending["1"][0] == "credential"
+
+
+def test_a_good_credential_advances_to_the_username_without_spending_it() -> None:
+    members, emby = _FakeMembers(), _FakeEmby()
+    reg = _FakeRegistration(_Verdict(credential="GOODCODE"))
+    bot = _bot(members, emby)
+    bot._registration = reg
+
+    asyncio.run(bot._submit_credential(1, "42", "GOODCODE"))
+
+    assert bot._pending["1"][0] == "username"
+    # Nothing is spent yet: the account does not exist.
+    assert reg.consumed == []
+
+
+def test_the_credential_is_spent_only_after_the_account_exists() -> None:
+    members, emby = _FakeMembers(), _FakeEmby()
+    reg = _FakeRegistration()
+    admission = _Verdict(via="redeem", credential="CARD", days=90,
+                         group_id="vip")
+    bot = _bot(members, emby)
+    bot._registration = reg
+
+    asyncio.run(bot._finish_registration(1, "42", "tguser", "newmember",
+                                        admission=admission))
+
+    assert emby.created == ["newmember"]
+    assert reg.consumed == [("redeem", "emby-newmember")]
+    payload = members.upserted[0][2]
+    assert payload["register_via"] == "redeem"
+    assert payload["group_id"] == "vip"
+    assert payload["register_at"]
+
+
+def test_a_failed_creation_does_not_spend_the_credential() -> None:
+    """The whole point of the ordering: a taken username must cost nothing."""
+    members, emby = _FakeMembers(), _FakeEmby(fail=True)
+    reg = _FakeRegistration()
+    bot = _bot(members, emby)
+    bot._registration = reg
+
+    asyncio.run(bot._finish_registration(
+        1, "42", "tguser", "duplicate",
+        admission=_Verdict(via="redeem", credential="CARD")))
+
+    assert members.upserted == []
+    assert reg.consumed == []
+    assert any("创建失败" in m for m in bot.sent)  # type: ignore[attr-defined]
+
+
+def test_a_rejected_username_does_not_spend_the_credential() -> None:
+    members, emby = _FakeMembers(), _FakeEmby()
+    reg = _FakeRegistration()
+    bot = _bot(members, emby)
+    bot._registration = reg
+
+    asyncio.run(bot._finish_registration(
+        1, "42", "tguser", "no",
+        admission=_Verdict(via="invite", credential="INV")))
+
+    assert emby.created == []
+    assert reg.consumed == []
+
+
+def test_an_invite_records_who_vouched_for_the_new_member() -> None:
+    members, emby = _FakeMembers(), _FakeEmby()
+    reg = _FakeRegistration()
+    bot = _bot(members, emby)
+    bot._registration = reg
+
+    asyncio.run(bot._finish_registration(
+        1, "42", "tguser", "newmember",
+        admission=_Verdict(via="invite", credential="INV",
+                           inviter_id="emby-owner")))
+
+    payload = members.upserted[0][2]
+    assert payload["inviter_id"] == "emby-owner"
+    assert payload["register_via"] == "invite"
+
+
+def test_members_see_their_invite_codes_and_remaining_slots() -> None:
+    member = {"emby_user_id": "u1", "username": "someone", "status": "active",
+              "expires_at": int(time.time()) + 86400}
+    reg = _FakeRegistration()
+    reg.quota = 2
+    bot = _bot(_FakeMembers({"999": member}))
+    bot._registration = reg
+    edits: list[str] = []
+
+    async def fake_edit(chat, mid, text, keyboard=None):
+        edits.append(text)
+
+    bot._edit = fake_edit  # type: ignore[assignment]
+    asyncio.run(bot._invites_view(1, 2, member))
+
+    assert any("剩余名额" in t and "2" in t for t in edits)
+
+
+def test_minting_an_invite_debits_a_slot_and_shows_the_code() -> None:
+    member = {"emby_user_id": "u1", "username": "someone", "status": "active",
+              "expires_at": int(time.time()) + 86400}
+    reg = _FakeRegistration()
+    reg.quota = 1
+    bot = _bot(_FakeMembers({"999": member}))
+    bot._registration = reg
+    edits: list[str] = []
+
+    async def fake_edit(chat, mid, text, keyboard=None):
+        edits.append(text)
+
+    bot._edit = fake_edit  # type: ignore[assignment]
+    asyncio.run(bot._invites_view(1, 2, member, mint=True))
+
+    assert reg.quota == 0
+    assert reg.minted == ["INVITE1"]
+    assert any("INVITE1" in t for t in edits)
+
+
+def test_a_member_with_no_slots_is_told_rather_than_ignored() -> None:
+    member = {"emby_user_id": "u1", "username": "someone", "status": "active",
+              "expires_at": int(time.time()) + 86400}
+    reg = _FakeRegistration()
+    reg.quota = 0
+    bot = _bot(_FakeMembers({"999": member}))
+    bot._registration = reg
+    edits: list[str] = []
+
+    async def fake_edit(chat, mid, text, keyboard=None):
+        edits.append(text)
+
+    bot._edit = fake_edit  # type: ignore[assignment]
+    asyncio.run(bot._invites_view(1, 2, member, mint=True))
+
+    assert reg.minted == []
+    assert any("名额" in t for t in edits)
+
+
+def test_a_broken_registration_service_does_not_crash_the_flow() -> None:
+    class _Broken:
+        def resolve(self, *a, **k):
+            raise RuntimeError("db down")
+
+    members, emby = _FakeMembers(), _FakeEmby()
+    bot = _bot(members, emby)
+    bot._registration = _Broken()
+
+    asyncio.run(bot._submit_credential(1, "42", "ANY"))
+
+    assert emby.created == []
+    assert any("暂时不可用" in m for m in bot.sent)  # type: ignore[attr-defined]

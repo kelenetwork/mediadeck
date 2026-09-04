@@ -269,16 +269,30 @@ class MemberService:
     # -- read ----------------------------------------------------------------
     def get(self, user_id: str) -> dict[str, Any] | None:
         row = self._db.one("SELECT * FROM members WHERE emby_user_id=?", (user_id,))
-        return self._decorate(row) if row else None
+        if not row:
+            return None
+        decorated = self._decorate(row)
+        # Same shape as a list row: a caller that reads invitee_count off the
+        # table and then off the detail view must not get a KeyError from one
+        # of them.
+        self._attach_tree([decorated])
+        return decorated
 
     def list(self, status: str | None = None, group_id: str | None = None,
              role: str | None = None, search: str | None = None,
-             limit: int = 500) -> list[dict[str, Any]]:
+             limit: int = 500, register_via: str | None = None,
+             inviter_id: str | None = None) -> list[dict[str, Any]]:
         sql = "SELECT * FROM members"
         clauses, params = [], []
         if group_id:
             clauses.append("group_id=?")
             params.append(group_id)
+        if register_via:
+            clauses.append("register_via=?")
+            params.append(str(register_via))
+        if inviter_id:
+            clauses.append("inviter_id=?")
+            params.append(str(inviter_id))
         if search:
             clauses.append("(username LIKE ? OR note LIKE ? OR contact LIKE ?)")
             like = f"%{search}%"
@@ -288,6 +302,7 @@ class MemberService:
         sql += " ORDER BY username COLLATE NOCASE ASC LIMIT ?"
         params.append(max(1, min(limit, 5000)))
         rows = [self._decorate(r) for r in self._db.query(sql, tuple(params))]
+        self._attach_tree(rows)
         # Status/role are filtered after decoration: the *effective* state is
         # time-dependent and roles live in a comma-separated column.
         if status:
@@ -295,6 +310,38 @@ class MemberService:
         if role:
             rows = [r for r in rows if role in r["roles"]]
         return rows
+
+    def _attach_tree(self, rows: list[dict[str, Any]]) -> None:
+        """Add invitee counts and inviter names in two queries, not 2N.
+
+        The list renders hundreds of rows; asking per row is how a member page
+        starts taking seconds.
+        """
+        if not rows:
+            return
+        counts = {
+            str(r["inviter_id"]): int(r["n"] or 0) for r in self._db.query(
+                "SELECT inviter_id, COUNT(*) AS n FROM members"
+                " WHERE inviter_id <> '' GROUP BY inviter_id")
+        }
+        wanted = {str(r.get("inviter_id") or "") for r in rows if r.get("inviter_id")}
+        names: dict[str, str] = {}
+        if wanted:
+            placeholders = ",".join("?" * len(wanted))
+            names = {
+                str(r["emby_user_id"]): str(r["username"] or "")
+                for r in self._db.query(
+                    "SELECT emby_user_id, username FROM members"
+                    f" WHERE emby_user_id IN ({placeholders})", tuple(wanted))
+            }
+        for row in rows:
+            uid = str(row.get("emby_user_id") or "")
+            inviter_id = str(row.get("inviter_id") or "")
+            row["invitee_count"] = counts.get(uid, 0)
+            # An inviter whose account is gone still gets a label: '—' would
+            # read as "nobody invited them", which is a different fact.
+            row["inviter_name"] = (
+                names.get(inviter_id, "(已删除)") if inviter_id else "")
 
     def _decorate(self, row: dict[str, Any]) -> dict[str, Any]:
         out = dict(row)
@@ -333,6 +380,9 @@ class MemberService:
         out["device_count"] = self._db.one(
             "SELECT COUNT(*) AS n FROM devices WHERE emby_user_id=? AND blocked=0",
             (out["emby_user_id"],))["n"]
+        out["register_via"] = str(out.get("register_via") or "legacy")
+        out["inviter_id"] = str(out.get("inviter_id") or "")
+        out["invite_quota"] = int(out.get("invite_quota") or 0)
         return out
 
     def detail(self, user_id: str, *, audit_limit: int = 50) -> dict[str, Any] | None:
@@ -428,6 +478,20 @@ class MemberService:
             "traffic_used_bytes",
             existing["traffic_used_bytes"] if existing else 0))
 
+        # Provenance is written once, at creation. An update that omitted these
+        # would quietly relabel where a member came from, and the invite tree
+        # is only worth having if it cannot be rewritten by a later edit.
+        register_via = str(payload.get(
+            "register_via",
+            existing["register_via"] if existing else "legacy") or "legacy")
+        inviter_id = str(payload.get(
+            "inviter_id", existing["inviter_id"] if existing else "") or "")
+        if inviter_id == user_id:
+            inviter_id = ""  # nobody invites themselves
+        register_at = payload.get(
+            "register_at", existing["register_at"] if existing else None)
+        register_at = int(register_at) if register_at else None
+
         row = (
             username or (existing["username"] if existing else ""),
             group_id,
@@ -458,12 +522,15 @@ class MemberService:
             self._db.execute(
                 "INSERT INTO members (username,group_id,roles,status,expires_at,"
                 "traffic_used_bytes,traffic_period_start,note,contact,updated_at,"
-                "emby_user_id,created_at,overrides_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                row + (user_id, now, "{}"))
+                "emby_user_id,created_at,overrides_json,register_via,inviter_id,"
+                "register_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                row + (user_id, now, "{}", register_via, inviter_id, register_at))
             self.audit(actor, "member.create", user_id, encode_audit_detail({
                 "group_id": {"from": None, "to": group_id},
                 "status": {"from": None, "to": status},
                 "expires_at": {"from": None, "to": expires_at},
+                "register_via": {"from": None, "to": register_via},
+                "inviter_id": {"from": None, "to": inviter_id},
             }))
         return self.get(user_id)  # type: ignore[return-value]
 
@@ -606,15 +673,88 @@ class MemberService:
             (now, until))
         return [self._decorate(r) for r in rows]
 
-    def delete(self, user_id: str, actor: str = "system") -> bool:
-        if not self._db.one("SELECT 1 AS x FROM members WHERE emby_user_id=?", (user_id,)):
+    def inviter_of(self, user_id: str) -> dict[str, Any] | None:
+        """The member who vouched for this one, if they still exist."""
+        row = self._db.one(
+            "SELECT inviter_id FROM members WHERE emby_user_id=?", (str(user_id),))
+        inviter_id = str((row or {}).get("inviter_id") or "")
+        if not inviter_id or inviter_id == str(user_id):
+            return None
+        return self.get(inviter_id)
+
+    def invitees_of(self, user_id: str) -> list[dict[str, Any]]:
+        rows = self._db.query(
+            "SELECT * FROM members WHERE inviter_id=? ORDER BY username",
+            (str(user_id),))
+        return [self._decorate(r) for r in rows]
+
+    def delete_preview(self, user_id: str) -> dict[str, Any]:
+        """Exactly who a delete would remove, for the confirmation dialog.
+
+        The operator has to be told before they click, not after: cascade means
+        one click can remove an account they never named.
+        """
+        target = self.get(user_id)
+        if not target:
             raise KeyError(user_id)
-        # Removing membership stops enforcement but must not touch the Emby
-        # account: the operator may simply want it unmanaged again.
+        inviter = self.inviter_of(user_id)
+        cascade = [inviter] if inviter else []
+        return {
+            "target": {
+                "emby_user_id": target["emby_user_id"],
+                "username": target.get("username") or "",
+                "register_via": target.get("register_via") or "legacy",
+            },
+            "cascade": [{
+                "emby_user_id": m["emby_user_id"],
+                "username": m.get("username") or "",
+                "reason": "邀请人连坐",
+            } for m in cascade],
+        }
+
+    def _remove_rows(self, user_id: str) -> None:
         self._db.execute("DELETE FROM members WHERE emby_user_id=?", (user_id,))
         self._db.execute("DELETE FROM devices WHERE emby_user_id=?", (user_id,))
-        self.audit(actor, "member.delete", user_id, "membership removed; Emby account untouched")
-        return True
+
+    def delete(self, user_id: str, actor: str = "system",
+               cascade: bool = True) -> dict[str, Any]:
+        """Delete a member, and by default their inviter too.
+
+        Cascade stops at one level, deliberately. Walking the whole chain would
+        let a single bad account take out an arbitrarily long line of members
+        above it -- one deletion, an unbounded blast radius -- and no operator
+        clicking 'delete' on one row is asking for that. One level is the rule
+        the owner set: whoever vouched for an account answers for it, and
+        nobody answers for a deletion the system performed.
+
+        Returns the ids removed rather than a bare True, because with cascade
+        the caller cannot otherwise know what it just did.
+        """
+        if not self._db.one("SELECT 1 AS x FROM members WHERE emby_user_id=?",
+                            (user_id,)):
+            raise KeyError(user_id)
+        target = self.get(user_id) or {}
+        inviter = self.inviter_of(user_id) if cascade else None
+
+        self._remove_rows(user_id)
+        self.audit(actor, "member.delete", user_id,
+                   "membership removed" + ("; cascading to inviter"
+                                           if inviter else ""))
+        deleted = [str(user_id)]
+
+        if inviter:
+            inviter_id = str(inviter["emby_user_id"])
+            self._remove_rows(inviter_id)
+            # A distinct action, not another member.delete: the operator never
+            # asked for this row, and the audit trail has to say whose deletion
+            # took it with them.
+            self.audit(actor, "member.delete.cascade", inviter_id,
+                       f"cascaded from {target.get('username') or user_id}")
+            deleted.append(inviter_id)
+            # Orphaned invitees keep their history: blanking inviter_id would
+            # erase who brought them in, which is the one fact the tree exists
+            # to record.
+        return {"deleted": deleted, "emby_deleted": []}
 
     def register_device(self, user_id: str, device_id: str, *,
                         device_name: str = "", client: str = "",

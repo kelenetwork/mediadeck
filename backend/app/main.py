@@ -50,6 +50,7 @@ from app.modules.provisioning import (
     enroll_command,
     install_script,
 )
+from app.modules.registration import RegistrationService
 from app.modules.scheduler import Scheduler
 from app.modules.settings import SettingsService
 from app.modules.sharing import SharingDetector
@@ -326,9 +327,13 @@ async def _startup() -> None:
     # Long polling, not a webhook: a webhook needs a public HTTPS route into
     # the panel, while polling reaches out instead and leaves the panel
     # reachable only from where it already was.
+    app.state.registration = RegistrationService(
+        app.state.db, app.state.groups,
+        app.state.settings_service.telegram_config)
     app.state.telegram = TelegramBot(
         app.state.settings_service.telegram_config, app.state.members,
-        emby=app.state.emby, stats=app.state.stats, db=app.state.db)
+        emby=app.state.emby, stats=app.state.stats, db=app.state.db,
+        registration=app.state.registration)
     app.state.telegram.start()
 
     # ---- plugins ---------------------------------------------------------
@@ -1147,7 +1152,8 @@ async def groups_delete(group_id: str, user: str = Depends(_auth)) -> dict[str, 
 @app.get("/api/members", dependencies=[Depends(_auth)])
 async def members_list(status: str | None = None, group_id: str | None = None,
                        role: str | None = None, search: str | None = None,
-                       limit: int = 500) -> dict[str, Any]:
+                       limit: int = 500, register_via: str | None = None,
+                       inviter_id: str | None = None) -> dict[str, Any]:
     """Members plus the Emby accounts that are not enrolled yet.
 
     Showing both in one payload is deliberate: the operator needs to see who is
@@ -1156,7 +1162,16 @@ async def members_list(status: str | None = None, group_id: str | None = None,
     """
     limit = max(1, min(int(limit or 500), 5000))
     members = app.state.members.list(status=status, group_id=group_id,
-                                     role=role, search=search, limit=limit)
+                                     role=role, search=search, limit=limit,
+                                     register_via=register_via,
+                                     inviter_id=inviter_id)
+    # One query for the whole page, joined in memory: the alternative is a
+    # stats lookup per row, which is what makes a member list feel broken.
+    hours = {}
+    with contextlib.suppress(Exception):
+        hours = app.state.stats.hours_this_month()
+    for member in members:
+        member["watch_hours"] = hours.get(member["emby_user_id"], 0.0)
     truncated = len(members) >= limit
     known = {m["emby_user_id"] for m in members}
     unmanaged: list[dict[str, Any]] = []
@@ -1280,23 +1295,45 @@ async def members_upsert(user_id: str, payload: dict[str, Any] = Body(...),  # n
     return member
 
 
-@app.delete("/api/members/{user_id}", dependencies=[Depends(_auth)])
-async def members_delete(user_id: str, delete_emby: bool = False,
-                         user: str = Depends(_auth)) -> dict[str, bool]:
-    """Un-enrol by default. Deleting the Emby account is an explicit extra."""
+@app.get("/api/members/{user_id}/delete-preview", dependencies=[Depends(_auth)])
+async def members_delete_preview(user_id: str) -> dict[str, Any]:
+    """Exactly who a delete would remove, before the operator commits to it."""
     try:
-        app.state.members.delete(user_id, actor=user)
+        return app.state.members.delete_preview(user_id)
     except KeyError:
         raise HTTPException(404, "unknown member") from None
-    emby_deleted = False
+
+
+@app.delete("/api/members/{user_id}", dependencies=[Depends(_auth)])
+async def members_delete(user_id: str, delete_emby: bool = True,
+                         cascade: bool = True,
+                         user: str = Depends(_auth)) -> dict[str, Any]:
+    """Delete an account for real, and by default its inviter with it.
+
+    Both defaults changed in v0.19 on the owner's definition: "delete" means
+    the Emby account is gone, not merely unmanaged, and whoever vouched for an
+    account answers for it. Cascade stops after one level -- see
+    MemberService.delete -- so one click can never unravel a whole chain.
+    """
+    try:
+        preview = app.state.members.delete_preview(user_id)
+        result = app.state.members.delete(user_id, actor=user, cascade=cascade)
+    except KeyError:
+        raise HTTPException(404, "unknown member") from None
+
+    emby_deleted: list[str] = []
     if delete_emby:
-        with contextlib.suppress(Exception):
-            emby_deleted = bool(await app.state.emby.delete_user(user_id))
-        app.state.members.audit(
-            user, "member.delete_emby", user_id,
-            "Emby account deleted" if emby_deleted else "Emby delete failed",
-            ok=emby_deleted)
-    return {"deleted": True, "emby_deleted": emby_deleted}
+        for victim in result["deleted"]:
+            ok = False
+            with contextlib.suppress(Exception):
+                ok = bool(await app.state.emby.delete_user(victim))
+            if ok:
+                emby_deleted.append(victim)
+            app.state.members.audit(
+                user, "member.delete_emby", victim,
+                "Emby account deleted" if ok else "Emby delete failed", ok=ok)
+    return {"deleted": True, "removed": result["deleted"],
+            "emby_deleted": emby_deleted, **preview}
 
 
 @app.post("/api/members/{user_id}/renew", dependencies=[Depends(_auth)])
@@ -1764,6 +1801,128 @@ async def telegram_unbind(user_id: str, user: str = Depends(_auth)) -> dict[str,
         return app.state.members.unbind_telegram(user_id, actor=user)
     except KeyError:
         raise HTTPException(404, "member not found") from None
+
+
+# ---- registration channels --------------------------------------------------
+# Three ways in, each requiring something the operator issued: a pre-authorised
+# Telegram id, an invite a member spent a slot on, or a card. The panel is
+# where all three are minted and audited.
+
+@app.get("/api/redeem", dependencies=[Depends(_auth)])
+async def redeem_list(status: str | None = None, batch: str | None = None,
+                      limit: int = 500) -> dict[str, Any]:
+    return {
+        "codes": app.state.registration.list_redeem(
+            status=status, batch=batch, limit=limit),
+        "stats": app.state.registration.redeem_stats(),
+        "batches": app.state.registration.redeem_batches(),
+    }
+
+
+@app.post("/api/redeem/generate", dependencies=[Depends(_auth)])
+async def redeem_generate(payload: dict[str, Any] = Body(...),  # noqa: B008
+                          user: str = Depends(_auth)) -> dict[str, Any]:
+    try:
+        # Passed through as given: `or 1` here would turn an explicit count of
+        # 0 into a card the operator never asked for. Validation belongs to
+        # the service, which rejects it.
+        issued = app.state.registration.generate_redeem(
+            group_id=str(payload.get("group_id") or ""),
+            days=payload.get("days"),
+            count=payload.get("count"),
+            batch=str(payload.get("batch") or ""),
+            note=str(payload.get("note") or ""))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "天数与数量必须是整数") from None
+    # The codes themselves are the product and go back to the operator who
+    # asked; the audit trail records only how many, so a log reader cannot
+    # harvest unsold cards.
+    app.state.members.audit(
+        user, "redeem.generate", "",
+        f"count={len(issued)} group={payload.get('group_id')} "
+        f"days={payload.get('days')} batch={issued[0]['batch'] if issued else ''}")
+    return {"codes": issued, "count": len(issued)}
+
+
+@app.post("/api/redeem/{code_value}/revoke", dependencies=[Depends(_auth)])
+async def redeem_revoke(code_value: str,
+                        user: str = Depends(_auth)) -> dict[str, Any]:
+    try:
+        row = app.state.registration.revoke_redeem(code_value)
+    except KeyError:
+        raise HTTPException(404, "unknown code") from None
+    app.state.members.audit(user, "redeem.revoke", "", f"code={row.get('masked') or ''}")
+    return row
+
+
+@app.get("/api/redeem/export.csv", dependencies=[Depends(_auth)])
+async def redeem_export(batch: str | None = None,
+                        status: str | None = None) -> Response:
+    body = app.state.registration.export_redeem_csv(batch=batch, status=status)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    return Response(
+        content=body, media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition":
+                 f'attachment; filename="redeem-{stamp}.csv"'})
+
+
+@app.get("/api/registration/grants", dependencies=[Depends(_auth)])
+async def grants_list() -> list[dict[str, Any]]:
+    return app.state.registration.list_grants()
+
+
+@app.post("/api/registration/grants", dependencies=[Depends(_auth)])
+async def grants_add(payload: dict[str, Any] = Body(...),  # noqa: B008
+                     user: str = Depends(_auth)) -> dict[str, Any]:
+    tg_id = str(payload.get("tg_user_id") or "").strip()
+    row = app.state.registration.grant_admin(tg_id, granted_by=user)
+    app.state.members.audit(user, "registration.grant", "", f"tg={tg_id}")
+    return row
+
+
+@app.delete("/api/registration/grants/{tg_user_id}", dependencies=[Depends(_auth)])
+async def grants_remove(tg_user_id: str,
+                        user: str = Depends(_auth)) -> dict[str, bool]:
+    try:
+        app.state.registration.revoke_grant(tg_user_id)
+    except KeyError:
+        raise HTTPException(404, "unknown grant") from None
+    app.state.members.audit(user, "registration.grant.revoke", "",
+                            f"tg={tg_user_id}")
+    return {"revoked": True}
+
+
+@app.get("/api/members/{user_id}/invites", dependencies=[Depends(_auth)])
+async def member_invites(user_id: str) -> dict[str, Any]:
+    if not app.state.members.get(user_id):
+        raise HTTPException(404, "unknown member")
+    return {
+        "quota": app.state.registration.invite_quota(user_id),
+        "invites": app.state.registration.list_invites(user_id),
+        "invitees": [{
+            "emby_user_id": m["emby_user_id"],
+            "username": m.get("username") or "",
+            "state": m.get("state"),
+            "register_at": m.get("register_at"),
+        } for m in app.state.members.invitees_of(user_id)],
+    }
+
+
+@app.post("/api/members/{user_id}/invite-quota", dependencies=[Depends(_auth)])
+async def member_invite_quota(user_id: str,
+                              payload: dict[str, Any] = Body(...),  # noqa: B008
+                              user: str = Depends(_auth)) -> dict[str, Any]:
+    try:
+        delta = int(payload.get("delta") or 0)
+    except (TypeError, ValueError):
+        raise HTTPException(400, "数量必须是整数") from None
+    try:
+        after = app.state.registration.adjust_quota(user_id, delta)
+    except KeyError:
+        raise HTTPException(404, "unknown member") from None
+    app.state.members.audit(user, "member.invite_quota", user_id,
+                            f"delta={delta} now={after}")
+    return {"quota": after}
 
 
 # ---- plugins (automation cards) --------------------------------------------

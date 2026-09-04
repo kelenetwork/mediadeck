@@ -85,12 +85,14 @@ class TelegramBot:
     """Long-polling bot bound to the panel's member records."""
 
     def __init__(self, config_provider: Any, members: Any, emby: Any = None,
-                 stats: Any = None, db: Any = None) -> None:
+                 stats: Any = None, db: Any = None,
+                 registration: Any = None) -> None:
         self._config = config_provider
         self._members = members
         self._emby = emby
         self._stats = stats
         self._db = db
+        self._registration = registration
         self._offset = 0
         self._task: asyncio.Task | None = None
         self._last_error = ""
@@ -217,9 +219,10 @@ class TelegramBot:
              {"text": "⏳ 有效期", "callback_data": "expiry"}],
             [{"text": "📺 我的设备", "callback_data": "devices"},
              {"text": "📊 观看统计", "callback_data": "usage"}],
-            [{"text": "🏆 本站排行", "callback_data": "top"},
-             {"text": "🔑 重置密码", "callback_data": "resetpw"}],
-            [{"text": "🔄 刷新", "callback_data": "home"}],
+            [{"text": "🎫 我的邀请码", "callback_data": "invites"},
+             {"text": "🏆 本站排行", "callback_data": "top"}],
+            [{"text": "🔑 重置密码", "callback_data": "resetpw"},
+             {"text": "🔄 刷新", "callback_data": "home"}],
         ]
 
     def _member_for_chat(self, tg_user_id: str) -> dict[str, Any] | None:
@@ -236,12 +239,11 @@ class TelegramBot:
     def _home(self, tg_user_id: str, tg_name: str) -> tuple[str, list[list[dict[str, str]]]]:
         member = self._member_for_chat(tg_user_id)
         if not member:
-            cfg = self._cfg()
-            state = "开放注册中" if cfg.get("registration_enabled") else "当前暂停注册"
+            state = "开放注册中" if self._registration_open() else "当前暂停注册"
             body = (
                 f"👋 你好，{tg_name}\n\n"
                 f"这里是影视库的账号服务。<b>{state}</b>\n\n"
-                "· 没有账号 → 点「注册账号」，几秒后就能用\n"
+                "· 没有账号 → 点「注册账号」，需要邀请码或卡密\n"
                 "· 已有账号但没关联 → 点「认领已有账号」，需要管理员确认"
             )
             return body, self.guest_menu()
@@ -271,10 +273,20 @@ class TelegramBot:
                 used = int((row or {}).get("n") or 0)
         return used, cap
 
-    async def _registration_blocked(self, tg_user_id: str) -> str:
-        """Why this user may not register right now, or '' if they may."""
+    def _registration_open(self) -> bool:
+        """Is any channel open? Three closed switches is a closed door."""
         cfg = self._cfg()
-        if not cfg.get("registration_enabled"):
+        return any(bool(cfg.get(key, True)) for key in
+                   ("allow_admin_grant", "allow_invite", "allow_redeem"))
+
+    async def _registration_blocked(self, tg_user_id: str) -> str:
+        """Why this user may not register right now, or '' if they may.
+
+        This is the gate that applies to *everyone*, whatever channel they came
+        through: slots, group membership, Emby being reachable. Which channel
+        admits them is a separate question, answered by RegistrationService.
+        """
+        if not self._registration_open():
             return "当前暂停注册，请稍后再来或联系管理员。"
         if self._emby is None:
             return "后台未连接 Emby，暂时无法开户。"
@@ -286,7 +298,18 @@ class TelegramBot:
             return "需要先加入官方群组才能注册。"
         return ""
 
+    _USERNAME_PROMPT = (
+        "🆕 <b>注册账号</b>\n\n请直接发送你想要的用户名：\n\n"
+        "· 3–20 个字符，字母开头\n"
+        "· 只能用字母、数字和下划线\n\n"
+        "<i>密码由系统生成，不需要你输入。10 分钟内有效。</i>")
+
     async def _start_registration(self, chat_id: Any, tg_user_id: str) -> None:
+        """Pre-authorised users skip straight to the username.
+
+        Asking someone the operator already named for a code they were never
+        given is a dead end they cannot get out of.
+        """
         if self._member_for_chat(tg_user_id):
             await self.send(chat_id, "你已经有账号了。", self.member_menu())
             return
@@ -295,16 +318,69 @@ class TelegramBot:
             await self.send(chat_id, f"🚫 {blocked}", self.guest_menu())
             return
         self._sweep_pending()
-        self._pending[str(chat_id)] = ("username", time.time() + PENDING_TTL, {})
+
+        admission = self._resolve(tg_user_id, None)
+        if admission is not None and admission.allowed:
+            self._pending[str(chat_id)] = (
+                "username", time.time() + PENDING_TTL,
+                {"admission": admission})
+            await self.send(chat_id, self._USERNAME_PROMPT)
+            return
+
+        if self._registration is None:
+            # No registration service wired (older deployments / tests): fall
+            # back to the plain username step rather than blocking everyone.
+            self._pending[str(chat_id)] = ("username", time.time() + PENDING_TTL, {})
+            await self.send(chat_id, self._USERNAME_PROMPT)
+            return
+
+        self._pending[str(chat_id)] = (
+            "credential", time.time() + PENDING_TTL, {})
         await self.send(
             chat_id,
-            "🆕 <b>注册账号</b>\n\n请直接发送你想要的用户名：\n\n"
-            "· 3–20 个字符，字母开头\n"
-            "· 只能用字母、数字和下划线\n\n"
-            "<i>密码由系统生成，不需要你输入。10 分钟内有效。</i>")
+            "🎟 <b>注册账号</b>\n\n请发送你的<b>邀请码</b>或<b>卡密</b>：\n\n"
+            "· 邀请码由老用户生成，8 位\n"
+            "· 卡密由管理员发放，12 位\n\n"
+            "<i>大小写不敏感，10 分钟内有效。</i>")
+
+    def _resolve(self, tg_user_id: str, credential: str | None) -> Any:
+        """Ask the registration service for a verdict, tolerating its absence."""
+        if self._registration is None:
+            return None
+        try:
+            return self._registration.resolve(tg_user_id, credential)
+        except Exception:  # noqa: BLE001 - a member must not see a stack trace
+            self._last_error = "注册通道解析失败"
+            return None
+
+    async def _submit_credential(self, chat_id: Any, tg_user_id: str,
+                                 credential: str) -> None:
+        """Validate the code, then move to the username step.
+
+        The credential is checked but *not* spent here: the account does not
+        exist yet, and a failure after this point must leave the code good.
+        """
+        admission = self._resolve(tg_user_id, credential)
+        if admission is None:
+            self._pending.pop(str(chat_id), None)
+            await self.send(chat_id, "🚫 注册暂时不可用，请稍后再试。",
+                            self.guest_menu())
+            return
+        if not admission.allowed:
+            # The conversation stays open: a mistyped code should cost one
+            # message, not the whole flow.
+            await self.send(
+                chat_id,
+                f"❌ {admission.reason}\n\n请重新发送邀请码或卡密，或点下面的按钮返回。",
+                [[{"text": "↩️ 返回", "callback_data": "home"}]])
+            return
+        self._pending[str(chat_id)] = (
+            "username", time.time() + PENDING_TTL, {"admission": admission})
+        await self.send(chat_id, f"✅ {admission.reason}\n\n" + self._USERNAME_PROMPT)
 
     async def _finish_registration(self, chat_id: Any, tg_user_id: str,
-                                   tg_username: str, username: str) -> None:
+                                   tg_username: str, username: str,
+                                   admission: Any = None) -> None:
         username = username.strip()
         if not USERNAME_RE.match(username):
             await self.send(chat_id,
@@ -340,16 +416,37 @@ class TelegramBot:
             await self._emby.set_user_password(emby_id, password)
 
         cfg = self._cfg()
+        now = int(time.time())
+        # The admission decides the terms when there is one: a card bought for
+        # a better group must not silently downgrade to the default plan.
         days = int(cfg.get("register_days") or 0)
-        payload: dict[str, Any] = {"status": "active"}
-        if cfg.get("default_group_id"):
-            payload["group_id"] = str(cfg["default_group_id"])
+        group_id = str(cfg.get("default_group_id") or "")
+        via, inviter_id = "admin", ""
+        if admission is not None:
+            via = str(getattr(admission, "via", "") or "admin")
+            inviter_id = str(getattr(admission, "inviter_id", "") or "")
+            group_id = str(getattr(admission, "group_id", "") or group_id)
+            days = int(getattr(admission, "days", 0) or 0)
+
+        payload: dict[str, Any] = {
+            "status": "active",
+            "register_via": via,
+            "inviter_id": inviter_id,
+            "register_at": now,
+        }
+        if group_id:
+            payload["group_id"] = group_id
         if days > 0:
-            payload["expires_at"] = int(time.time()) + days * 86400
+            payload["expires_at"] = now + days * 86400
 
         self._members.upsert(emby_id, username, payload, actor="telegram")
         self._members.bind_telegram(emby_id, tg_user_id, tg_username,
                                     actor="telegram")
+        # Only now: the account exists and the chat is linked, so spending the
+        # credential can no longer strand someone who paid for it.
+        if admission is not None and self._registration is not None:
+            with contextlib.suppress(Exception):
+                self._registration.consume(admission, emby_id)
         self._pending.pop(str(chat_id), None)
 
         server = str(cfg.get("emby_public_url") or "").strip()
@@ -364,6 +461,59 @@ class TelegramBot:
             lines.append(f"有效期：{days} 天")
         lines.append("\n<i>请立刻保存密码，这条消息不会再发第二次。</i>")
         await self.send(chat_id, "\n".join(lines), self.member_menu())
+
+    # -- member invites -------------------------------------------------------
+
+    async def _invites_view(self, chat_id: Any, message_id: int,
+                            member: dict[str, Any], mint: bool = False) -> None:
+        """A member's own invite codes, and the slots they have left.
+
+        Minting is a member-visible spend: one slot becomes one single-use
+        code. Showing the remaining count next to the button is what stops the
+        obvious "why did nothing happen" when they are out.
+        """
+        if self._registration is None:
+            await self._edit(chat_id, message_id, "邀请功能暂未开放。",
+                             self.member_menu())
+            return
+        user_id = str(member.get("emby_user_id") or "")
+        notice = ""
+        if mint:
+            try:
+                issued = self._registration.spend_quota_for_invite(user_id)
+                notice = f"✅ 新邀请码：<code>{issued.get('code', '')}</code>\n\n"
+            except Exception as exc:  # noqa: BLE001 - shown to a member
+                notice = f"❌ {exc}\n\n"
+
+        quota = 0
+        codes: list[dict[str, Any]] = []
+        with contextlib.suppress(Exception):
+            quota = self._registration.invite_quota(user_id)
+            codes = self._registration.list_invites(user_id, limit=10)
+
+        lines = [f"{notice}🎫 <b>我的邀请码</b>\n", f"剩余名额：<b>{quota}</b>"]
+        if codes:
+            lines.append("")
+            for row in codes:
+                left = int(row.get("uses_left") or 0)
+                if row.get("revoked"):
+                    tail = "已作废"
+                elif left <= 0:
+                    tail = "已用完"
+                else:
+                    tail = f"剩 {left} 次 · {_fmt_expiry(row.get('expires_at'))}"
+                lines.append(f"<code>{row.get('code', '')}</code> · {tail}")
+        else:
+            lines.append("\n你还没有生成过邀请码。")
+        lines.append("\n<i>把邀请码发给朋友，他们注册时填写即可。</i>")
+
+        keyboard: list[list[dict[str, str]]] = []
+        if quota > 0:
+            keyboard.append(
+                [{"text": f"➕ 生成新码（剩 {quota}）",
+                  "callback_data": "invite_new"}])
+        keyboard.append([{"text": "↩️ 返回", "callback_data": "home"}])
+        await self._edit(chat_id, message_id, "\n".join(lines), keyboard)
 
     # -- claim / rebind requests ---------------------------------------------
 
@@ -460,9 +610,13 @@ class TelegramBot:
         waiting = self._pending.get(str(chat_id))
         if waiting and text and not text.startswith("/"):
             kind, _, extra = waiting
+            if kind == "credential":
+                await self._submit_credential(chat_id, tg_user_id, text)
+                return
             if kind == "username":
                 await self._finish_registration(
-                    chat_id, tg_user_id, tg_username, text)
+                    chat_id, tg_user_id, tg_username, text,
+                    admission=extra.get("admission"))
                 return
             if kind == "claim":
                 self._pending.pop(str(chat_id), None)
@@ -573,6 +727,9 @@ class TelegramBot:
                 f"📊 <b>观看统计</b>\n\n本周期用量：{_fmt_bytes(used)}\n"
                 f"最近活跃：{time.strftime('%Y-%m-%d %H:%M', time.localtime(seen)) if seen else '—'}",
                 self.member_menu())
+            return
+        if data in ("invites", "invite_new"):
+            await self._invites_view(chat_id, message_id, member, mint=data == "invite_new")
             return
         if data == "resetpw":
             if self._emby is None:
