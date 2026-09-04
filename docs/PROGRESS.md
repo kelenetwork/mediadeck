@@ -4,6 +4,34 @@ Newest entries first. Every working session appends one entry.
 
 ---
 
+## 2026-09-05 — dark console theme, and room for artwork
+**Done**
+- Panel is dark by default. It runs on a second monitor for hours next to a
+  media player; a bright white sheet was the wrong default, and it made poster
+  art read as a foreign object pasted onto a form.
+- Palette is a deep indigo ramp, not neutral grey: at these luminances pure
+  grey goes muddy, while a slight blue cast keeps large dark areas from
+  looking flat. Cyan means "current/primary" and is used sparingly; green,
+  amber and red are reserved for state, never decoration.
+- Token set widened so pages stop hardcoding hex: `--panel-2/-3`, `--sidebar`,
+  `--topbar`, `--control`, `--line-soft`, `--text-2`, and `*-soft` fills for
+  each state colour.
+- New media primitives, ready for the dashboard to use:
+  `.poster-grid/.poster` (2:3 ratio preserved, bottom scrim, type badge),
+  `.play-row` (compact "who is watching" list) and `.play-card` (poster,
+  synopsis, viewer, elapsed/remaining).
+- Fixes that only show up on a dark surface: native `select` dropdowns were
+  rendering white, focus rings were invisible, and progress bars now carry a
+  gradient so a nearly-empty track still shows direction.
+- Styling only. No markup or JS touched: all 85 previously defined classes are
+  still defined, 20 added, none dropped.
+
+**Next**
+- Wire the dashboard to `.poster-grid` and `.play-card` (needs a panel-side
+  image cache; the metadata DB just moved off spinning disks and should not be
+  hit for every tile on every load).
+- Then the user-management pages, which are the next feature focus.
+
 ## 2026-09-05 — dispatch follows the wire, and hot titles spread
 **Done**
 - `StreamNode.bandwidth_mbps`: a node's real link ceiling, headroom already
