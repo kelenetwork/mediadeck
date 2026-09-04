@@ -140,39 +140,61 @@ async function deleteMount(name) {
 }
 
 /* ---------------- members ---------------- */
+/* ---------- members ----------
+   A product back-office rather than an ops table: the stats answer "how is the
+   member base doing", the filters answer "who am I looking for", and the row
+   shows provenance (which door they came in by, who vouched for them) because
+   that is what the invite tree is for. */
+const MEMBER_COLS = ['', 'Emby 账号', '套餐', '有效期', '注册渠道', '邀请人',
+  '下级', 'TG', '本月观看', ''];
+
 PAGES.members = async () => {
   $('#view').innerHTML = pageLoading();
   const [listing, groups] = await Promise.all([api('/api/members'), api('/api/groups')]);
   state.memberListing = listing;
   state.groups = groups;
   const members = listing.members || [];
-  const now = Date.now() / 1000;
-  const soon = members.filter((m) => m.expires_at && m.expires_at > now && m.expires_at - now <= 7 * 86400).length;
-  const blocked = members.filter((m) => m.state === 'suspended' || m.state === 'exhausted' || m.state === 'expired').length;
+  state.watchPeak = members.reduce((max, m) => Math.max(max, Number(m.watch_hours || 0)), 0);
+  const midnight = new Date(); midnight.setHours(0, 0, 0, 0);
+  const dayStart = midnight.getTime() / 1000;
   const ok = members.filter((m) => m.state === 'active').length;
+  const off = members.filter((m) => m.state !== 'active').length;
+  // Legacy accounts have no register_at, so they can never count as "new
+  // today" -- dating them to the import would invent a signup that never was.
+  const fresh = members.filter((m) => m.register_at && m.register_at >= dayStart).length;
   const unmanagedN = (listing.unmanaged || []).filter((u) => !u.is_admin).length;
   $('#view').innerHTML = `
     <div class="stat-grid">
-      ${stat('☺', members.length, '成员总数', listing.truncated ? `列表被截断（limit ${listing.limit}）` : '已纳入管理')}
-      ${stat('✓', ok, '正常', '可播放')}
-      ${stat('⏳', soon, '即将到期', '7 天内')}
-      ${stat('⊘', blocked, '已停用或超额', '含过期')}
+      ${stat('☺', members.length, '总用户', listing.truncated ? `列表被截断（limit ${listing.limit}）` : '已纳入管理')}
+      ${stat('✓', ok, '已启用', '可正常播放')}
+      ${stat('⊘', off, '停用中', '含过期与超额')}
+      ${stat('✦', fresh, '今日新增', '按注册时间')}
     </div>
     <div class="filter-bar">
-      <input id="mf-q" placeholder="搜索用户名 / 备注" style="min-width:180px">
-      <select id="mf-group"><option value="">全部用户组</option>${groups.map((g) => `<option value="${esc(g.id)}">${esc(g.name)}</option>`).join('')}</select>
-      <select id="mf-role">
-        <option value="">全部角色</option>
-        <option value="admin">管理员</option><option value="uploader">上片员</option>
-      </select>
+      <input id="mf-q" placeholder="搜索用户名 / 备注" style="min-width:170px">
       <select id="mf-state">
         <option value="">全部状态</option>
         <option value="active">正常</option><option value="expired">已过期</option>
         <option value="exhausted">已超额</option><option value="suspended">已停用</option>
         <option value="pending">待开通</option>
       </select>
-      <button class="btn" id="mf-apply">筛选</button>
-      <button class="btn" id="mf-create">新建 Emby 账号</button>
+      <select id="mf-group"><option value="">全部套餐</option>${groups.map((g) => `<option value="${esc(g.id)}">${esc(g.name)}</option>`).join('')}</select>
+      <select id="mf-via">
+        <option value="">全部渠道</option>
+        <option value="admin">管理员</option><option value="invite">邀请</option>
+        <option value="redeem">卡密</option><option value="legacy">历史导入</option>
+      </select>
+      <select id="mf-tg">
+        <option value="">TG 不限</option>
+        <option value="yes">已绑定</option><option value="no">未绑定</option>
+      </select>
+      <select id="mf-exp">
+        <option value="">到期不限</option>
+        <option value="soon">7 天内</option><option value="gone">已过期</option>
+      </select>
+      <input id="mf-inviter" placeholder="邀请人" style="width:120px">
+      <button class="btn primary" id="mf-apply">筛选</button>
+      <button class="btn" id="mf-reset">重置</button>
       <button class="btn" id="mf-preview">预览变更</button>
       <button class="btn danger" id="mf-apply-enf">应用策略</button>
     </div>
@@ -185,8 +207,7 @@ PAGES.members = async () => {
       <button class="btn" onclick="toggleAllMembers(false)">取消选择</button>
     </div>
     ${listing.truncated ? '<div class="help">后端返回已达上限，计数可能不完整。筛选只作用于当前这一页。</div>' : ''}
-    ${tableCard('成员', `${members.length} 人`,
-      ['', '用户', '用户组', '状态', '到期', '流量', '设备', 'Telegram', '最后活跃', ''],
+    ${tableCard('用户', `${members.length} 人`, MEMBER_COLS,
       members.map((m) => memberRow(m)).join(''))}
     ${card('纳入现有 Emby 账号', '未纳入的账号不受任何限制，也不计流量',
       `<div class="card-body">
@@ -194,11 +215,11 @@ PAGES.members = async () => {
         ${enrolmentTable(listing.unmanaged || [], groups)}</div>`)}`;
   const memberCard = [...document.querySelectorAll('#view .card')].find((c) => {
     const h = c.querySelector('h3');
-    return h && h.textContent === '成员';
+    return h && h.textContent === '用户';
   });
   if (memberCard) {
     const table = memberCard.querySelector('table');
-    if (table) table.id = 'member-table';
+    if (table) { table.id = 'member-table'; table.classList.add('member-table'); }
   }
   const headCell = document.querySelector('#member-table thead th');
   if (headCell) {
@@ -206,12 +227,36 @@ PAGES.members = async () => {
     $('#m-pick-all').onchange = (e) => toggleAllMembers(e.target.checked);
   }
   $('#mf-apply').onclick = filterMembers;
-  $('#mf-q').onkeydown = (e) => { if (e.key === 'Enter') filterMembers(); };
-  $('#mf-create').onclick = createEmbyUser;
+  $('#mf-reset').onclick = resetMemberFilters;
+  ['mf-q', 'mf-inviter'].forEach((id) => {
+    if ($('#' + id)) $('#' + id).onkeydown = (e) => { if (e.key === 'Enter') filterMembers(); };
+  });
   $('#mf-preview').onclick = () => enforcementPreview();
   $('#mf-apply-enf').onclick = () => enforcementApply();
   if ($('#mf-enroll-all')) $('#mf-enroll-all').onclick = enrollAllDefaults;
+  if (state.memberFilter) applyStoredMemberFilter();
 };
+/* Jumping from an inviter cell to "everyone they brought in" has to survive
+   the page re-render, so the intent is stored rather than applied to DOM that
+   is about to be replaced. */
+function filterByInviter(name) {
+  state.memberFilter = { inviter: uq(name) };
+  renderPage('members', true);
+}
+function applyStoredMemberFilter() {
+  const wanted = state.memberFilter;
+  state.memberFilter = null;
+  if (!wanted || !$('#mf-inviter')) return;
+  $('#mf-inviter').value = wanted.inviter || '';
+  filterMembers();
+}
+function resetMemberFilters() {
+  ['mf-q', 'mf-inviter'].forEach((id) => { if ($('#' + id)) $('#' + id).value = ''; });
+  ['mf-state', 'mf-group', 'mf-via', 'mf-tg', 'mf-exp'].forEach((id) => {
+    if ($('#' + id)) $('#' + id).value = '';
+  });
+  filterMembers();
+}
 async function enrollAllDefaults() {
   if (!confirm('把所有未纳入的普通 Emby 账号划进默认用户组？\n\n按组设置开始计时计流量。')) return;
   try {
@@ -237,26 +282,61 @@ function tgCell(m) {
   // account and an operator approves it. There is nothing to hand out here.
   return '<span class="muted">未关联</span>';
 }
+/* Which door a member came in by. 'legacy' is shown as 历史导入 rather than
+   hidden: several hundred accounts predate the bot, and labelling them as a
+   channel they never used would make this column a lie. */
+const CHANNEL_LABELS = {
+  admin: ['admin', '管理员'], invite: ['invite', '邀请'],
+  redeem: ['redeem', '卡密'], legacy: ['legacy', '历史导入'],
+};
+function channelTag(via) {
+  const [cls, label] = CHANNEL_LABELS[via] || CHANNEL_LABELS.legacy;
+  return `<span class="tag chan ${cls}">${esc(label)}</span>`;
+}
+function inviterCell(m) {
+  if (!m.inviter_id) return '<span class="muted">—</span>';
+  const name = m.inviter_name || '(已删除)';
+  if (m.inviter_name === '(已删除)' || !m.inviter_name) {
+    return `<span class="muted" title="邀请人账号已删除">${esc(name)}</span>`;
+  }
+  return `<button class="link-btn" title="只看这个人邀请的成员"
+    onclick="filterByInviter('${q(name)}')">${esc(name)}</button>`;
+}
+/* Hours watched this month, with a bar scaled against the busiest member on
+   the page: an absolute scale would leave every bar invisible on a library
+   where nobody watches 100 hours. */
+function watchCell(m) {
+  const hours = Number(m.watch_hours || 0);
+  if (!hours) return '<span class="muted">—</span>';
+  const peak = Number(state.watchPeak || 0) || hours;
+  const pct = Math.max(4, Math.min(100, Math.round(hours / peak * 100)));
+  return `<div class="watch-cell"><div class="n">${esc(hours.toFixed(1))} 小时</div>
+    <span class="bar"><i style="width:${pct}%"></i></span></div>`;
+}
 function memberRow(m) {
-  const devices = m.max_devices ? `${m.device_count || 0}/${m.max_devices}` : `${m.device_count || 0}/不限`;
   const id = q(m.emby_user_id);
-  const tog = m.state === 'suspended' ? 'active' : 'suspended';
-  const togLabel = m.state === 'suspended' ? '启用' : '停用';
+  const suspended = m.state === 'suspended';
+  const tog = suspended ? 'active' : 'suspended';
+  const kids = Number(m.invitee_count || 0);
   return `<tr>
     <td><input type="checkbox" class="m-pick" value="${id}" onchange="syncBulkBar()"></td>
-    <td>${esc(m.username)}${roleTags(m)}</td><td>${esc(m.group_name)}</td>
-    <td>${stateTag(m.state)}</td><td>${daysLeftHtml(m)}</td>
-    <td>${trafficBar(m.traffic_used_bytes, m.traffic_quota_bytes)}</td>
-    <td>${esc(devices)}</td><td>${tgCell(m)}</td>
-    <td>${esc(fmtAgeTs(m.last_seen_at))}</td>
-    <td class="row-actions">
-      <button class="btn sm" onclick="memberDetail('${id}')">详情</button>
-      <button class="btn sm" onclick="memberRenew('${id}')">续期</button>
-      <button class="btn sm" onclick="memberReset('${id}')">重置流量</button>
-      <button class="btn sm" onclick="memberStatus('${id}','${tog}')">${togLabel}</button>
-      <button class="btn sm" onclick="memberKick('${id}')">踢下线</button>
-      <button class="btn sm" onclick="memberPassword('${id}')">改密</button>
-      <button class="btn sm danger" onclick="memberDelete('${id}','${q(m.username)}')">删除</button>
+    <td><div class="u-name">${esc(m.username)}${roleTags(m)}</div>
+      <div class="u-sub">${stateTag(m.state)}</div></td>
+    <td>${esc(m.group_name)}</td>
+    <td>${daysLeftHtml(m)}</td>
+    <td>${channelTag(m.register_via)}</td>
+    <td>${inviterCell(m)}</td>
+    <td>${kids ? `<button class="link-btn" onclick="filterByInviter('${q(m.username)}')">${kids}</button>`
+    : '<span class="muted">0</span>'}</td>
+    <td>${tgCell(m)}</td>
+    <td>${watchCell(m)}</td>
+    <td class="icon-actions">
+      <button class="btn sm" title="详情" onclick="memberDetail('${id}')">👁</button>
+      <button class="btn sm" title="续期" onclick="memberRenew('${id}')">⏳</button>
+      <button class="btn sm" title="${suspended ? '启用' : '停用'}"
+        onclick="memberStatus('${id}','${tog}')">${suspended ? '✅' : '⛔'}</button>
+      <button class="btn sm danger" title="删除"
+        onclick="memberDelete('${id}','${q(m.username)}')">🗑</button>
     </td></tr>`;
 }
 
@@ -333,12 +413,22 @@ function filterMembers() {
   const listing = state.memberListing || { members: [] };
   const qv = (($('#mf-q') || {}).value || '').trim().toLowerCase();
   const grp = (($('#mf-group') || {}).value || '');
-  const role = (($('#mf-role') || {}).value || '');
   const st = (($('#mf-state') || {}).value || '');
+  const via = (($('#mf-via') || {}).value || '');
+  const tg = (($('#mf-tg') || {}).value || '');
+  const exp = (($('#mf-exp') || {}).value || '');
+  const inviter = (($('#mf-inviter') || {}).value || '').trim().toLowerCase();
+  const now = Date.now() / 1000;
   const rows = (listing.members || []).filter((m) => {
     if (grp && m.group_id !== grp) return false;
-    if (role && !(m.roles || []).includes(role)) return false;
     if (st && m.state !== st) return false;
+    if (via && (m.register_via || 'legacy') !== via) return false;
+    if (tg === 'yes' && !m.tg_user_id) return false;
+    if (tg === 'no' && m.tg_user_id) return false;
+    if (exp === 'soon' && !(m.expires_at && m.expires_at > now
+      && m.expires_at - now <= 7 * 86400)) return false;
+    if (exp === 'gone' && !(m.expires_at && m.expires_at <= now)) return false;
+    if (inviter && !String(m.inviter_name || '').toLowerCase().includes(inviter)) return false;
     if (qv && !(`${m.username} ${m.note || ''} ${m.contact || ''}`).toLowerCase().includes(qv)) return false;
     return true;
   });
@@ -347,15 +437,10 @@ function filterMembers() {
   // Filtering re-renders the rows, so any previous ticks are gone with them.
   syncBulkBar();
 }
-async function createEmbyUser() {
-  const name = prompt('新 Emby 用户名', '');
-  if (!name) return;
-  try {
-    await api('/api/emby/users', { method: 'POST', body: JSON.stringify({ name: name.trim() }) });
-    toast('账号已创建，请在下方选择用户组纳入');
-    renderPage('members');
-  } catch (e) { toast('失败: ' + e.message, 1); }
-}
+/* Creating an Emby account by hand was removed in v0.19 (owner decision):
+   accounts arrive through the bot's three registration channels, and a
+   panel-made account has no inviter, no channel and no chat behind it. The
+   enrolment card below still adopts accounts that already exist in Emby. */
 async function enrolMember(id, username) {
   id = uq(id); username = uq(username);
   const sel = document.getElementById('enroll-group-' + id) || $(`#enroll-group-${CSS.escape(id)}`);
@@ -411,14 +496,32 @@ async function memberPassword(id) {
     toast(r.password ? `新密码：${r.password}` : '已改密');
   } catch (e) { toast('失败: ' + e.message, 1); }
 }
+/* Delete means delete: the panel record and the Emby account, plus whoever
+   vouched for them. The preview is fetched first and named in the prompt --
+   an operator told "this removes 1 account" who loses 2 will never trust the
+   dialog again, and the second account is one they never clicked on. */
 async function memberDelete(id, username) {
   id = uq(id); username = uq(username);
-  if (!confirm(`取消纳入「${username}」？\n\n默认只解除托管，Emby 账号会保留。`)) return;
-  const wipe = confirm('同时删除 Emby 账号？此操作不可恢复。\n选「取消」则只取消纳入。');
+  let preview = null;
   try {
-    await api(`/api/members/${encodeURIComponent(id)}${wipe ? '?delete_emby=true' : ''}`, { method: 'DELETE' });
-    toast(wipe ? '已删除纳入记录和 Emby 账号' : '已取消纳入，Emby 账号保留');
-    renderPage('members');
+    preview = await api(`/api/members/${encodeURIComponent(id)}/delete-preview`);
+  } catch (e) { toast('无法读取删除影响: ' + e.message, 1); return; }
+
+  const also = (preview.cascade || []).map((c) => `· ${c.username}（${c.reason}）`);
+  const lines = [
+    `确认删除「${username}」？`, '',
+    '将同时删除：',
+    `· ${username}（本人）`,
+    ...also,
+    '',
+    'Emby 账号与面板记录都会被删除，且不可恢复。',
+  ];
+  if (!confirm(lines.join('\n'))) return;
+  try {
+    const r = await api(`/api/members/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    const n = (r.removed || []).length;
+    toast(n > 1 ? `已删除 ${n} 个账号（含邀请人）` : '已删除');
+    renderPage('members', true);
   } catch (e) { toast('失败: ' + e.message, 1); }
 }
 function kbpsToMBps(n) {
@@ -649,11 +752,16 @@ async function memberDetail(id) {
       <div class="help">${esc(m.username)} · ${esc(m.group_name)} · ${stateTag(m.state)}${roleTags(m)}
         <span class="muted">${esc(m.state_reason || '')}</span></div>
       <div class="help">到期 ${esc(fmtExpiry(m.expires_at_effective || m.expires_at))} · 流量 ${fmtBytes(m.traffic_used_bytes)} / ${fmtQuota(m.traffic_quota_bytes)}</div>
+      <div class="help">注册渠道 ${channelTag(m.register_via)}
+        · 邀请人 ${m.inviter_name ? esc(m.inviter_name) : '<span class="muted">—</span>'}
+        · 下级 ${esc(m.invitee_count || 0)} 人
+        · 邀请名额 ${esc(m.invite_quota || 0)}</div>
       <div class="detail-actions">
         <button class="btn sm" onclick="memberKick('${q(id)}')">踢下线</button>
         <button class="btn sm" onclick="memberPassword('${q(id)}')">重置密码</button>
         <button class="btn sm" onclick="memberStatus('${q(id)}','${tog}')">${togLabel}</button>
         <button class="btn sm" onclick="memberRenew('${q(id)}')">续期</button>
+        <button class="btn sm" onclick="memberReset('${q(id)}')">重置流量</button>
         <button class="btn sm" onclick="memberAddTraffic('${q(id)}')">加流量</button>
       </div>
       <h3 style="font-size:13px;margin:16px 0 6px">用户组与角色</h3>
@@ -1088,8 +1196,9 @@ PAGES.tgbot = async () => {
     <div class="stat-grid">
       ${stat('✈', running ? '运行中' : (tg.bot_token_set ? '已停止' : '未配置'), '机器人',
         st.last_error ? `最近错误：${st.last_error}` : (tg.bot_token_set ? tg.bot_token_masked : '尚未填写 Token'))}
-      ${stat('🆕', tg.registration_enabled ? '开放' : '关闭', '注册',
-        tg.register_days ? `赠送 ${tg.register_days} 天` : '不限期')}
+      ${stat('🆕', tg.registration_open ? '开放' : '关闭', '注册',
+        [tg.allow_admin_grant ? '预授权' : '', tg.allow_invite ? '邀请码' : '',
+          tg.allow_redeem ? '卡密' : ''].filter(Boolean).join(' / ') || '全部通道已关闭')}
       ${stat('☺', tg.max_users ? `上限 ${tg.max_users}` : '不限', '名额',
         tg.require_group ? `需加入 ${tg.require_group}` : '无群组要求')}
       ${stat('⚡', '任务中心', '定时推送', '排行与到期提醒已迁至自动化')}
@@ -1111,11 +1220,18 @@ PAGES.tgbot = async () => {
           <span id="tg-result" class="muted"></span>
         </div>
       </div>`)}
-    ${card('注册开户', '成员在机器人里直接创建 Emby 账号，密码由系统生成',
+    ${card('注册开户', '注册需要凭证：预授权、邀请码或卡密，三选一',
       `<div class="card-body">
-        <div class="form-row"><label>开放注册</label>
-          <input id="tg-reg" type="checkbox" ${tg.registration_enabled ? 'checked' : ''}>
-          <span class="muted">关闭后仍可认领已有账号</span></div>
+        <div class="form-row"><label>管理员预授权</label>
+          <input id="tg-ch-admin" type="checkbox" ${tg.allow_admin_grant ? 'checked' : ''}>
+          <span class="muted">名单在「邀请与授权」页维护</span></div>
+        <div class="form-row"><label>邀请码</label>
+          <input id="tg-ch-invite" type="checkbox" ${tg.allow_invite ? 'checked' : ''}>
+          <span class="muted">老用户用自己的名额生成</span></div>
+        <div class="form-row"><label>卡密</label>
+          <input id="tg-ch-redeem" type="checkbox" ${tg.allow_redeem ? 'checked' : ''}>
+          <span class="muted">在「卡密管理」页批量生成</span></div>
+        <div class="help">三个通道全部关闭 = 停止注册。卡密自带套餐和天数，下面的赠送天数只对预授权和邀请码生效。</div>
         <div class="form-row"><label>赠送天数</label>
           <input id="tg-regdays" type="number" min="0" max="3650" value="${esc(tg.register_days)}" style="width:100px">
           <span class="muted">0 = 不限期</span></div>
@@ -1163,7 +1279,9 @@ function telegramPagePayload() {
     bot_token: typed.trim() || SECRET_KEEP,
     enabled: flag('tg-enabled'),
     emby_public_url: str('tg-embyurl'),
-    registration_enabled: flag('tg-reg'),
+    allow_admin_grant: flag('tg-ch-admin'),
+    allow_invite: flag('tg-ch-invite'),
+    allow_redeem: flag('tg-ch-redeem'),
     register_days: num('tg-regdays', 30),
     max_users: num('tg-max', 0),
     default_group_id: str('tg-group'),
@@ -1217,6 +1335,316 @@ async function sendRankingsNow() {
       ? '<span class="tag ok">已发送</span>'
       : '<span class="tag bad">发送失败</span>';
   } catch (e) { el.innerHTML = `<span class="tag bad">${esc(e.message)}</span>`; }
+}
+
+/* ---------- redeem codes ----------
+   A card is a bearer credential: whoever reads it can spend it. The table
+   masks them and reveals one on demand, while the generation result and the
+   CSV export show them in full -- those are the operator handing cards out,
+   which is the entire point of minting them. */
+PAGES.redeem = async () => {
+  $('#view').innerHTML = pageLoading();
+  const [listing, groups] = await Promise.all([
+    api('/api/redeem'), api('/api/groups')]);
+  state.redeemListing = listing;
+  const codes = listing.codes || [];
+  const st = listing.stats || {};
+  const statusLabel = { unused: ['ok', '未使用'], used: ['idle', '已使用'],
+    revoked: ['bad', '已作废'] };
+  $('#view').innerHTML = `
+    <div class="stat-grid">
+      ${stat('🎟', st.unused || 0, '未使用', '可以发出去的')}
+      ${stat('✓', st.used || 0, '已使用', '已经换成账号')}
+      ${stat('⊘', st.revoked || 0, '已作废', '不再可用')}
+    </div>
+    ${card('生成卡密', '每张卡自带套餐和天数，注册时一次性核销',
+      `<div class="card-body">
+        <div class="form-row"><label>套餐</label>
+          <select id="rd-group">${groups.map((g) => `<option value="${esc(g.id)}" ${g.is_default ? 'selected' : ''}>${esc(g.name)}</option>`).join('')}</select></div>
+        <div class="form-row"><label>天数</label>
+          <input id="rd-days" type="number" min="0" max="3650" value="30" style="width:110px">
+          <span class="muted">0 = 不限期</span></div>
+        <div class="form-row"><label>数量</label>
+          <input id="rd-count" type="number" min="1" max="500" value="10" style="width:110px">
+          <span class="muted">一次最多 500 张</span></div>
+        <div class="form-row"><label>批次名</label>
+          <input id="rd-batch" placeholder="留空自动按时间生成"></div>
+        <div class="form-row"><label>备注</label>
+          <input id="rd-note" placeholder="给自己看的说明，例如「双十一活动」"></div>
+        <div class="toolbar"><button class="btn primary" id="rd-make">生成</button></div>
+        <div id="rd-result"></div>
+      </div>`)}
+    <div class="filter-bar">
+      <select id="rd-f-status">
+        <option value="">全部状态</option>
+        <option value="unused">未使用</option><option value="used">已使用</option>
+        <option value="revoked">已作废</option>
+      </select>
+      <select id="rd-f-batch"><option value="">全部批次</option>${
+  (listing.batches || []).map((b) => `<option value="${esc(b)}">${esc(b)}</option>`).join('')}</select>
+      <button class="btn primary" id="rd-filter">筛选</button>
+      <button class="btn" id="rd-export">导出 CSV</button>
+    </div>
+    ${tableCard('卡密', `${codes.length} 张`,
+    ['卡密', '套餐', '天数', '状态', '批次', '使用者', '使用时间', ''],
+    codes.map((c) => {
+      const [cls, label] = statusLabel[c.status] || ['idle', c.status];
+      return `<tr>
+        <td><span class="code-cell" title="点击复制完整卡密"
+          onclick="copyRedeem('${q(c.code)}', this)">${esc(c.masked)}</span></td>
+        <td>${esc(c.group_name || c.group_id)}</td>
+        <td>${c.days ? esc(c.days) + ' 天' : '不限期'}</td>
+        <td><span class="tag ${cls}">${esc(label)}</span></td>
+        <td>${esc(c.batch || '—')}</td>
+        <td>${esc(c.used_by || '—')}</td>
+        <td>${c.used_at ? esc(fmtAgeTs(c.used_at)) : '<span class="muted">—</span>'}</td>
+        <td class="icon-actions">${c.status === 'unused'
+    ? `<button class="btn sm danger" title="作废" onclick="revokeRedeem('${q(c.code)}')">⊘</button>`
+    : ''}</td></tr>`;
+    }).join(''))}`;
+  $('#rd-make').onclick = generateRedeem;
+  $('#rd-filter').onclick = () => renderRedeemFiltered();
+  $('#rd-export').onclick = exportRedeem;
+};
+function redeemFilterQuery() {
+  const params = new URLSearchParams();
+  const stv = (($('#rd-f-status') || {}).value || '');
+  const bv = (($('#rd-f-batch') || {}).value || '');
+  if (stv) params.set('status', stv);
+  if (bv) params.set('batch', bv);
+  return params.toString();
+}
+async function renderRedeemFiltered() {
+  const qs = redeemFilterQuery();
+  try {
+    const listing = await api('/api/redeem' + (qs ? '?' + qs : ''));
+    state.redeemListing = listing;
+    // Re-render through the page so the table, stats and options stay in
+    // agreement rather than drifting apart cell by cell.
+    const keep = { status: ($('#rd-f-status') || {}).value, batch: ($('#rd-f-batch') || {}).value };
+    await PAGES.redeem();
+    if ($('#rd-f-status')) $('#rd-f-status').value = keep.status || '';
+    if ($('#rd-f-batch')) $('#rd-f-batch').value = keep.batch || '';
+    const rows = listing.codes || [];
+    const tbody = document.querySelector('#view table tbody');
+    if (tbody && rows.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="8" class="empty">没有匹配的卡密</td></tr>';
+    }
+  } catch (e) { toast('筛选失败: ' + e.message, 1); }
+}
+async function generateRedeem() {
+  const body = {
+    group_id: ($('#rd-group') || {}).value || '',
+    days: Number(($('#rd-days') || {}).value || 0),
+    count: Number(($('#rd-count') || {}).value || 0),
+    batch: (($('#rd-batch') || {}).value || '').trim(),
+    note: (($('#rd-note') || {}).value || '').trim(),
+  };
+  try {
+    const r = await api('/api/redeem/generate', {
+      method: 'POST', body: JSON.stringify(body) });
+    const values = (r.codes || []).map((c) => c.code);
+    state.lastRedeemBatch = values;
+    const box = $('#rd-result');
+    if (box) {
+      box.innerHTML = `
+        <div class="help" style="margin-top:14px">
+          已生成 <b>${values.length}</b> 张（批次 ${esc((r.codes[0] || {}).batch || '')}）。
+          <b>这是唯一一次完整显示</b>，列表里只会看到掩码。
+        </div>
+        <div class="code-dump" id="rd-dump">${esc(values.join('\n'))}</div>
+        <div class="toolbar" style="margin-top:10px">
+          <button class="btn" id="rd-copy">复制全部</button>
+          <button class="btn" id="rd-dl">下载 CSV</button>
+        </div>`;
+      $('#rd-copy').onclick = () => copyText(values.join('\n'), `已复制 ${values.length} 张`);
+      $('#rd-dl').onclick = () => downloadRedeemCsv((r.codes[0] || {}).batch || '');
+    }
+    toast(`已生成 ${values.length} 张`);
+  } catch (e) { toast('生成失败: ' + e.message, 1); }
+}
+async function copyText(text, okMsg) {
+  try {
+    await navigator.clipboard.writeText(text);
+    toast(okMsg || '已复制');
+    return true;
+  } catch (e) {
+    // Clipboard access is denied outside a secure context, which is exactly
+    // where a self-hosted panel often runs. Say so instead of failing mutely.
+    toast('复制失败，请手动选择文本', 1);
+    return false;
+  }
+}
+function copyRedeem(value, el) {
+  value = uq(value);
+  copyText(value, '已复制完整卡密').then((ok) => {
+    if (ok && el) {
+      const was = el.textContent;
+      el.textContent = value;
+      setTimeout(() => { el.textContent = was; }, 4000);
+    }
+  });
+}
+function downloadRedeemCsv(batch) {
+  const qs = batch ? '?batch=' + encodeURIComponent(batch) : '';
+  window.open('/api/redeem/export.csv' + qs, '_blank');
+}
+function exportRedeem() {
+  const qs = redeemFilterQuery();
+  window.open('/api/redeem/export.csv' + (qs ? '?' + qs : ''), '_blank');
+}
+async function revokeRedeem(value) {
+  value = uq(value);
+  if (!confirm('作废这张卡密？作废后无法再用来注册。')) return;
+  try {
+    await api(`/api/redeem/${encodeURIComponent(value)}/revoke`, { method: 'POST' });
+    toast('已作废');
+    renderPage('redeem', true);
+  } catch (e) { toast('作废失败: ' + e.message, 1); }
+}
+
+/* ---------- invites and pre-authorisation ----------
+   The two ways in that do not involve a card: the operator naming a Telegram
+   id, or a member spending an invite slot. Both are shown next to the channel
+   switches, because "why can nobody register" is usually one of them being
+   off. */
+PAGES.invites = async () => {
+  $('#view').innerHTML = pageLoading();
+  const [grants, listing, tg] = await Promise.all([
+    api('/api/registration/grants').catch(() => []),
+    api('/api/members').catch(() => ({ members: [] })),
+    api('/api/settings/telegram').catch(() => ({})),
+  ]);
+  const members = (listing.members || []).slice()
+    .sort((a, b) => String(a.username).localeCompare(String(b.username)));
+  state.inviteMembers = members;
+  const pending = grants.filter((g) => !g.used_at).length;
+  const withQuota = members.filter((m) => (m.invite_quota || 0) > 0);
+  $('#view').innerHTML = `
+    <div class="stat-grid">
+      ${stat('🎫', pending, '待使用授权', `共 ${grants.length} 条`)}
+      ${stat('☺', withQuota.length, '持有邀请名额的成员',
+    `合计 ${withQuota.reduce((n, m) => n + (m.invite_quota || 0), 0)} 个名额`)}
+      ${stat('🌳', members.filter((m) => m.register_via === 'invite').length,
+    '通过邀请加入', '占比按当前列表')}
+    </div>
+    ${card('注册通道', '三个通道各自独立；全部关闭等于停止注册',
+    `<div class="card-body">
+        <div class="form-row"><label>管理员预授权</label>
+          <input id="ch-admin" type="checkbox" ${tg.allow_admin_grant ? 'checked' : ''}>
+          <span class="muted">名单里的 Telegram 账号无需任何凭证</span></div>
+        <div class="form-row"><label>邀请码</label>
+          <input id="ch-invite" type="checkbox" ${tg.allow_invite ? 'checked' : ''}>
+          <span class="muted">老用户用自己的名额生成</span></div>
+        <div class="form-row"><label>卡密</label>
+          <input id="ch-redeem" type="checkbox" ${tg.allow_redeem ? 'checked' : ''}>
+          <span class="muted">管理员生成，见「卡密管理」</span></div>
+        ${tg.enabled ? '' : '<div class="help">机器人当前未启用，通道开关不会生效。</div>'}
+        <div class="toolbar"><button class="btn primary" id="ch-save">保存</button></div>
+      </div>`)}
+    ${card('管理员预授权', '直接放行某个 Telegram 账号，不需要邀请码或卡密',
+    `<div class="card-body">
+        <div class="form-row"><label>Telegram ID</label>
+          <input id="gr-id" placeholder="纯数字，例如 6425070392" style="max-width:260px">
+          <button class="btn primary" id="gr-add">授权</button></div>
+        <div class="help">让对方发 /start 给机器人，机器人会回显他的数字 ID。</div>
+        ${grants.length ? `<table><thead><tr><th>Telegram ID</th><th>状态</th><th>授权人</th><th>时间</th><th></th></tr></thead><tbody>
+          ${grants.map((g) => `<tr>
+            <td>${esc(g.tg_user_id)}</td>
+            <td>${g.used_at ? '<span class="tag idle">已使用</span>' : '<span class="tag ok">待使用</span>'}</td>
+            <td>${esc(g.granted_by || '—')}</td>
+            <td>${esc(fmtAgeTs(g.created_at))}</td>
+            <td class="icon-actions"><button class="btn sm danger" title="撤销"
+              onclick="revokeGrant('${q(g.tg_user_id)}')">🗑</button></td>
+          </tr>`).join('')}</tbody></table>` : '<div class="empty">还没有预授权的账号</div>'}
+      </div>`)}
+    ${card('邀请名额', '发放后成员可在机器人里自助生成邀请码',
+    `<div class="card-body">
+        <div class="form-row"><label>成员</label>
+          <select id="iq-member" style="max-width:260px">${members.map((m) => `<option value="${esc(m.emby_user_id)}">${esc(m.username)}（${m.invite_quota || 0}）</option>`).join('')}</select>
+          <input id="iq-delta" type="number" value="1" style="width:90px">
+          <button class="btn primary" id="iq-give">发放</button></div>
+        <div class="help">填负数即可收回名额；名额不会低于 0。</div>
+        ${withQuota.length ? `<table><thead><tr><th>成员</th><th>剩余名额</th><th>已邀请</th><th></th></tr></thead><tbody>
+          ${withQuota.map((m) => `<tr>
+            <td>${esc(m.username)}</td><td>${esc(m.invite_quota || 0)}</td>
+            <td>${esc(m.invitee_count || 0)}</td>
+            <td class="icon-actions"><button class="btn sm" title="查看邀请码"
+              onclick="showMemberInvites('${q(m.emby_user_id)}','${q(m.username)}')">👁</button></td>
+          </tr>`).join('')}</tbody></table>` : '<div class="empty">还没有成员持有邀请名额</div>'}
+        <div id="iq-detail"></div>
+      </div>`)}`;
+  $('#ch-save').onclick = saveChannels;
+  $('#gr-add').onclick = addGrant;
+  $('#iq-give').onclick = giveQuota;
+};
+async function saveChannels() {
+  try {
+    await api('/api/settings/telegram', {
+      method: 'POST',
+      body: JSON.stringify({
+        bot_token: SECRET_KEEP,
+        allow_admin_grant: (($('#ch-admin') || {}).checked) || false,
+        allow_invite: (($('#ch-invite') || {}).checked) || false,
+        allow_redeem: (($('#ch-redeem') || {}).checked) || false,
+      }) });
+    toast('已保存');
+    renderPage('invites', true);
+  } catch (e) { toast('保存失败: ' + e.message, 1); }
+}
+async function addGrant() {
+  const value = (($('#gr-id') || {}).value || '').trim();
+  if (!value) { toast('请填写 Telegram ID', 1); return; }
+  try {
+    await api('/api/registration/grants', {
+      method: 'POST', body: JSON.stringify({ tg_user_id: value }) });
+    toast('已授权');
+    renderPage('invites', true);
+  } catch (e) { toast('授权失败: ' + e.message, 1); }
+}
+async function revokeGrant(value) {
+  value = uq(value);
+  if (!confirm('撤销这条预授权？对方将无法直接注册。')) return;
+  try {
+    await api(`/api/registration/grants/${encodeURIComponent(value)}`,
+      { method: 'DELETE' });
+    toast('已撤销');
+    renderPage('invites', true);
+  } catch (e) { toast('撤销失败: ' + e.message, 1); }
+}
+async function giveQuota() {
+  const id = ($('#iq-member') || {}).value || '';
+  const delta = Number(($('#iq-delta') || {}).value || 0);
+  if (!id || !delta) { toast('请选择成员并填写数量', 1); return; }
+  try {
+    const r = await api(`/api/members/${encodeURIComponent(id)}/invite-quota`, {
+      method: 'POST', body: JSON.stringify({ delta }) });
+    toast(`名额已更新为 ${r.quota}`);
+    renderPage('invites', true);
+  } catch (e) { toast('发放失败: ' + e.message, 1); }
+}
+async function showMemberInvites(id, username) {
+  id = uq(id); username = uq(username);
+  const box = $('#iq-detail');
+  if (!box) return;
+  box.innerHTML = '<div class="page-loading">加载中…</div>';
+  try {
+    const d = await api(`/api/members/${encodeURIComponent(id)}/invites`);
+    const codes = d.invites || [];
+    const kids = d.invitees || [];
+    box.innerHTML = `
+      <div class="help" style="margin-top:16px"><b>${esc(username)}</b> · 剩余名额 ${esc(d.quota)}</div>
+      ${codes.length ? `<table><thead><tr><th>邀请码</th><th>剩余次数</th><th>有效期</th><th>状态</th></tr></thead><tbody>
+        ${codes.map((c) => `<tr>
+          <td><span class="code-cell" onclick="copyRedeem('${q(c.code)}', this)">${esc(c.masked)}</span></td>
+          <td>${esc(c.uses_left)}</td>
+          <td>${c.expires_at ? esc(fmtExpiry(c.expires_at)) : '永久'}</td>
+          <td>${c.revoked ? '<span class="tag bad">已作废</span>'
+    : (c.usable ? '<span class="tag ok">可用</span>' : '<span class="tag idle">已用完</span>')}</td>
+        </tr>`).join('')}</tbody></table>` : '<div class="empty">还没有生成过邀请码</div>'}
+      ${kids.length ? `<div class="help" style="margin-top:12px">已邀请 ${kids.length} 人：${
+  kids.map((k) => esc(k.username)).join('、')}</div>` : ''}`;
+  } catch (e) { box.innerHTML = `<div class="help">加载失败：${esc(e.message)}</div>`; }
 }
 
 PAGES.tgrequests = async () => {

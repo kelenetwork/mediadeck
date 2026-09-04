@@ -329,3 +329,97 @@ def test_delete_preview_of_an_unknown_member_is_404() -> None:
     with TestClient(app) as client:
         assert client.get("/api/members/ghost/delete-preview",
                           auth=ADMIN).status_code == 404
+
+
+# -- upgrading a database that predates all of this --------------------------
+
+def _legacy_db(path) -> None:
+    """The members/redeem_codes shape a v0.13 install actually has on disk."""
+    import sqlite3
+    import time as _t
+    now = int(_t.time())
+    conn = sqlite3.connect(str(path))
+    conn.executescript("""
+    CREATE TABLE members (
+        emby_user_id TEXT PRIMARY KEY,
+        username TEXT NOT NULL DEFAULT '',
+        plan_id TEXT,
+        status TEXT NOT NULL DEFAULT 'active',
+        expires_at INTEGER,
+        traffic_used_bytes INTEGER NOT NULL DEFAULT 0,
+        traffic_period_start INTEGER NOT NULL DEFAULT 0,
+        note TEXT NOT NULL DEFAULT '',
+        contact TEXT NOT NULL DEFAULT '',
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        last_seen_at INTEGER,
+        applied_fingerprint TEXT NOT NULL DEFAULT '',
+        applied_at INTEGER
+    );
+    CREATE TABLE redeem_codes (
+        id TEXT PRIMARY KEY,
+        batch_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        plan_id TEXT,
+        extend_days INTEGER NOT NULL DEFAULT 0,
+        add_traffic_bytes INTEGER NOT NULL DEFAULT 0,
+        max_uses INTEGER NOT NULL DEFAULT 1,
+        used_count INTEGER NOT NULL DEFAULT 0,
+        expires_at INTEGER,
+        created_at INTEGER NOT NULL,
+        created_by TEXT NOT NULL DEFAULT '',
+        note TEXT NOT NULL DEFAULT ''
+    );
+    """)
+    conn.execute(
+        "INSERT INTO members(emby_user_id,username,created_at,updated_at)"
+        " VALUES('old-1','oldtimer',?,?)", (now, now))
+    conn.execute(
+        "INSERT INTO redeem_codes(id,batch_id,kind,extend_days,created_at)"
+        " VALUES('OLDCARD','b1','extend',30,?)", (now,))
+    conn.commit()
+    conn.close()
+
+
+def test_accounts_that_predate_the_bot_upgrade_as_legacy(tmp_path) -> None:
+    """The several hundred existing accounts must survive and be labelled."""
+    path = tmp_path / "old.db"
+    _legacy_db(path)
+
+    db = Database(path)
+    row = db.one("SELECT * FROM members WHERE emby_user_id='old-1'")
+
+    assert row["username"] == "oldtimer"
+    assert row["register_via"] == "legacy"
+    assert row["inviter_id"] == ""
+    assert row["register_at"] is None
+    assert row["invite_quota"] == 0
+
+
+def test_the_old_redeem_table_is_archived_not_dropped(tmp_path) -> None:
+    """CREATE TABLE IF NOT EXISTS would leave the wrong shape in place.
+
+    Renaming keeps cards an operator may have sold; dropping them cannot be
+    undone, and a silent no-op would break every query written against the
+    new columns.
+    """
+    path = tmp_path / "old.db"
+    _legacy_db(path)
+
+    db = Database(path)
+    assert len(db.query("SELECT * FROM redeem_codes_v13")) == 1
+    assert db.query("SELECT * FROM redeem_codes") == []
+    columns = {r["name"] for r in db.query("PRAGMA table_info(redeem_codes)")}
+    assert {"code", "group_id", "days", "status", "batch"} <= columns
+
+
+def test_reopening_an_upgraded_database_archives_nothing_further(tmp_path) -> None:
+    path = tmp_path / "old.db"
+    _legacy_db(path)
+    Database(path).close()
+
+    db = Database(path)
+    names = {r["name"] for r in db.query(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "redeem_codes_v13" in names
+    assert "redeem_codes_v13_2" not in names
