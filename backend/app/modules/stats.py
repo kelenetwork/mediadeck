@@ -233,6 +233,20 @@ class StatsService:
             "methods": methods,
         }
 
+    def hours_this_month(self) -> dict[str, float]:
+        """Watch hours per member since the 1st, as one query.
+
+        The member list renders hundreds of rows; asking per row is how that
+        page starts taking seconds. Callers get a plain dict and decide what a
+        missing member means (zero, not unknown).
+        """
+        since = datetime.now(UTC).replace(day=1).strftime("%Y-%m-%d")
+        rows = self._db.query(
+            "SELECT emby_user_id, SUM(seconds) AS secs FROM usage_daily"
+            " WHERE day >= ? GROUP BY emby_user_id", (since,))
+        return {str(r["emby_user_id"]): round(int(r["secs"] or 0) / 3600, 1)
+                for r in rows}
+
     def member_detail(self, user_id: str, days: int = 30) -> dict[str, Any]:
         days = max(1, min(days, MAX_DAYS))
         since_day = _day_list(days)[0]

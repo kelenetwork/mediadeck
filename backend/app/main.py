@@ -1165,6 +1165,13 @@ async def members_list(status: str | None = None, group_id: str | None = None,
                                      role=role, search=search, limit=limit,
                                      register_via=register_via,
                                      inviter_id=inviter_id)
+    # One query for the whole page, joined in memory: the alternative is a
+    # stats lookup per row, which is what makes a member list feel broken.
+    hours = {}
+    with contextlib.suppress(Exception):
+        hours = app.state.stats.hours_this_month()
+    for member in members:
+        member["watch_hours"] = hours.get(member["emby_user_id"], 0.0)
     truncated = len(members) >= limit
     known = {m["emby_user_id"] for m in members}
     unmanaged: list[dict[str, Any]] = []

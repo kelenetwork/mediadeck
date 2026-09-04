@@ -4,6 +4,72 @@ Newest entries first. Every working session appends one entry.
 
 ---
 
+## 2026-09-05 — registration channels, the invite tree and cascade delete
+**Done**
+- **Three registration channels replace one global switch.**
+  `registration_enabled` could only be open to everyone who found the bot or
+  closed to everyone including the people the operator wanted in. It is gone,
+  replaced by `allow_admin_grant` / `allow_invite` / `allow_redeem`, each
+  requiring something the operator issued: a pre-authorised Telegram id, an
+  invite a member spent a slot on, or a card carrying its own group and
+  duration. An old stored `registration_enabled=False` migrates to all three
+  off, so an operator who had closed the door does not find it open after an
+  upgrade.
+- **resolve() decides, consume() spends, account creation happens in
+  between.** This ordering is the whole design of `registration.py`. A
+  credential burned before the Emby account exists is a credential the member
+  loses when their chosen username turns out to be taken — they paid and got
+  nothing. `consume()` is guarded in SQL (`WHERE uses_left > 0`,
+  `WHERE status='unused'`) rather than by a read-then-write, so two chats
+  racing for the last use of a code cannot both win.
+- **The invite tree.** Members carry `inviter_id` / `register_via` /
+  `register_at` / `invite_quota`. `register_via='legacy'` is the honest label
+  for the several hundred accounts that predate the bot; inventing a channel
+  for them would make the source breakdown a fiction.
+- **Cascade delete, one level only.** Deleting a member also deletes whoever
+  invited them — an invite is a warranty, not a favour — but the cascade stops
+  there. Walking the chain would let one bad account take out an unbounded
+  line of members above it, and nobody clicking delete on a single row is
+  asking for that. The two removals are audited under *different* actions
+  (`member.delete` vs `member.delete.cascade`, the latter naming who it came
+  from), because the operator never asked for the second one. Bulk delete
+  stays unavailable for exactly this reason.
+- **The preview is the promise.** `delete_preview()` feeds the confirmation
+  dialog and is asserted against the real deletion in tests: an operator told
+  "this removes 1 account" who loses 2 will never trust the dialog again.
+- **Redeem cards** get a management page — generate in batches, mask in the
+  list, reveal on click, revoke, export CSV. A spent card cannot be rewritten
+  as revoked: history is what the member was actually given. The audit trail
+  records how many cards were minted, never their values, so a log reader
+  cannot harvest unsold stock.
+- **Member page reworked** into a product back-office: total / active /
+  suspended / new-today, filters for channel, TG binding, expiry and inviter,
+  and columns for provenance and downstream count. Invitee counts and inviter
+  names are two queries for the whole page, not two per row. "Create Emby
+  account" is gone (owner decision): accounts arrive through a channel, and a
+  panel-made one has no inviter, no channel and no chat behind it.
+- **A v0.13-shaped `redeem_codes` table is renamed aside, not dropped.**
+  `CREATE TABLE IF NOT EXISTS` is a no-op against an existing table, so the
+  old shape would have survived and broken every query written against the new
+  columns. Renaming keeps cards an operator may have sold; dropping them
+  cannot be undone. Re-running the migration archives nothing further.
+
+**Verification**
+- 379 tests passing (was 285): +34 registration, +30 cascade/migration,
+  +19 redeem, +15 bot flow. Every new behaviour has a positive and a negative
+  case — notably that a failed account creation spends nothing.
+- `ruff check app tests` clean; `node --check` clean on both bundles; every
+  NAV id resolves to a `PAGES` entry.
+
+**Next**
+- The bot does not yet echo a user's numeric Telegram id on `/start`, which is
+  what the pre-authorisation page tells the operator to ask for.
+- Invite quota is granted by hand; no rule yet that earns slots automatically.
+
+**Open questions**
+- Should a cascade-deleted inviter be notified, or is silent removal correct?
+  Currently silent — the operator is the one who knows why.
+
 ## 2026-09-05 — every scheduled job becomes a plugin
 **Done**
 - Plugin framework. A plugin declares what it is, what it can be configured
