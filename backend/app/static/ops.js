@@ -176,8 +176,17 @@ PAGES.members = async () => {
       <button class="btn" id="mf-preview">预览变更</button>
       <button class="btn danger" id="mf-apply-enf">应用策略</button>
     </div>
+    <div class="filter-bar" id="bulk-bar" style="display:none">
+      <span id="bulk-count" class="muted">已选 0 人</span>
+      <button class="btn primary" onclick="bulkRenew()">批量续期</button>
+      <button class="btn" onclick="bulkAction('activate')">批量启用</button>
+      <button class="btn" onclick="bulkAction('suspend')">批量停用</button>
+      <button class="btn" onclick="bulkAction('reset-traffic')">重置流量</button>
+      <button class="btn" onclick="toggleAllMembers(false)">取消选择</button>
+    </div>
     ${listing.truncated ? '<div class="help">后端返回已达上限，计数可能不完整。筛选只作用于当前这一页。</div>' : ''}
-    ${tableCard('成员', `${members.length} 人`, ['用户', '用户组', '状态', '到期', '流量', '设备', '最后活跃', ''],
+    ${tableCard('成员', `${members.length} 人`,
+      ['', '用户', '用户组', '状态', '到期', '流量', '设备', 'Telegram', '最后活跃', ''],
       members.map((m) => memberRow(m)).join(''))}
     ${card('纳入现有 Emby 账号', '未纳入的账号不受任何限制，也不计流量',
       `<div class="card-body">
@@ -190,6 +199,11 @@ PAGES.members = async () => {
   if (memberCard) {
     const table = memberCard.querySelector('table');
     if (table) table.id = 'member-table';
+  }
+  const headCell = document.querySelector('#member-table thead th');
+  if (headCell) {
+    headCell.innerHTML = '<input type="checkbox" id="m-pick-all">';
+    $('#m-pick-all').onchange = (e) => toggleAllMembers(e.target.checked);
   }
   $('#mf-apply').onclick = filterMembers;
   $('#mf-q').onkeydown = (e) => { if (e.key === 'Enter') filterMembers(); };
@@ -210,16 +224,29 @@ function roleTags(m) {
     ? ' <span class="tag warn">管理员</span>'
     : ' <span class="tag idle">上片员</span>').join('');
 }
+/* Telegram column: a linked chat is what makes expiry reminders possible, so
+   the list has to show at a glance who can actually be reached. */
+function tgCell(m) {
+  const id = q(m.emby_user_id);
+  if (m.tg_user_id) {
+    const who = m.tg_username ? `@${m.tg_username}` : '已绑定';
+    return `<span class="tag ok" title="${esc(who)}">${esc(who)}</span>
+      <button class="btn sm" onclick="memberTgUnbind('${id}')">解绑</button>`;
+  }
+  return `<button class="btn sm" onclick="memberTgCode('${id}')">生成绑定码</button>`;
+}
 function memberRow(m) {
   const devices = m.max_devices ? `${m.device_count || 0}/${m.max_devices}` : `${m.device_count || 0}/不限`;
   const id = q(m.emby_user_id);
   const tog = m.state === 'suspended' ? 'active' : 'suspended';
   const togLabel = m.state === 'suspended' ? '启用' : '停用';
   return `<tr>
+    <td><input type="checkbox" class="m-pick" value="${id}" onchange="syncBulkBar()"></td>
     <td>${esc(m.username)}${roleTags(m)}</td><td>${esc(m.group_name)}</td>
     <td>${stateTag(m.state)}</td><td>${daysLeftHtml(m)}</td>
     <td>${trafficBar(m.traffic_used_bytes, m.traffic_quota_bytes)}</td>
-    <td>${esc(devices)}</td><td>${esc(fmtAgeTs(m.last_seen_at))}</td>
+    <td>${esc(devices)}</td><td>${tgCell(m)}</td>
+    <td>${esc(fmtAgeTs(m.last_seen_at))}</td>
     <td class="row-actions">
       <button class="btn sm" onclick="memberDetail('${id}')">详情</button>
       <button class="btn sm" onclick="memberRenew('${id}')">续期</button>
@@ -229,6 +256,75 @@ function memberRow(m) {
       <button class="btn sm" onclick="memberPassword('${id}')">改密</button>
       <button class="btn sm danger" onclick="memberDelete('${id}','${q(m.username)}')">删除</button>
     </td></tr>`;
+}
+
+/* ---------- bulk selection ----------
+   The bar only appears once something is ticked: a row of destructive-looking
+   buttons above an empty selection invites a click that cannot do anything. */
+function pickedIds() {
+  return [...document.querySelectorAll('.m-pick:checked')].map((el) => el.value);
+}
+function syncBulkBar() {
+  const n = pickedIds().length;
+  const bar = $('#bulk-bar');
+  if (!bar) return;
+  bar.style.display = n ? 'flex' : 'none';
+  const label = $('#bulk-count');
+  if (label) label.textContent = `已选 ${n} 人`;
+  const all = document.querySelectorAll('.m-pick').length;
+  const head = $('#m-pick-all');
+  if (head) {
+    head.checked = n > 0 && n === all;
+    head.indeterminate = n > 0 && n < all;
+  }
+}
+function toggleAllMembers(on) {
+  document.querySelectorAll('.m-pick').forEach((el) => { el.checked = on; });
+  syncBulkBar();
+}
+async function bulkAction(action, extra) {
+  const ids = pickedIds();
+  if (!ids.length) return;
+  try {
+    const r = await api('/api/members/bulk', {
+      method: 'POST',
+      body: JSON.stringify({ action, user_ids: ids, ...(extra || {}) }),
+    });
+    // Partial success is normal, and saying only "done" would hide it.
+    if (r.failed && r.failed.length) {
+      toast(`成功 ${r.ok} 人，失败 ${r.failed.length} 人：${esc(r.failed[0].error)}`, 1);
+    } else {
+      toast(`已处理 ${r.ok} 人`);
+    }
+    renderPage('members', true);
+  } catch (e) { toast('批量操作失败: ' + e.message, 1); }
+}
+async function bulkRenew() {
+  const days = prompt('批量续期天数', '30');
+  if (!days) return;
+  const n = Number(days);
+  if (!Number.isFinite(n) || n <= 0) { toast('天数必须大于 0', 1); return; }
+  await bulkAction('renew', { days: n });
+}
+async function memberTgCode(id) {
+  try {
+    const r = await api(`/api/members/${encodeURIComponent(id)}/telegram/bind-code`,
+      { method: 'POST' });
+    const mins = Math.round((r.expires_in || 600) / 60);
+    // Shown, not sent: the operator hands it over on whatever channel they
+    // already trust, and it dies in ten minutes either way.
+    alert(`${r.username || ''} 的绑定码：\n\n${r.code}\n\n`
+      + `请让成员在机器人对话里直接发送这串字符。\n${mins} 分钟内有效，只能使用一次。`);
+  } catch (e) { toast('生成失败: ' + e.message, 1); }
+}
+async function memberTgUnbind(id) {
+  if (!confirm('解绑后该成员将不再收到到期提醒，确认？')) return;
+  try {
+    await api(`/api/members/${encodeURIComponent(id)}/telegram/unbind`,
+      { method: 'POST' });
+    toast('已解绑');
+    renderPage('members', true);
+  } catch (e) { toast('解绑失败: ' + e.message, 1); }
 }
 function enrolmentTable(unmanaged, groups) {
   if (!unmanaged.length) return '<div class="empty">所有 Emby 账号都已纳入</div>';
@@ -256,7 +352,9 @@ function filterMembers() {
     return true;
   });
   const tbody = document.querySelector('#member-table tbody');
-  if (tbody) tbody.innerHTML = rows.map(memberRow).join('') || '<tr><td colspan="8" class="empty">没有匹配的成员</td></tr>';
+  if (tbody) tbody.innerHTML = rows.map(memberRow).join('') || '<tr><td colspan="10" class="empty">没有匹配的成员</td></tr>';
+  // Filtering re-renders the rows, so any previous ticks are gone with them.
+  syncBulkBar();
 }
 async function createEmbyUser() {
   const name = prompt('新 Emby 用户名', '');

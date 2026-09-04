@@ -1277,6 +1277,73 @@ async def members_renew(user_id: str, payload: dict[str, Any] = Body(default={})
     return member
 
 
+@app.post("/api/members/bulk", dependencies=[Depends(_auth)])
+async def members_bulk(payload: dict[str, Any] = Body(...),  # noqa: B008
+                       user: str = Depends(_auth)) -> dict[str, Any]:
+    """Apply one action to many members, reporting per-member outcomes.
+
+    Partial success is the normal case: one member may have been deleted in
+    another tab while the operator was ticking boxes. Failing the whole batch
+    for that would make the operator redo work that already succeeded, so each
+    id is attempted independently and the failures are named.
+
+    Deliberately excludes deletion. A mis-click on a checkbox column is easy,
+    and a bulk delete is the one action with no way back.
+    """
+    action = str(payload.get("action") or "").strip()
+    ids = payload.get("user_ids") or []
+    if not isinstance(ids, list) or not ids:
+        raise HTTPException(400, "user_ids 不能为空")
+    if len(ids) > 500:
+        raise HTTPException(400, "单次最多处理 500 个成员")
+
+    allowed = {"renew", "suspend", "activate", "reset-traffic"}
+    if action not in allowed:
+        raise HTTPException(400, f"action 必须是 {'/'.join(sorted(allowed))} 之一")
+
+    days = payload.get("days")
+    if action == "renew":
+        try:
+            days = int(days) if days is not None else None
+        except (TypeError, ValueError):
+            raise HTTPException(400, "days 必须是整数") from None
+        if days is not None and not 1 <= days <= 3650:
+            raise HTTPException(400, "续期天数必须在 1–3650 之间")
+
+    ok: list[str] = []
+    failed: list[dict[str, str]] = []
+    for raw in ids:
+        user_id = str(raw)
+        try:
+            if action == "renew":
+                app.state.members.renew(user_id, days, actor=user)
+            elif action == "suspend":
+                app.state.members.set_status(user_id, "suspended", actor=user)
+            elif action == "activate":
+                app.state.members.set_status(user_id, "active", actor=user)
+            else:
+                app.state.members.reset_traffic(user_id, actor=user)
+            ok.append(user_id)
+        except KeyError:
+            failed.append({"user_id": user_id, "error": "成员不存在"})
+        except Exception as exc:  # noqa: BLE001 - reported per member, not raised
+            failed.append({"user_id": user_id, "error": str(exc)})
+
+    app.state.members.audit(
+        user, f"member.bulk.{action}", "",
+        f"requested={len(ids)} ok={len(ok)} failed={len(failed)}")
+
+    # Enforcement runs once after the batch rather than per member: pushing the
+    # same policy change 200 times would hammer Emby for no extra correctness.
+    if ok and app.state.settings_service.membership_config()["enforcement_enabled"]:
+        for user_id in ok:
+            with contextlib.suppress(Exception):
+                await app.state.enforcement.enforce_now(user_id, f"bulk {action}")
+
+    return {"action": action, "requested": len(ids),
+            "ok": len(ok), "failed": failed}
+
+
 @app.post("/api/members/{user_id}/reset-traffic", dependencies=[Depends(_auth)])
 async def members_reset_traffic(user_id: str, user: str = Depends(_auth)) -> dict[str, Any]:
     try:

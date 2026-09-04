@@ -30,9 +30,27 @@ Newest entries first. Every working session appends one entry.
   idempotent column migration, plus `find_by_telegram`, `bind_telegram`,
   `unbind_telegram` and `expiring_within`.
 
+**Also in this branch: member list gets selection and batch actions**
+- Checkbox column plus a bulk bar that only appears once something is ticked:
+  a row of buttons above an empty selection invites a click that cannot do
+  anything.
+- `POST /api/members/bulk` with renew / activate / suspend / reset-traffic.
+  Each id is attempted independently and failures are named, because partial
+  success is the normal case: a member can be deleted in another tab while the
+  operator is ticking boxes, and failing the whole batch would make them redo
+  work that already succeeded.
+- Deletion is deliberately absent from the batch path. A mis-click on a
+  checkbox column is easy, and bulk delete is the one action with no way back.
+- Renew days are bounded 1–3650 server-side, so a typo of an extra zero cannot
+  hand out a decade of access.
+- One audit summary line per batch carrying `ok=`/`failed=`, so a 200-member
+  action is traceable as one operator decision rather than only as 200 rows.
+- Telegram column shows who can actually be reached, with per-member
+  bind-code and unbind buttons.
+
 **Next**
-- Member list UI: bind-code button, TG column, batch renew.
-- Then shared-account detection and UA/region access rules.
+- Shared-account detection: same account playing from several places at once.
+- UA / region access rules.
 
 ## 2026-09-05 — dashboard shows the library, not just counters
 **Done**
