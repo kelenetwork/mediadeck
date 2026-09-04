@@ -936,26 +936,30 @@ class TelegramBot:
     # -- rankings -------------------------------------------------------------
 
     def _rankings_text(self, days: int = 1) -> str:
-        if self._stats is None:
-            return "统计暂不可用。"
         window = "今日" if days <= 1 else f"近 {days} 天"
         lines = [f"🏆 <b>{window}排行</b>\n"]
-        with contextlib.suppress(Exception):
-            users = self._stats.top_users(days=days, limit=5)
-            if users:
-                lines.append("<b>观看时长</b>")
-                for i, u in enumerate(users, 1):
-                    lines.append(
-                        f"{i}. {u['username']} · {u['hours']} 小时 · {u['plays']} 次")
-                lines.append("")
-        with contextlib.suppress(Exception):
-            titles = self._stats.top_titles(days=days, limit=5)
-            if titles:
-                lines.append("<b>热门影片</b>")
-                for i, t in enumerate(titles, 1):
-                    lines.append(
-                        f"{i}. {t['title']} · {t['plays']} 次 · {t['hours']} 小时")
-                lines.append("")
+        # Watch rankings and the points ranking come from different services,
+        # so one being unavailable must not hide the other: a panel with no
+        # playback stats still has a points economy worth showing.
+        if self._stats is not None:
+            with contextlib.suppress(Exception):
+                users = self._stats.top_users(days=days, limit=5)
+                if users:
+                    lines.append("<b>观看时长</b>")
+                    for i, u in enumerate(users, 1):
+                        lines.append(
+                            f"{i}. {u['username']} · {u['hours']} 小时 · "
+                            f"{u['plays']} 次")
+                    lines.append("")
+            with contextlib.suppress(Exception):
+                titles = self._stats.top_titles(days=days, limit=5)
+                if titles:
+                    lines.append("<b>热门影片</b>")
+                    for i, t in enumerate(titles, 1):
+                        lines.append(
+                            f"{i}. {t['title']} · {t['plays']} 次 · "
+                            f"{t['hours']} 小时")
+                    lines.append("")
         # Points are a different kind of ranking -- earned rather than watched
         # -- so it is a separate section, and it is only shown once someone has
         # actually earned something.
@@ -971,7 +975,7 @@ class TelegramBot:
         while lines and not lines[-1]:
             lines.pop()
         if len(lines) == 1:
-            lines.append("暂时还没有播放记录。")
+            lines.append("暂时还没有排行数据。")
         return "\n".join(lines)
 
     # -- update handling ------------------------------------------------------
