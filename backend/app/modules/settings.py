@@ -55,10 +55,18 @@ INTEGRATION_DEFAULTS: dict[str, Any] = {
 TELEGRAM_DEFAULTS: dict[str, Any] = {
     "enabled": False,
     "bot_token": "",
-    # Registration is off by default. Turning it on means anyone who finds the
-    # bot can create an Emby account, which has to be a deliberate act rather
-    # than something an upgrade switches on quietly.
-    "registration_enabled": False,
+    # v0.19: the single registration_enabled switch is gone. It could only be
+    # open to everyone who found the bot or closed to everyone including the
+    # people the operator wanted in. Registration is now gated by *who vouched
+    # for you*, one switch per channel:
+    #   admin_grant — the operator pre-authorised this Telegram id
+    #   invite      — an existing member spent one of their slots
+    #   redeem      — a card the operator generated
+    # All three default on because none of them is open to the public: every
+    # one still requires something the operator issued.
+    "allow_admin_grant": True,
+    "allow_invite": True,
+    "allow_redeem": True,
     "register_days": 30,
     "default_group_id": "",
     # 0 = unlimited. A cap is the only thing standing between a leaked bot link
@@ -372,9 +380,21 @@ class SettingsService:
                 cfg[key] = section[key]
         cfg["bot_token"] = str(cfg["bot_token"] or "").strip()
         cfg["enabled"] = bool(cfg["enabled"]) and bool(cfg["bot_token"])
-        # Registration cannot outlive the bot: with polling stopped nobody could
-        # reach it anyway, and reporting it as open would mislead the operator.
-        cfg["registration_enabled"] = bool(cfg["registration_enabled"]) and cfg["enabled"]
+        # Upgrade path: a stored registration_enabled=False meant "nobody may
+        # register", and that intent has to survive the switch being split in
+        # three. Absent (never configured) means take the defaults, not off --
+        # a fresh install has no stored value and should not read as closed.
+        if "registration_enabled" in section and not section.get(
+                "registration_enabled"):
+            for channel in ("allow_admin_grant", "allow_invite", "allow_redeem"):
+                if channel not in section:
+                    cfg[channel] = False
+        # No channel can outlive the bot: with polling stopped nobody could
+        # reach it anyway, and reporting a door as open would mislead.
+        for channel in ("allow_admin_grant", "allow_invite", "allow_redeem"):
+            cfg[channel] = bool(cfg[channel]) and cfg["enabled"]
+        cfg["registration_open"] = any(
+            cfg[c] for c in ("allow_admin_grant", "allow_invite", "allow_redeem"))
         for key, low, high, fallback in (
             ("register_days", 0, 3650, 30),
         ):
@@ -429,12 +449,17 @@ class SettingsService:
         if max_users < 0:
             raise ConfigError("注册名额不能为负数")
 
-        registration = bool(payload.get("registration_enabled",
-                                        current["registration_enabled"]))
-        # Opening registration on a bot that is not running would advertise a
-        # door nobody can walk through.
-        if registration and not enabled:
-            raise ConfigError("机器人未启用时无法开放注册")
+        # Each channel is stored as the operator set it, including while the
+        # bot is off: telegram_config() masks them behind `enabled`, so the
+        # settings survive a temporary shutdown instead of being silently
+        # rewritten to False and lost.
+        channels = {}
+        for channel in ("allow_admin_grant", "allow_invite", "allow_redeem"):
+            stored = self._store.section("telegram").get(
+                channel, TELEGRAM_DEFAULTS[channel])
+            channels[channel] = bool(payload.get(channel, stored))
+        if any(channels.values()) and not enabled:
+            raise ConfigError("机器人未启用时无法开放注册通道")
 
         emby_url = str(payload.get("emby_public_url",
                                    current["emby_public_url"]) or "").strip()
@@ -444,7 +469,7 @@ class SettingsService:
         self._store.set_section("telegram", {
             "enabled": enabled,
             "bot_token": token,
-            "registration_enabled": registration,
+            **channels,
             "register_days": reg_days,
             "default_group_id": str(payload.get(
                 "default_group_id", current["default_group_id"]) or "").strip(),

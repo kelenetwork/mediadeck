@@ -275,9 +275,52 @@ CREATE TABLE IF NOT EXISTS audit_log (
 );
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts);
 CREATE INDEX IF NOT EXISTS idx_audit_subject ON audit_log(subject);
--- Invite and redeem-code tables from v0.13 were dropped in v0.14 (owner
--- decision 2026-08-30): accounts are operator-created, codes are gone.
--- Existing rows in old databases are left in place but never read.
+
+-- v0.19: registration is gated again, but by *who vouched for you* rather
+-- than by a global switch. Three channels, three tables.
+
+-- An invite is a member vouching for someone. owner_user_id is who spends
+-- their quota; the new account records that id as its inviter, which is what
+-- makes cascade delete possible later.
+CREATE TABLE IF NOT EXISTS invite_codes (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    code          TEXT NOT NULL UNIQUE,
+    owner_user_id TEXT NOT NULL DEFAULT '',
+    uses_left     INTEGER NOT NULL DEFAULT 1,
+    expires_at    INTEGER,
+    created_at    INTEGER NOT NULL,
+    revoked       INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_invite_owner ON invite_codes(owner_user_id);
+
+-- A redeem code is sold or handed out by the operator: it carries its own
+-- group and duration, so a card can be worth more than the default plan.
+-- Single-use by construction (status flips to 'used'), because a card that
+-- can be redeemed twice is a card that will be.
+CREATE TABLE IF NOT EXISTS redeem_codes (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    code        TEXT NOT NULL UNIQUE,
+    group_id    TEXT NOT NULL DEFAULT '',
+    days        INTEGER NOT NULL DEFAULT 30,
+    status      TEXT NOT NULL DEFAULT 'unused',
+    used_by     TEXT NOT NULL DEFAULT '',
+    used_at     INTEGER,
+    batch       TEXT NOT NULL DEFAULT '',
+    note        TEXT NOT NULL DEFAULT '',
+    created_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_redeem_status ON redeem_codes(status, batch);
+
+-- Pre-authorisation: the operator names a Telegram id that may register with
+-- no credential at all. Keyed by tg_user_id because that is the identity the
+-- bot can actually verify, and UNIQUE so granting twice is not two slots.
+CREATE TABLE IF NOT EXISTS admin_grants (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    tg_user_id  TEXT NOT NULL UNIQUE,
+    granted_by  TEXT NOT NULL DEFAULT '',
+    created_at  INTEGER NOT NULL,
+    used_at     INTEGER
+);
 
 CREATE TABLE IF NOT EXISTS redeem_log (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -320,6 +363,11 @@ class Database:
 
     def _migrate(self) -> None:
         with self._lock:
+            # Must run before executescript: CREATE TABLE IF NOT EXISTS is a
+            # no-op against a table that already exists under an incompatible
+            # shape, so the v0.13 redeem_codes would survive and every query
+            # written against the new columns would fail at runtime.
+            self._retire_legacy_redeem_codes()
             self._conn.executescript(SCHEMA)
             cur = self._conn.execute("SELECT value FROM meta WHERE key='schema_version'")
             row = cur.fetchone()
@@ -347,7 +395,44 @@ class Database:
             self._conn.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_members_tg "
                 "ON members(tg_user_id) WHERE tg_user_id <> ''")
+            # v0.19: how each member got here, and who vouched for them.
+            # legacy is the honest label for the several hundred accounts that
+            # predate the bot -- inventing a channel for them would make the
+            # registration-source report a lie.
+            self._ensure_column("members", "inviter_id", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(
+                "members", "register_via", "TEXT NOT NULL DEFAULT 'legacy'")
+            self._ensure_column("members", "register_at", "INTEGER")
+            self._ensure_column(
+                "members", "invite_quota", "INTEGER NOT NULL DEFAULT 0")
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_members_inviter "
+                "ON members(inviter_id)")
             self._conn.commit()
+
+    def _retire_legacy_redeem_codes(self) -> None:
+        """Move a v0.13-shaped redeem_codes aside instead of dropping it.
+
+        The old table keyed codes by a TEXT id and described them with
+        batch_id/kind/plan_id/extend_days. Nothing reads it any more, but it
+        may hold codes an operator sold, so it is renamed rather than deleted:
+        a wrong migration that destroys data cannot be undone, one that keeps
+        it can.
+        """
+        cols = {r[1] for r in self._conn.execute(
+            "PRAGMA table_info(redeem_codes)")}
+        if not cols or "code" in cols:
+            return
+        for suffix in ("", *[f"_{n}" for n in range(2, 20)]):
+            archive = f"redeem_codes_v13{suffix}"
+            exists = self._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (archive,)).fetchone()
+            if not exists:
+                self._conn.execute(
+                    f"ALTER TABLE redeem_codes RENAME TO {archive}")
+                self._conn.commit()
+                return
 
     def _ensure_column(self, table: str, name: str, ddl: str) -> None:
         """Idempotent ADD COLUMN for databases created before the column existed.
