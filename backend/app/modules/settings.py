@@ -48,6 +48,10 @@ PLAYBACK_DEFAULTS: dict[str, Any] = {
 INTEGRATION_DEFAULTS: dict[str, Any] = {
     "panel_public_url": "",
     "emby_public_url": "",
+    # Optional. Media requests work without it -- a request then carries the
+    # TMDB id and no title, which is still actionable. See modules/tmdb.py.
+    "tmdb_api_key": "",
+    "tmdb_language": "zh-CN",
 }
 
 # Telegram bot. Off until a token is stored: an enabled bot with no token would
@@ -273,12 +277,24 @@ class SettingsService:
 
     # -- integration ---------------------------------------------------------
     def integration_config(self) -> dict[str, Any]:
+        """Full config, credential included. For server-side callers only."""
         section = self._store.section("integration")
         cfg = dict(INTEGRATION_DEFAULTS)
         for key in cfg:
             if key in section:
                 cfg[key] = str(section[key] or "")
         return cfg
+
+    def integration_public(self) -> dict[str, Any]:
+        """What the browser may see: the key masked, never the key."""
+        cfg = self.integration_config()
+        return {
+            "panel_public_url": cfg["panel_public_url"],
+            "emby_public_url": cfg["emby_public_url"],
+            "tmdb_language": cfg["tmdb_language"],
+            "tmdb_api_key_masked": mask_secret(cfg["tmdb_api_key"]),
+            "tmdb_api_key_set": bool(cfg["tmdb_api_key"]),
+        }
 
     def save_integration(self, payload: dict[str, Any]) -> dict[str, Any]:
         current = self.integration_config()
@@ -288,10 +304,24 @@ class SettingsService:
             panel = _require_http_url(panel, "面板对外地址")
         if emby:
             emby = _require_http_url(emby, "Emby 对外地址")
+        # Same contract as every other stored credential: a form that only
+        # changed the language must not blank the key, so an unsent or
+        # sentinel value keeps what is already there.
+        api_creds = payload.get("tmdb_api_key", SECRET_UNCHANGED)
+        if api_creds == SECRET_UNCHANGED or api_creds is None:
+            api_creds = current["tmdb_api_key"]
+        api_creds = str(api_creds).strip()
+        language = str(payload.get("tmdb_language",
+                                   current["tmdb_language"]) or "").strip()
+        if not language:
+            language = str(INTEGRATION_DEFAULTS["tmdb_language"])
+        if len(language) > 16:
+            raise ConfigError("TMDB 语言代码过长")
         self._store.set_section("integration", {
             "panel_public_url": panel, "emby_public_url": emby,
+            "tmdb_api_key": api_creds, "tmdb_language": language,
         })
-        return self.integration_config()
+        return self.integration_public()
 
     # -- image cache ---------------------------------------------------------
     def image_cache_config(self) -> dict[str, Any]:

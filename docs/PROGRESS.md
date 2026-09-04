@@ -4,6 +4,81 @@ Newest entries first. Every working session appends one entry.
 
 ---
 
+## 2026-09-05 — media requests, uploader claiming and admin commands
+**Done**
+- **A request names a film, not a string.** Members send a TMDB link or id;
+  free text is refused rather than guessed, because a wrong id is invisible
+  until an uploader has spent an evening on the wrong title. The id is also
+  what makes two people asking in different words one request: the partial
+  unique index on `(tmdb_id, media_type) WHERE status IN ('open','claimed')`
+  is the mechanism, and `create()` catches the IntegrityError to answer
+  "somebody already asked, it is being handled".
+- **TMDB is optional and stays optional.** The owner has no key. With none,
+  `lookup()` returns None *without opening a socket* and the request is stored
+  under a `#12345` placeholder. A request feature that refuses requests until
+  a key is configured is a feature that is switched off. Lookups are cached
+  for an hour and hand out copies, so a caller editing the dict it got back
+  cannot poison later lookups.
+- **One claimer, decided by the database.** `claim()` is
+  `UPDATE ... WHERE status='open'` and trusts the rowcount. Read-then-write
+  would let two uploaders who tapped at the same instant both believe they
+  own the job — the same duplicated 40GB the deduplication above prevents.
+  The loser is told who won.
+- **The fan-out can be taken back.** Each uploader gets their own message and
+  its id is stored in `request_notices`; on a claim, every other message is
+  rewritten to "已由 X 接单" with the button removed. A live button on a job
+  that is gone is how two people start the same download. This also forced a
+  fix to the callback handler: the blanket `answerCallbackQuery` is now
+  skipped for `req_*`, because a query may only be answered once and acking
+  first swallowed the loser's alert entirely.
+- **The quota counts refusals.** `request_used` is charged at creation in the
+  same transaction as the insert, so a rejected request still spends the
+  slot; deriving remaining allowance from open rows would refund every
+  refusal and let a member ask for unavailable titles forever. The month key
+  is compared on read, so a rolled-over month is correct the first time they
+  ask rather than whenever a job next runs.
+- **Only the claimer closes it** (or an admin). Otherwise the requester is
+  told their title was handled by somebody who never touched it.
+- **Thirteen admin commands, gated on the `admin` role**, re-read on every
+  command *and* again when a confirmation is tapped — a dialog can sit on
+  screen across a demotion. There is deliberately no separate list of
+  privileged Telegram ids: a second source of truth would eventually disagree
+  with the one the panel already uses to decide who may log in. `/rm`,
+  `/renewall` and `/scoreall` show what they are about to do and do nothing
+  until a button is pressed; `/rm`'s preview names the cascaded inviter,
+  which is the account nobody typed.
+- **`/gift` routes through a new `ShopService.grant()`** rather than
+  reimplementing the four grants. An admin's "+50GB" and a purchased "+50GB"
+  have to be the same write or the two paths drift.
+- **The whitelist group is ensured on every boot**, unlike the starter groups
+  which seed once. `/prouser` names a specific group, and that command must
+  not fail on a database whose owner tidied their group list — but an edited
+  whitelist group is left exactly as they left it.
+
+**Verification**
+- 722 tests passing (was 480): +42 TMDB, +49 requests, +97 admin commands,
+  +27 bot request flow, +18 groups, +7 digest card, plus the existing plugin
+  and telegram suites updated. Every new behaviour is asserted from both
+  sides — including that a refused command wrote nothing.
+- `ruff check app tests` clean; `node --check` clean on both bundles; all 24
+  NAV ids resolve to a `PAGES` entry.
+- Two gaps found by the tests and fixed in the code rather than the test:
+  `lookup()` promised never to raise but only guarded inside `_fetch`, so a
+  transport error escaped to the member's request; and the TMDB key was
+  reachable through both browser-facing settings endpoints until
+  `integration_public()` was split out.
+
+**Next**
+- No way to search TMDB by title from the bot; the member has to find the id
+  themselves. A search step would need paging and disambiguation in chat.
+- Requests are not linked to the import pipeline, so "done" is an uploader's
+  word rather than an observed library change.
+
+**Open questions**
+- Should a rejected request refund the slot after all? It currently does not,
+  which is right for "no source exists" and arguably harsh for "uploader was
+  busy". Splitting the two would need a second refusal reason.
+
 ## 2026-09-05 — points: ledger, check-in, transfer, shop and the backpack
 **Done**
 - **The balance is the ledger, not a column.** `points_ledger` is append-only

@@ -36,6 +36,7 @@ from app.modules.plugins_builtin import (
     InactiveCleanupPlugin,
     PluginContext,
     RankingsPostPlugin,
+    RequestDigestPlugin,
     ViewingReportPlugin,
     migrate_legacy_telegram_jobs,
     register_builtin,
@@ -129,6 +130,30 @@ class FakeBot:
     async def notify_expiring(self, members: list[dict[str, Any]]) -> int:
         self.expiring_calls.append(list(members))
         return sum(1 for m in members if m.get("tg_user_id"))
+
+    async def send(self, chat_id: str | int, text: str,
+                   keyboard: Any = None) -> bool:
+        self.notified.append((str(chat_id), text))
+        return True
+
+
+class FakeRequests:
+    """Just the two calls the digest card makes."""
+
+    def __init__(self, stats: dict[str, Any] | None = None,
+                 uploaders: list[dict[str, Any]] | None = None) -> None:
+        self._stats = stats or {"open": 2, "claimed": 1, "done": 5,
+                                "rejected": 0, "month_total": 8}
+        self._uploaders = uploaders if uploaders is not None else [
+            {"emby_user_id": "up1", "username": "bob", "tg_user_id": "801"},
+            {"emby_user_id": "up2", "username": "dave", "tg_user_id": "802"},
+        ]
+
+    def stats(self) -> dict[str, Any]:
+        return dict(self._stats)
+
+    def uploaders(self) -> list[dict[str, Any]]:
+        return list(self._uploaders)
 
 
 class FakeStats:
@@ -509,7 +534,8 @@ def test_every_builtin_declares_a_card_with_unique_id() -> None:
     assert len(reg.ids()) == len(BUILTIN_PLUGINS)
     # Every card must declare a known category and explain itself: the panel
     # renders both straight from the spec, so a blank one is a blank card.
-    assert all(c["category"] in ("task", "points") for c in reg.cards())
+    assert all(c["category"] in ("task", "points", "request")
+               for c in reg.cards())
     assert all(c["description"] for c in reg.cards())
     # Registration hands the registry to the context. Points plugins are
     # invoked by the bot rather than the scheduler, so they have to be able to
@@ -732,6 +758,75 @@ def test_expiry_reminder_needs_a_running_bot() -> None:
     assert summary["ok"] is False
 
 
+# -- request_digest ---------------------------------------------------------
+def test_request_digest_tells_every_uploader_what_is_waiting() -> None:
+    bot = FakeBot()
+    plugin = RequestDigestPlugin(
+        make_ctx(telegram=bot, requests=FakeRequests()))
+
+    summary = asyncio.run(plugin.run({"hour": 9, "only_if_open": True}))
+
+    assert summary["待接单"] == 2 and summary["处理中"] == 1
+    assert summary["已通知"] == 2
+    assert {chat for chat, _ in bot.notified} == {"801", "802"}
+    assert "待接单" in bot.notified[0][1] and "/req" in bot.notified[0][1]
+
+
+def test_request_digest_stays_quiet_when_the_queue_is_empty() -> None:
+    """A digest that says 'nothing to do' every morning is one people stop
+    reading, and then they miss the one that mattered."""
+    bot = FakeBot()
+    plugin = RequestDigestPlugin(make_ctx(
+        telegram=bot,
+        requests=FakeRequests({"open": 0, "claimed": 3, "month_total": 3})))
+
+    summary = asyncio.run(plugin.run({"hour": 9, "only_if_open": True}))
+
+    assert summary["ok"] is True and summary["已通知"] == 0
+    assert bot.notified == []
+
+
+def test_request_digest_can_be_told_to_report_even_when_idle() -> None:
+    bot = FakeBot()
+    plugin = RequestDigestPlugin(make_ctx(
+        telegram=bot,
+        requests=FakeRequests({"open": 0, "claimed": 0, "month_total": 0})))
+
+    summary = asyncio.run(plugin.run({"hour": 9, "only_if_open": False}))
+
+    assert summary["已通知"] == 2
+
+
+def test_request_digest_needs_a_running_bot() -> None:
+    plugin = RequestDigestPlugin(make_ctx(
+        telegram=FakeBot(enabled=False), requests=FakeRequests()))
+    summary = asyncio.run(plugin.run({"hour": 9, "only_if_open": True}))
+    assert summary["ok"] is False
+
+
+def test_request_digest_without_the_service_reports_rather_than_raises() -> None:
+    plugin = RequestDigestPlugin(make_ctx(telegram=FakeBot(), requests=None))
+    summary = asyncio.run(plugin.run({"hour": 9, "only_if_open": True}))
+    assert summary["ok"] is False
+
+
+def test_request_digest_skips_uploaders_with_no_chat() -> None:
+    bot = FakeBot()
+    plugin = RequestDigestPlugin(make_ctx(telegram=bot, requests=FakeRequests(
+        uploaders=[{"emby_user_id": "up1", "tg_user_id": "801"},
+                   {"emby_user_id": "up2", "tg_user_id": ""}])))
+
+    summary = asyncio.run(plugin.run({"hour": 9, "only_if_open": True}))
+
+    assert summary["已通知"] == 1
+
+
+def test_request_digest_defaults_to_nine_in_the_morning() -> None:
+    assert RequestDigestPlugin.spec.hour == 9
+    defaults = {f.key: f.default for f in RequestDigestPlugin.spec.fields}
+    assert defaults == {"hour": 9, "only_if_open": True}
+
+
 # ---------------------------------------------------------------------------
 # legacy migration
 # ---------------------------------------------------------------------------
@@ -798,10 +893,18 @@ def test_listing_returns_every_builtin_card() -> None:
         assert all("fields" in c and "config" in c for c in cards)
 
 
-def test_an_empty_category_is_not_an_error_it_is_an_empty_list() -> None:
-    """'request' is declared but unused; asking for it is not a failure."""
+def test_an_unused_category_is_not_an_error_it_is_an_empty_list() -> None:
+    """A category nobody registered into is empty, not a 4xx."""
     with TestClient(app) as client:
-        assert client.get("/api/plugins?category=request", auth=ADMIN).json() == []
+        assert client.get("/api/plugins?category=nosuchcategory",
+                          auth=ADMIN).json() == []
+
+
+def test_the_request_category_carries_the_digest_card() -> None:
+    """The automation page grows a 求片 tab from the category alone."""
+    with TestClient(app) as client:
+        cards = client.get("/api/plugins?category=request", auth=ADMIN).json()
+        assert {c["id"] for c in cards} == {"request_digest"}
 
 
 def test_the_points_category_carries_the_points_plugins() -> None:
@@ -917,8 +1020,15 @@ def test_every_nav_entry_has_a_page_that_renders_it() -> None:
 
 def test_the_new_sections_are_actually_in_the_nav() -> None:
     ids = _nav_ids()
-    for expected in ("automation", "access", "sharing"):
+    for expected in ("automation", "access", "sharing", "requests"):
         assert expected in ids, expected
+
+
+def test_the_request_page_is_reachable_from_the_operations_group() -> None:
+    """A page with no nav entry is a page nobody finds."""
+    app_js = (_STATIC / "app.js").read_text(encoding="utf-8")
+    assert "id: 'requests'" in app_js
+    assert "PAGES.requests =" in _panel_source()
 
 
 def test_only_one_telegram_form_owns_the_credential_field() -> None:
