@@ -504,11 +504,17 @@ def test_start_is_idempotent_and_stop_cleans_up() -> None:
 # ---------------------------------------------------------------------------
 # built-in plugins
 # ---------------------------------------------------------------------------
-def test_every_builtin_declares_a_task_card_with_unique_id() -> None:
+def test_every_builtin_declares_a_card_with_unique_id() -> None:
     reg = register_builtin(make_registry(), make_ctx())
     assert len(reg.ids()) == len(BUILTIN_PLUGINS)
-    assert all(c["category"] == "task" for c in reg.cards())
+    # Every card must declare a known category and explain itself: the panel
+    # renders both straight from the spec, so a blank one is a blank card.
+    assert all(c["category"] in ("task", "points") for c in reg.cards())
     assert all(c["description"] for c in reg.cards())
+    # Registration hands the registry to the context. Points plugins are
+    # invoked by the bot rather than the scheduler, so they have to be able to
+    # read their own live config at that moment.
+    assert reg.get("checkin").ctx.registry is reg
 
 
 def _member(uid: str, **kwargs: Any) -> dict[str, Any]:
@@ -793,8 +799,21 @@ def test_listing_returns_every_builtin_card() -> None:
 
 
 def test_an_empty_category_is_not_an_error_it_is_an_empty_list() -> None:
+    """'request' is declared but unused; asking for it is not a failure."""
     with TestClient(app) as client:
-        assert client.get("/api/plugins?category=points", auth=ADMIN).json() == []
+        assert client.get("/api/plugins?category=request", auth=ADMIN).json() == []
+
+
+def test_the_points_category_carries_the_points_plugins() -> None:
+    """The automation page renders these from the category alone."""
+    with TestClient(app) as client:
+        cards = client.get("/api/plugins?category=points", auth=ADMIN).json()
+        assert {c["id"] for c in cards} == {"checkin", "points_transfer"}
+        # Neither is scheduled: a member triggers them, so a timer that fired
+        # them would be awarding points nobody asked for.
+        assert all(c["interval"] == 0 and c["hour"] is None for c in cards)
+        # Off until the operator decides otherwise.
+        assert all(c["enabled"] is False for c in cards)
 
 
 def test_unknown_plugin_ids_answer_404_on_every_route() -> None:

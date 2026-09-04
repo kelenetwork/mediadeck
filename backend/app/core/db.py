@@ -334,6 +334,68 @@ CREATE INDEX IF NOT EXISTS idx_redeem_log_code ON redeem_log(code);
 CREATE INDEX IF NOT EXISTS idx_redeem_log_user ON redeem_log(user_id);
 CREATE INDEX IF NOT EXISTS idx_redeem_log_ts ON redeem_log(ts);
 
+-- v0.20: points. The balance is deliberately absent as a column: it is the
+-- SUM of these rows and nothing else, so a wrong balance is always a wrong
+-- row that can be found and reversed. balance_after is a witness for audits,
+-- never the answer to "how many points does this member have".
+CREATE TABLE IF NOT EXISTS points_ledger (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    emby_user_id  TEXT NOT NULL,
+    delta         INTEGER NOT NULL,
+    balance_after INTEGER NOT NULL DEFAULT 0,
+    reason        TEXT NOT NULL DEFAULT '',
+    ref           TEXT NOT NULL DEFAULT '',
+    actor         TEXT NOT NULL DEFAULT 'system',
+    created_at    INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_points_user
+    ON points_ledger(emby_user_id, created_at);
+
+-- One row per member per day. The primary key is what makes a second
+-- check-in on the same day impossible rather than merely discouraged: two
+-- taps on a slow connection must not pay twice.
+CREATE TABLE IF NOT EXISTS checkins (
+    emby_user_id TEXT NOT NULL,
+    day          TEXT NOT NULL,
+    streak       INTEGER NOT NULL DEFAULT 1,
+    points       INTEGER NOT NULL DEFAULT 0,
+    created_at   INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (emby_user_id, day)
+);
+CREATE INDEX IF NOT EXISTS idx_checkins_day ON checkins(day);
+
+-- What points can be spent on. Kept as data rather than code so the operator
+-- can price and retire items without a release.
+CREATE TABLE IF NOT EXISTS shop_items (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind           TEXT NOT NULL,
+    name           TEXT NOT NULL,
+    description    TEXT NOT NULL DEFAULT '',
+    cost           INTEGER NOT NULL DEFAULT 0,
+    amount         INTEGER NOT NULL DEFAULT 0,
+    enabled        INTEGER NOT NULL DEFAULT 1,
+    per_user_limit INTEGER NOT NULL DEFAULT 0,
+    sort           INTEGER NOT NULL DEFAULT 0,
+    created_at     INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_shop_items_sort ON shop_items(sort, id);
+
+-- What was actually handed out. Kept even when the item is deleted, because
+-- "why does this member have 500GB extra" must stay answerable.
+CREATE TABLE IF NOT EXISTS shop_orders (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    emby_user_id TEXT NOT NULL,
+    item_id      INTEGER NOT NULL,
+    item_name    TEXT NOT NULL DEFAULT '',
+    cost         INTEGER NOT NULL DEFAULT 0,
+    kind         TEXT NOT NULL DEFAULT '',
+    amount       INTEGER NOT NULL DEFAULT 0,
+    created_at   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_shop_orders_user
+    ON shop_orders(emby_user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_shop_orders_item ON shop_orders(item_id);
+
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL

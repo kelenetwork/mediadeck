@@ -159,6 +159,12 @@ class _FakeMembers:
     def find_by_username(self, username: str):
         return self._by_name.get(str(username).lower())
 
+    def get(self, user_id: str):
+        for row in self._linked.values():
+            if str(row.get("emby_user_id")) == str(user_id):
+                return row
+        return None
+
     def upsert(self, user_id, username, payload, actor="system"):
         self.upserted.append((user_id, username, payload))
         row = {"emby_user_id": user_id, "username": username,
@@ -220,7 +226,11 @@ def test_guest_and_member_see_different_menus() -> None:
 
     # A member is past that step and must not be offered it again.
     assert "register" not in member_actions
-    assert {"me", "expiry", "devices", "usage", "top"} <= member_actions
+    # The member menu is two levels: the top offers identity and backpack, and
+    # the per-account views hang off 「我的信息」 rather than crowding the root.
+    assert {"me", "bag", "top", "home"} <= member_actions
+    info_actions = {b["callback_data"] for row in bot.info_menu() for b in row}
+    assert {"devices", "usage", "me_points", "me_nodes", "resetpw"} <= info_actions
 
     assert "没有账号" in guest_body
     assert "someone" in member_body
@@ -503,7 +513,7 @@ def test_rankings_say_so_when_there_is_nothing_yet() -> None:
 
     bot = TelegramBot(lambda: {"enabled": False, "bot_token": ""},
                       _FakeMembers(), stats=_Empty())
-    assert "还没有播放记录" in bot._rankings_text(1)
+    assert "还没有排行数据" in bot._rankings_text(1)
 
 
 def test_a_broken_stats_source_does_not_crash_the_bot() -> None:
@@ -516,7 +526,7 @@ def test_a_broken_stats_source_does_not_crash_the_bot() -> None:
 
     bot = TelegramBot(lambda: {"enabled": False, "bot_token": ""},
                       _FakeMembers(), stats=_Broken())
-    assert "还没有播放记录" in bot._rankings_text(1)
+    assert "还没有排行数据" in bot._rankings_text(1)
 
 
 # -- disabled bot behaves ---------------------------------------------------
@@ -776,3 +786,350 @@ def test_a_broken_registration_service_does_not_crash_the_flow() -> None:
 
     assert emby.created == []
     assert any("暂时不可用" in m for m in bot.sent)  # type: ignore[attr-defined]
+
+
+# -- points in the bot -------------------------------------------------------
+# The menu is the product here: a member who cannot find the button does not
+# have the feature. These pin the structure and the two multi-step flows.
+
+class _FakeRegistry:
+    """Just the two questions the bot asks a registry."""
+
+    def __init__(self, enabled: set[str] | None = None,
+                 plugins: dict | None = None) -> None:
+        self._enabled = enabled or set()
+        self._plugins = plugins or {}
+
+    def enabled(self, plugin_id: str) -> bool:
+        return plugin_id in self._enabled
+
+    def get(self, plugin_id: str):
+        return self._plugins.get(plugin_id)
+
+
+class _FakePoints:
+    def __init__(self, balances: dict | None = None) -> None:
+        self.balances = balances or {}
+        self.transfers: list[tuple] = []
+
+    def balance(self, user_id: str) -> int:
+        return int(self.balances.get(str(user_id), 0))
+
+    def ledger(self, user_id: str, limit: int = 20):
+        return [{"delta": 10, "reason": "checkin", "reason_label": "每日签到",
+                 "created_at": int(time.time())}]
+
+    def top(self, limit: int = 5):
+        return [{"username": "alice", "balance": 300}]
+
+
+class _FakeTransferPlugin:
+    def __init__(self, ok: bool = True, reason: str = "", fee: int = 0) -> None:
+        self.ok, self.reason, self._fee = ok, reason, fee
+        self.calls: list[tuple] = []
+
+    def can_transfer(self, from_id: str, amount):
+        return (self.ok, self.reason)
+
+    def fee_for(self, amount: int) -> int:
+        return self._fee
+
+    def transfer(self, from_id: str, to_id: str, amount: int):
+        self.calls.append((from_id, to_id, amount))
+        return {"amount": amount, "fee": self._fee,
+                "received": amount - self._fee,
+                "from_balance": 100, "to_balance": 200}
+
+
+class _FakeCheckinPlugin:
+    def __init__(self, result: dict | None = None) -> None:
+        self.result = result or {"ok": True, "points": 15, "bonus": 5,
+                                 "streak": 2, "balance": 115}
+        self.calls: list[str] = []
+
+    def checkin(self, user_id: str):
+        self.calls.append(user_id)
+        return self.result
+
+
+def _points_bot(members=None, *, enabled=None, plugins=None, points=None,
+                shop=None, scheduler=None):
+    bot = _bot(members or _FakeMembers())
+    bot._plugins = _FakeRegistry(enabled or set(), plugins or {})
+    bot._points = points or _FakePoints()
+    bot._shop = shop
+    bot._scheduler = scheduler
+    bot.edits = []  # type: ignore[attr-defined]
+
+    async def fake_edit(chat, mid, text, keyboard=None):
+        bot.edits.append(text)  # type: ignore[attr-defined]
+        return True
+
+    bot._edit = fake_edit  # type: ignore[assignment]
+    return bot
+
+
+def _actions(keyboard) -> set:
+    return {b["callback_data"] for row in keyboard for b in row}
+
+
+def test_the_main_menu_is_two_levels_not_one_long_list() -> None:
+    """Identity and backpack are the entry points; details hang off them."""
+    bot = _points_bot(enabled={"checkin", "points_transfer"})
+    rows = bot.member_menu()
+
+    assert _actions(rows) == {"me", "bag", "checkin", "transfer", "top", "home"}
+    # Two buttons per row keeps the keyboard readable on a phone.
+    assert all(len(row) <= 2 for row in rows)
+    assert _actions(bot.info_menu()) == {
+        "me_status", "me_points", "me_nodes", "devices", "usage", "resetpw",
+        "home"}
+    assert _actions(bot.bag_menu()) == {"invites", "shop", "orders", "home"}
+
+
+def test_the_backpack_holds_invites_shop_and_history() -> None:
+    bot = _points_bot()
+    labels = [b["text"] for row in bot.bag_menu() for b in row]
+    assert any("邀请码" in t for t in labels)
+    assert any("兑换商城" in t for t in labels)
+    assert any("兑换记录" in t for t in labels)
+
+
+def test_checking_in_from_the_bot_reports_points_and_streak() -> None:
+    plugin = _FakeCheckinPlugin()
+    bot = _points_bot(enabled={"checkin"}, plugins={"checkin": plugin})
+    member = {"emby_user_id": "u1", "username": "alice"}
+
+    asyncio.run(bot._checkin(1, 2, member))
+
+    assert plugin.calls == ["u1"]
+    text = bot.edits[0]  # type: ignore[attr-defined]
+    assert "签到成功" in text and "+15" in text
+    assert "2" in text and "115" in text
+
+
+def test_a_second_checkin_says_so_instead_of_paying_again() -> None:
+    plugin = _FakeCheckinPlugin({"ok": False, "reason": "今天已签到",
+                                 "balance": 115})
+    bot = _points_bot(enabled={"checkin"}, plugins={"checkin": plugin})
+
+    asyncio.run(bot._checkin(1, 2, {"emby_user_id": "u1"}))
+    assert "今天已签到" in bot.edits[0]  # type: ignore[attr-defined]
+
+
+def test_checkin_is_refused_when_the_plugin_is_off() -> None:
+    plugin = _FakeCheckinPlugin()
+    bot = _points_bot(plugins={"checkin": plugin})  # registered but disabled
+    asyncio.run(bot._checkin(1, 2, {"emby_user_id": "u1"}))
+    assert plugin.calls == []
+    assert "未开启" in bot.edits[0]  # type: ignore[attr-defined]
+
+
+def test_transfer_asks_for_a_name_then_an_amount_then_confirmation() -> None:
+    members = _FakeMembers({"999": {"emby_user_id": "u1", "username": "alice"}})
+    members._by_name["bob"] = {"emby_user_id": "u2", "username": "bob"}
+    plugin = _FakeTransferPlugin()
+    bot = _points_bot(members, enabled={"points_transfer"},
+                      plugins={"points_transfer": plugin},
+                      points=_FakePoints({"u1": 500}))
+    member = members._linked["999"]
+
+    asyncio.run(bot._transfer_start(1, 2))
+    assert bot._pending["1"][0] == "transfer_to"
+
+    asyncio.run(bot._transfer_pick_target(1, member, "bob"))
+    kind, _, extra = bot._pending["1"]
+    assert kind == "transfer_amount" and extra["to_id"] == "u2"
+
+    asyncio.run(bot._transfer_pick_amount(1, member, extra, "50"))
+    kind, _, extra = bot._pending["1"]
+    assert kind == "transfer_confirm" and extra["amount"] == 50
+    # Nothing has moved yet: the last step is a deliberate confirmation.
+    assert plugin.calls == []
+
+    asyncio.run(bot._transfer_execute(1, 2, member))
+    assert plugin.calls == [("u1", "u2", 50)]
+    assert "转账成功" in bot.edits[-1]  # type: ignore[attr-defined]
+    assert "1" not in bot._pending
+
+
+def test_an_unknown_recipient_ends_the_conversation_with_a_reason() -> None:
+    members = _FakeMembers({"999": {"emby_user_id": "u1", "username": "alice"}})
+    bot = _points_bot(members, enabled={"points_transfer"},
+                      plugins={"points_transfer": _FakeTransferPlugin()})
+
+    asyncio.run(bot._transfer_pick_target(1, members._linked["999"], "nobody"))
+    assert "找不到用户" in bot.sent[-1]  # type: ignore[attr-defined]
+    assert "1" not in bot._pending
+
+
+def test_transferring_to_yourself_is_stopped_before_any_amount_is_asked() -> None:
+    members = _FakeMembers({"999": {"emby_user_id": "u1", "username": "alice"}})
+    members._by_name["alice"] = {"emby_user_id": "u1", "username": "alice"}
+    bot = _points_bot(members, enabled={"points_transfer"},
+                      plugins={"points_transfer": _FakeTransferPlugin()})
+
+    asyncio.run(bot._transfer_pick_target(1, members._linked["999"], "alice"))
+    assert "不能转给自己" in bot.sent[-1]  # type: ignore[attr-defined]
+    assert "1" not in bot._pending
+
+
+def test_a_refused_amount_does_not_reach_confirmation() -> None:
+    members = _FakeMembers({"999": {"emby_user_id": "u1", "username": "alice"}})
+    plugin = _FakeTransferPlugin(ok=False, reason="积分不足，当前余额 10")
+    bot = _points_bot(members, enabled={"points_transfer"},
+                      plugins={"points_transfer": plugin})
+
+    asyncio.run(bot._transfer_pick_amount(
+        1, members._linked["999"], {"to_id": "u2", "to_name": "bob"}, "500"))
+
+    assert "积分不足" in bot.sent[-1]  # type: ignore[attr-defined]
+    assert "1" not in bot._pending
+    assert plugin.calls == []
+
+
+def test_a_non_numeric_amount_re_asks_rather_than_giving_up() -> None:
+    members = _FakeMembers({"999": {"emby_user_id": "u1", "username": "alice"}})
+    bot = _points_bot(members, enabled={"points_transfer"},
+                      plugins={"points_transfer": _FakeTransferPlugin()})
+    bot._pending["1"] = ("transfer_amount", time.time() + 600,
+                         {"to_id": "u2", "to_name": "bob"})
+
+    asyncio.run(bot._transfer_pick_amount(
+        1, members._linked["999"], {"to_id": "u2", "to_name": "bob"}, "五十"))
+
+    assert "正整数" in bot.sent[-1]  # type: ignore[attr-defined]
+    assert bot._pending["1"][0] == "transfer_amount"
+
+
+def test_a_confirmation_that_expired_does_not_transfer() -> None:
+    members = _FakeMembers({"999": {"emby_user_id": "u1", "username": "alice"}})
+    plugin = _FakeTransferPlugin()
+    bot = _points_bot(members, enabled={"points_transfer"},
+                      plugins={"points_transfer": plugin})
+
+    asyncio.run(bot._transfer_execute(1, 2, members._linked["999"]))
+    assert plugin.calls == []
+    assert "取消或超时" in bot.edits[-1]  # type: ignore[attr-defined]
+
+
+def test_the_recipient_is_told_they_received_points() -> None:
+    """A balance that silently changes is indistinguishable from a bug."""
+    members = _FakeMembers({"999": {"emby_user_id": "u1", "username": "alice"}})
+    members._linked["888"] = {"emby_user_id": "u2", "username": "bob",
+                              "tg_user_id": "888"}
+    plugin = _FakeTransferPlugin()
+    bot = _points_bot(members, enabled={"points_transfer"},
+                      plugins={"points_transfer": plugin})
+    bot._pending["1"] = ("transfer_confirm", time.time() + 600,
+                         {"to_id": "u2", "to_name": "bob", "amount": 50})
+
+    asyncio.run(bot._transfer_execute(1, 2, members._linked["999"]))
+
+    assert plugin.calls == [("u1", "u2", 50)]
+    assert any("收到" in m and "alice" in m
+               for m in bot.sent)  # type: ignore[attr-defined]
+
+
+class _FakeShop:
+    def __init__(self, items=None, fail: str = "") -> None:
+        self._items = items or []
+        self.fail = fail
+        self.redeemed: list[tuple] = []
+
+    def items(self, enabled_only: bool = False):
+        return [i for i in self._items if i["enabled"]] if enabled_only \
+            else list(self._items)
+
+    def get(self, item_id: int):
+        return next((i for i in self._items if i["id"] == int(item_id)), None)
+
+    def redeem(self, user_id: str, item_id: int, actor: str = "member"):
+        if self.fail:
+            raise ValueError(self.fail)
+        self.redeemed.append((user_id, int(item_id)))
+        item = self.get(item_id)
+        return {"ok": True, "item": item, "cost": item["cost"],
+                "balance": 400, "granted": "+50GB 流量"}
+
+    def orders(self, user_id=None, limit: int = 10):
+        return [{"item_name": "流量包", "cost": 100,
+                 "created_at": int(time.time())}]
+
+
+def _shop_item(**kw):
+    base = {"id": 1, "name": "流量包 50GB", "cost": 100, "amount": 50,
+            "enabled": True, "unit": "GB", "kind_label": "流量包",
+            "description": "增加 50GB"}
+    base.update(kw)
+    return base
+
+
+def test_the_shop_lists_only_items_that_are_on_sale() -> None:
+    shop = _FakeShop([_shop_item(), _shop_item(id=2, name="隐藏商品",
+                                               enabled=False)])
+    bot = _points_bot(shop=shop, points=_FakePoints({"u1": 500}))
+
+    asyncio.run(bot._shop_view(1, 2, {"emby_user_id": "u1"}))
+    text = bot.edits[0]  # type: ignore[attr-defined]
+    assert "流量包 50GB" in text and "隐藏商品" not in text
+    assert "500" in text  # the balance, so the price means something
+
+
+def test_buying_asks_before_it_spends() -> None:
+    shop = _FakeShop([_shop_item()])
+    bot = _points_bot(shop=shop)
+
+    asyncio.run(bot._shop_confirm(1, 2, "1"))
+    assert "确定用" in bot.edits[0]  # type: ignore[attr-defined]
+    assert "100" in bot.edits[0]  # type: ignore[attr-defined]
+    # Confirmation only: nothing has been redeemed.
+    assert shop.redeemed == []
+
+    asyncio.run(bot._shop_redeem(1, 2, {"emby_user_id": "u1"}, "1"))
+    assert shop.redeemed == [("u1", 1)]
+    assert "兑换成功" in bot.edits[-1]  # type: ignore[attr-defined]
+
+
+def test_confirming_a_withdrawn_item_is_refused() -> None:
+    shop = _FakeShop([_shop_item(enabled=False)])
+    bot = _points_bot(shop=shop)
+    asyncio.run(bot._shop_confirm(1, 2, "1"))
+    assert "已下架" in bot.edits[0]  # type: ignore[attr-defined]
+    assert shop.redeemed == []
+
+
+def test_a_failed_redemption_explains_why() -> None:
+    shop = _FakeShop([_shop_item()], fail="积分不足")
+    bot = _points_bot(shop=shop)
+    asyncio.run(bot._shop_redeem(1, 2, {"emby_user_id": "u1"}, "1"))
+    assert "兑换失败" in bot.edits[-1]  # type: ignore[attr-defined]
+    assert "积分不足" in bot.edits[-1]  # type: ignore[attr-defined]
+
+
+def test_the_points_view_shows_a_balance_and_where_it_came_from() -> None:
+    bot = _points_bot(points=_FakePoints({"u1": 115}))
+    text = bot._points_text({"emby_user_id": "u1"})
+    assert "115" in text and "每日签到" in text
+
+
+def test_the_line_view_reports_each_node_and_its_load() -> None:
+    class _FakeScheduler:
+        def snapshot(self):
+            return [{"name": "hk1", "utilisation": 0.25, "ok": True,
+                     "enabled": True},
+                    {"name": "ca1", "utilisation": 0.95, "ok": True,
+                     "enabled": True},
+                    {"name": "old", "utilisation": 0.0, "ok": True,
+                     "enabled": False}]
+
+    bot = _points_bot(scheduler=_FakeScheduler())
+    text = asyncio.run(bot._nodes_text())
+    assert "hk1" in text and "25%" in text
+    assert "ca1" in text and "95%" in text
+    assert "维护中" in text
+
+
+def test_the_ranking_gains_a_points_section() -> None:
+    bot = _points_bot(points=_FakePoints())
+    assert "积分排行" in bot._rankings_text(1)

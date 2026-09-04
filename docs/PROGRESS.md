@@ -4,6 +4,73 @@ Newest entries first. Every working session appends one entry.
 
 ---
 
+## 2026-09-05 — points: ledger, check-in, transfer, shop and the backpack
+**Done**
+- **The balance is the ledger, not a column.** `points_ledger` is append-only
+  and `balance()` is a `SUM` over it. A stored balance and a ledger are two
+  sources of truth that eventually disagree, and when they do there is no way
+  to tell which one lied. Deriving it means a wrong balance is always a wrong
+  row, and a row can be found and reversed. `balance_after` is written as a
+  witness for audits; nothing reads it to answer "how much do they have".
+- **Nobody goes into debt.** Spending more than the balance raises before
+  anything is written. A negative balance is state the panel would then have
+  to display, explain and collect.
+- **Transfers and redemptions are one transaction.** Debit and effect are
+  written under a single lock. A member charged for a reward that never
+  arrived is the failure that ends trust in the whole feature, so it is made
+  structurally impossible rather than unlikely — and it is tested by
+  sabotaging the second half and asserting the first rolled back.
+- **Check-in and transfer are plugins**, so the operator gets a switch and the
+  bot keyboard follows it: a button for a disabled feature promises something
+  and then explains why it cannot. Both act when a member taps, not on a
+  timer — awarding a check-in on a schedule would mean the panel deciding that
+  someone showed up — so `run()` only reports. The `checkins` primary key
+  `(member, day)` is what makes a double tap impossible, rather than a check
+  that has already passed by the time the second write lands.
+- **The streak bonus is capped.** At +5/day an uninterrupted year is 1800
+  points of pure consistency, and the top of the ledger runs away from
+  everyone else. A missed day resets to 1, not 0: they did check in today.
+- **Transfer fees are destroyed, not collected.** A treasury account would
+  have to belong to someone, and "who may spend the fees" has no good answer
+  on a server run by one person. The daily cap is the control that matters: it
+  is what limits the damage when an account is taken over.
+- **The shop is data.** Four `kind`s map to the four things the panel can
+  already grant (traffic, days, bandwidth, invite slots); price, size, stock
+  limit and visibility are rows an operator edits, so a promotion is a form
+  submission rather than a release. Bandwidth boosts are refused on an
+  already-unlimited account *before* charging — billing for a no-op is the
+  thing a member notices first. Seeded items ship **disabled**; a live default
+  catalogue would sell at prices nobody chose. Orders outlive their item, so
+  "why does this member have 500GB extra" stays answerable.
+- **Bot menu is two levels.** The flat menu grew a row per feature and a
+  member looking for their expiry date had to read past invite codes.
+  Now 我的信息 / 🎒 背包 are the entry points, with status, points, lines,
+  devices, stats and password below the first, and invites, shop and
+  redemption history below the second. The recipient of a transfer is told:
+  a balance that silently changes is indistinguishable from a bug.
+
+**Verification**
+- 480 tests passing (was 379): +30 ledger, +28 shop, +23 plugins, +20 bot.
+  Every refusal is asserted from both sides — that it was refused, and that
+  nothing was written.
+- `ruff check app tests` clean; `node --check` clean on both bundles; all 23
+  NAV ids resolve to a `PAGES` entry. Migration verified against a simulated
+  v0.19 database: new tables appear, existing rows survive, old accounts
+  start at zero and can earn.
+- Two bugs found while writing the tests and fixed in the code rather than
+  the test: the points ranking was unreachable whenever the stats service was
+  missing (the method returned early), and the recipient notification
+  depended on a `MemberService.get` the bot's test double lacked.
+
+**Next**
+- No way yet to earn points from watching; check-in is the only faucet
+  besides operator adjustment.
+- The shop cannot express stock limits across all members, only per user.
+
+**Open questions**
+- Should redemptions be refundable by an operator? Currently no — the grant
+  is already applied, and reversing traffic already spent is not meaningful.
+
 ## 2026-09-05 — registration channels, the invite tree and cascade delete
 **Done**
 - **Three registration channels replace one global switch.**
