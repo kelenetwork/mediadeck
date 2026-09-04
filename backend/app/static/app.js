@@ -15,6 +15,7 @@ const NAV = [
     { id: 'groups', icon: '▣', label: '用户组', sub: '计费模式与默认限制' },
     { id: 'redeem', icon: '🎟', label: '卡密管理', sub: '生成、发放与作废注册卡密' },
     { id: 'shop', icon: '🎁', label: '兑换商城', sub: '积分商品、限购与兑换记录' },
+    { id: 'requests', icon: '🎬', label: '求片', sub: '成员求片、上片员接单与处理结果' },
     { id: 'stats', icon: '📈', label: '运营统计', sub: '流量、时长与热门内容' },
     { id: 'audit', icon: '☰', label: '审计日志', sub: '操作记录与变更追踪' },
   ]},
@@ -857,6 +858,18 @@ PAGES.settings = async () => {
           <input id="ig-panel" value="${esc(ig.panel_public_url)}" placeholder="https://deck.example.com"></div>
         <div class="form-row"><label>Emby 地址</label>
           <input id="ig-emby" value="${esc(ig.emby_public_url)}" placeholder="https://emby.example.com"></div>
+        <div class="muted" style="margin:14px 0 8px">
+          <b>TMDB</b>（可选）。填了之后成员求片会显示片名、年份和海报；
+          不填也能用，求片只会记下 TMDB 编号，上片员照样能处理。
+          <a href="https://www.themoviedb.org/settings/api" target="_blank" rel="noreferrer">去申请 Key</a>
+        </div>
+        <div class="form-row"><label>TMDB Key</label>
+          <input id="ig-tmdb" type="password" autocomplete="new-password"
+            placeholder="${ig.tmdb_api_key_set ? esc(ig.tmdb_api_key_masked) : '未配置'}">
+          <span class="muted">${ig.tmdb_api_key_set ? '已配置，留空表示不修改' : '留空表示不启用'}</span></div>
+        <div class="form-row"><label>TMDB 语言</label>
+          <input id="ig-tmdb-lang" value="${esc(ig.tmdb_language || 'zh-CN')}" style="width:120px">
+          <span class="muted">zh-CN / en-US / ja-JP</span></div>
         <div class="toolbar">
           <select id="ig-server" style="width:120px">
             <option value="caddy">Caddy</option><option value="nginx">nginx</option>
@@ -971,9 +984,14 @@ PAGES.settings = async () => {
 };
 async function saveIntegration() {
   try {
+    /* An empty box means "leave the stored key alone", not "delete it":
+       the operator edits a URL far more often than the credential. */
+    const typed = $('#ig-tmdb').value.trim();
     await api('/api/settings/integration', { method: 'PUT', body: JSON.stringify({
       panel_public_url: $('#ig-panel').value.trim(),
       emby_public_url: $('#ig-emby').value.trim(),
+      tmdb_api_key: typed === '' ? SECRET_KEEP : typed,
+      tmdb_language: $('#ig-tmdb-lang').value.trim() || 'zh-CN',
     }) });
     toast('接入配置已保存'); renderPage('settings');
   } catch (e) { toast('保存失败: ' + e.message, 1); }

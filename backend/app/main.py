@@ -1273,6 +1273,8 @@ async def members_get(user_id: str, days: int = 30) -> dict[str, Any]:
         **detail,
         "points": app.state.points.balance(user_id),
         "points_ledger": app.state.points.ledger(user_id, 20),
+        "requests": app.state.requests.for_user(user_id, limit=10),
+        "request_remaining": app.state.requests.remaining(user_id),
         "usage": usage,
         "plays": plays,
         "series": series,

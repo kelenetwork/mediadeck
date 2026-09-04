@@ -736,6 +736,23 @@ async function memberToggleRole(userId, role) {
     toast('已更新角色'); memberDetail(userId);
   } catch (e) { toast('失败: ' + e.message, 1); }
 }
+function memberRequests(d) {
+  const rows = d.requests || [];
+  const left = d.request_remaining == null ? '不限' : d.request_remaining + ' 次';
+  if (!rows.length) {
+    return `<div class="muted">还没有求过片。本月剩余 ${esc(left)}。</div>`;
+  }
+  return `<div class="muted" style="margin-bottom:6px">本月剩余 ${esc(left)}</div>
+    <table><thead><tr><th>编号</th><th>片名</th><th>状态</th><th>接单人</th><th>时间</th></tr></thead><tbody>
+    ${rows.map((r) => `<tr>
+      <td>#${esc(r.id)}</td>
+      <td>${esc(r.display_title)}${r.result_note
+    ? `<div class="u-sub muted">${esc(r.result_note)}</div>` : ''}</td>
+      <td>${requestStatusTag(r)}</td>
+      <td>${r.claimed_by_name ? esc(r.claimed_by_name) : '<span class="muted">—</span>'}</td>
+      <td class="muted">${esc(fmtAgeTs(r.created_at))}</td>
+    </tr>`).join('')}</tbody></table>`;
+}
 async function memberDetail(id) {
   id = uq(id);
   openModal('成员详情', '<div class="muted">加载中…</div>', { drawer: true });
@@ -781,6 +798,8 @@ async function memberDetail(id) {
         <label><input type="checkbox" ${hasUploader ? 'checked' : ''} onchange="memberToggleRole('${q(id)}','uploader')"> 上片员</label>
       </div>
       ${trafficBar(m.traffic_used_bytes, m.traffic_quota_bytes)}
+      <h3 style="font-size:13px;margin:16px 0 6px">求片记录</h3>
+      ${memberRequests(d)}
       <h3 style="font-size:13px;margin:16px 0 6px">权限覆盖</h3>
       ${overrideEditor(m, libs)}
       <h3 style="font-size:13px;margin:16px 0 6px">近 30 天用量</h3>
@@ -950,6 +969,7 @@ function groupLimitsText(g) {
   bits.push(g.max_streams ? g.max_streams + ' 路' : '并发不限');
   bits.push(g.bandwidth_limit_kbps ? fmtKbps(g.bandwidth_limit_kbps) : '不限速');
   bits.push(g.max_devices ? g.max_devices + ' 设备' : '设备不限');
+  bits.push(g.request_quota ? '求片 ' + g.request_quota + '/月' : '求片不限');
   bits.push(g.allow_transcode ? '转码' : '禁转码');
   bits.push(g.allow_download ? '下载' : '禁下载');
   return bits.join(' · ');
@@ -979,6 +999,7 @@ function groupForm(prefix, g) {
       <span class="muted">MB/s，0 = 不限速。保存后该组未覆盖成员会重签限速。</span></div></div>
     <div class="form-row"><label>并发</label><input id="${prefix}-streams" type="number" min="0" value="${v('max_streams', 2)}" style="width:90px"><span class="muted">路，0 = 不限</span></div>
     <div class="form-row"><label>设备</label><input id="${prefix}-devices" type="number" min="0" value="${v('max_devices', 3)}" style="width:90px"><span class="muted">台，0 = 不限</span></div>
+    <div class="form-row"><label>每月求片</label><input id="${prefix}-requests" type="number" min="0" value="${v('request_quota', 3)}" style="width:90px"><span class="muted">次/月，0 = 不限；被拒绝的求片也算一次</span></div>
     <div class="form-row"><label>权限</label>
       <label><input id="${prefix}-transcode" type="checkbox" ${g.allow_transcode == null || g.allow_transcode ? 'checked' : ''}> 转码</label>
       <label><input id="${prefix}-download" type="checkbox" ${g.allow_download ? 'checked' : ''}> 下载</label></div>`;
@@ -996,6 +1017,7 @@ function groupPayload(prefix) {
     bandwidth_limit_kbps: mBpsToKbps(parseFloat($(`#${prefix}-bandwidth`).value) || 0),
     max_streams: parseInt($(`#${prefix}-streams`).value, 10) || 0,
     max_devices: parseInt($(`#${prefix}-devices`).value, 10) || 0,
+    request_quota: parseInt($(`#${prefix}-requests`).value, 10) || 0,
     allow_transcode: $(`#${prefix}-transcode`).checked,
     allow_download: $(`#${prefix}-download`).checked,
   };
@@ -1772,6 +1794,7 @@ const automation = { category: 'task', open: {}, busy: {} };
 const PLUGIN_CATEGORIES = [
   { id: 'task', label: '任务' },
   { id: 'points', label: '积分' },
+  { id: 'request', label: '求片' },
 ];
 
 PAGES.automation = async () => {
@@ -1784,16 +1807,21 @@ PAGES.automation = async () => {
     `<button class="btn ${c.id === automation.category ? 'primary' : ''}"
        onclick="switchPluginCategory('${c.id}')">${esc(c.label)}</button>`).join('');
 
+  const emptyLabel = ({ points: '还没有已注册的积分功能',
+    request: '还没有已注册的求片任务' })[automation.category]
+    || '还没有已注册的任务';
   const body = cards.length
     ? `<div class="plugin-grid">${cards.map(pluginCard).join('')}</div>`
-    : `<div class="card"><div class="empty">${automation.category === 'points'
-      ? '还没有已注册的积分功能' : '还没有已注册的任务'}</div></div>`;
+    : `<div class="card"><div class="empty">${emptyLabel}</div></div>`;
 
   $('#view').innerHTML = `
-    <div class="help">${automation.category === 'points'
-    ? `积分功能和定时任务共用同一套开关与配置。<b>签到和转账由成员在机器人里触发</b>，
-       这里的「立即运行」只统计不发放；<b>关掉开关，机器人里对应的按钮就会消失</b>。`
-    : `定时任务在这里统一开关和配置。<b>「立即运行」不看开关</b>：先试一次再决定要不要常开。
+    <div class="help">${{
+    points: `积分功能和定时任务共用同一套开关与配置。<b>签到和转账由成员在机器人里触发</b>，
+       这里的「立即运行」只统计不发放；<b>关掉开关，机器人里对应的按钮就会消失</b>。`,
+    request: `求片相关的定时任务。<b>每条求片在提交时就会推给上片员</b>，
+       这里的摘要只是每天提醒一次还有多少没人接，避免没人接的求片一直没动静。`,
+  }[automation.category]
+    || `定时任务在这里统一开关和配置。<b>「立即运行」不看开关</b>：先试一次再决定要不要常开。
        任何一个任务出错都只影响它自己的卡片，不会影响其他任务。`}
     </div>
     <div class="toolbar" style="margin-bottom:14px">${tabs}</div>
@@ -2266,5 +2294,116 @@ async function deleteShopItem(id, name) {
   try {
     await api(`/api/shop/items/${Number(id)}`, { method: 'DELETE' });
     toast('已删除'); renderPage('shop');
+  } catch (e) { toast('失败: ' + e.message, 1); }
+}
+
+/* ---------- 求片 ----------
+   The operator's view of the same queue the uploaders see in Telegram. It
+   exists because the bot fan-out only reaches uploaders who linked a chat,
+   and somebody has to be able to see and close a request when nobody did. */
+const REQUEST_STATUS_TABS = [
+  { id: 'active', label: '未处理' },
+  { id: 'open', label: '待接单' },
+  { id: 'claimed', label: '处理中' },
+  { id: 'done', label: '已处理' },
+  { id: 'rejected', label: '已拒绝' },
+  { id: '', label: '全部' },
+];
+const requestsView = { status: 'active' };
+
+function requestStatusTag(row) {
+  const cls = ({ open: 'warn', claimed: 'idle', done: 'ok',
+    rejected: 'bad' })[row.status] || 'idle';
+  return `<span class="tag ${cls}">${esc(row.status_label || row.status)}</span>`;
+}
+function requestPoster(row) {
+  if (!row.poster_path) return '<span class="muted">—</span>';
+  const src = String(row.poster_path).startsWith('http')
+    ? row.poster_path : `https://image.tmdb.org/t/p/w92${row.poster_path}`;
+  return `<img src="${esc(src)}" alt="" loading="lazy"
+    style="width:34px;height:51px;object-fit:cover;border-radius:3px">`;
+}
+function requestActions(row) {
+  if (row.status === 'open') {
+    return `<button class="btn sm" onclick="claimRequest(${Number(row.id)})">接单</button>`;
+  }
+  if (row.status === 'claimed') {
+    return `<button class="btn sm" onclick="resolveRequest(${Number(row.id)},1)">已处理</button>
+      <button class="btn sm danger" onclick="resolveRequest(${Number(row.id)},0)">拒绝</button>`;
+  }
+  return '<span class="muted">—</span>';
+}
+PAGES.requests = async () => {
+  $('#view').innerHTML = pageLoading();
+  const query = requestsView.status ? `?status=${encodeURIComponent(requestsView.status)}` : '';
+  const [rows, stats] = await Promise.all([
+    api(`/api/requests${query}`).catch(() => null),
+    api('/api/requests/stats').catch(() => ({})),
+  ]);
+  if (!rows) { $('#view').innerHTML = pageError('无法读取求片列表'); return; }
+
+  const tabs = REQUEST_STATUS_TABS.map((t) =>
+    `<button class="btn ${t.id === requestsView.status ? 'primary' : ''}"
+       onclick="switchRequestStatus('${t.id}')">${esc(t.label)}</button>`).join('');
+
+  $('#view').innerHTML = `
+    <div class="help">
+      成员在机器人里发 TMDB 链接求片，<b>每条求片会单独发给每个已关联 Telegram 的上片员</b>，
+      谁先点「接单」谁负责，其他人的按钮会自动收回。
+      这里可以代为接单或关闭；关闭后求片人会收到通知。
+      <b>没有配置 TMDB Key 也能用</b>，只是显示编号而不是片名。
+    </div>
+    <div class="stat-grid">
+      ${stat('🕓', stats.open || 0, '待接单', '还没有人认领')}
+      ${stat('🔧', stats.claimed || 0, '处理中', '已有上片员接单')}
+      ${stat('✅', stats.done || 0, '已处理', '累计')}
+      ${stat('📅', stats.month_total || 0, '本月求片', stats.period || '')}
+    </div>
+    <div class="toolbar" style="margin-bottom:14px">${tabs}</div>
+    ${tableCard('求片列表', `${rows.length} 条`,
+    ['编号', '海报', '片名', '类型', '求片人', '状态', '接单人', '时间', ''],
+    rows.map((r) => `<tr>
+        <td>#${esc(r.id)}</td>
+        <td>${requestPoster(r)}</td>
+        <td><div class="u-name">${esc(r.display_title)}</div>
+          <div class="u-sub muted">TMDB ${esc(r.tmdb_id)}${r.note ? ' · ' + esc(r.note) : ''}</div>
+          ${r.result_note ? `<div class="u-sub muted">结果：${esc(r.result_note)}</div>` : ''}</td>
+        <td>${esc(r.media_label || '-')}</td>
+        <td>${esc(r.username || r.emby_user_id || '-')}</td>
+        <td>${requestStatusTag(r)}</td>
+        <td>${r.claimed_by_name ? esc(r.claimed_by_name) : '<span class="muted">—</span>'}</td>
+        <td class="muted">${esc(fmtAgeTs(r.created_at))}</td>
+        <td class="row-actions">${requestActions(r)}</td>
+      </tr>`).join(''))}`;
+};
+function switchRequestStatus(id) {
+  requestsView.status = id;
+  renderPage('requests');
+}
+async function claimRequest(id) {
+  try {
+    const r = await api(`/api/requests/${Number(id)}/claim`, {
+      method: 'POST', body: JSON.stringify({}) });
+    /* A lost race is a normal outcome, not an error: somebody in Telegram
+       may have tapped 接单 while this page was open. */
+    toast(r && r.ok === false
+      ? `已被 ${r.claimed_by_name || '其他上片员'} 接单`
+      : '已接单');
+    renderPage('requests');
+  } catch (e) { toast('失败: ' + e.message, 1); }
+}
+async function resolveRequest(id, done) {
+  let note = '';
+  if (!done) {
+    note = prompt('无法处理的原因？会原样发给求片人。', '暂时找不到片源');
+    if (note === null) return;
+  } else if (!confirm('标记为已处理？求片人会收到通知。')) {
+    return;
+  }
+  try {
+    await api(`/api/requests/${Number(id)}/resolve`, {
+      method: 'POST', body: JSON.stringify({ done: !!done, note }) });
+    toast(done ? '已标记处理完成' : '已拒绝并通知求片人');
+    renderPage('requests');
   } catch (e) { toast('失败: ' + e.message, 1); }
 }

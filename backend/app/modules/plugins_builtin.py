@@ -478,12 +478,78 @@ class ExpiryReminderPlugin(Plugin):
                 "提前天数": days}
 
 
+# ---------------------------------------------------------------------------
+# 6. Request digest
+# ---------------------------------------------------------------------------
+class RequestDigestPlugin(Plugin):
+    """A daily nudge to whoever is supposed to be filling requests.
+
+    The per-request notification is a push at the moment somebody asks, which
+    is exactly when an uploader is least likely to be free. Requests that
+    nobody took therefore go quiet, and the member is left watching a 待接单
+    row for a week. This is the reminder that nothing is quiet because
+    everything is done.
+
+    ``only_if_open`` defaults on: a digest that arrives every morning to say
+    'nothing to do' is one people stop reading, and then they miss the one
+    that mattered.
+    """
+
+    spec = Spec(
+        id="request_digest",
+        name="求片摘要",
+        description="每天把待接单和处理中的求片数量发给所有上片员。"
+                    "默认只在有待接单时发送。",
+        category="request",
+        icon="🎬",
+        hour=9,
+        fields=[
+            Field("hour", "推送时间", kind="int", default=9, min=0, max=23,
+                  help="每天几点推送（0–23）"),
+            Field("only_if_open", "仅在有待接单时推送", kind="bool",
+                  default=True,
+                  help="关闭后即使没有待处理求片也会每天发一条"),
+        ],
+    )
+
+    async def run(self, config: dict[str, Any]) -> dict[str, Any]:
+        if self.ctx.requests is None:
+            return {"ok": False, "错误": "求片服务不可用"}
+        if not _telegram_ready(self.ctx):
+            return {"ok": False, "错误": "机器人未启用"}
+
+        stats = self.ctx.requests.stats()
+        pending = int(stats.get("open") or 0)
+        working = int(stats.get("claimed") or 0)
+        if bool(config.get("only_if_open", True)) and not pending:
+            return {"ok": True, "待接单": 0, "处理中": working,
+                    "已通知": 0, "结果": "无待接单，未推送"}
+
+        body = (
+            "🎬 <b>求片摘要</b>\n\n"
+            f"待接单：<b>{pending}</b> 条\n"
+            f"处理中：<b>{working}</b> 条\n"
+            f"本月累计：{int(stats.get('month_total') or 0)} 条\n\n"
+            "发送 /req 查看列表。")
+
+        sent = 0
+        for uploader in self.ctx.requests.uploaders():
+            chat_id = str(uploader.get("tg_user_id") or "")
+            if not chat_id:
+                continue
+            if await self.ctx.telegram.send(chat_id, body):
+                sent += 1
+        return {"ok": True, "待接单": pending, "处理中": working,
+                "已通知": sent}
+
+
 BUILTIN_PLUGINS = (
     GroupAuditPlugin,
     InactiveCleanupPlugin,
     ViewingReportPlugin,
     RankingsPostPlugin,
     ExpiryReminderPlugin,
+    RequestDigestPlugin,
     *POINTS_PLUGINS,
 )
 
