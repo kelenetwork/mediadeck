@@ -14,6 +14,7 @@ const NAV = [
     { id: 'members', icon: '☺', label: '用户管理', sub: '用户组、角色、流量与设备' },
     { id: 'groups', icon: '▣', label: '用户组', sub: '计费模式与默认限制' },
     { id: 'redeem', icon: '🎟', label: '卡密管理', sub: '生成、发放与作废注册卡密' },
+    { id: 'shop', icon: '🎁', label: '兑换商城', sub: '积分商品、限购与兑换记录' },
     { id: 'stats', icon: '📈', label: '运营统计', sub: '流量、时长与热门内容' },
     { id: 'audit', icon: '☰', label: '审计日志', sub: '操作记录与变更追踪' },
   ]},

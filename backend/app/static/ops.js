@@ -146,7 +146,7 @@ async function deleteMount(name) {
    shows provenance (which door they came in by, who vouched for them) because
    that is what the invite tree is for. */
 const MEMBER_COLS = ['', 'Emby 账号', '套餐', '有效期', '注册渠道', '邀请人',
-  '下级', 'TG', '本月观看', ''];
+  '下级', 'TG', '积分', '本月观看', ''];
 
 PAGES.members = async () => {
   $('#view').innerHTML = pageLoading();
@@ -329,6 +329,7 @@ function memberRow(m) {
     <td>${kids ? `<button class="link-btn" onclick="filterByInviter('${q(m.username)}')">${kids}</button>`
     : '<span class="muted">0</span>'}</td>
     <td>${tgCell(m)}</td>
+    <td>${pointsCell(m)}</td>
     <td>${watchCell(m)}</td>
     <td class="icon-actions">
       <button class="btn sm" title="详情" onclick="memberDetail('${id}')">👁</button>
@@ -338,6 +339,14 @@ function memberRow(m) {
       <button class="btn sm danger" title="删除"
         onclick="memberDelete('${id}','${q(m.username)}')">🗑</button>
     </td></tr>`;
+}
+
+/* A zero balance is muted rather than bold: on a server that has just
+   switched points on every row reads zero, and shouting it would make the
+   column look broken. */
+function pointsCell(m) {
+  const n = Number(m.points || 0);
+  return n ? `<b>${esc(n)}</b>` : '<span class="muted">0</span>';
 }
 
 /* ---------- bulk selection ----------
@@ -797,10 +806,13 @@ async function memberDetail(id) {
         ${plays.slice(0, 20).map((p) => `<tr><td>${esc(p.series_name || p.item_name || '(未命名)')}</td>
           <td>${esc(p.play_method || '-')}</td><td>${esc(Math.round((p.seconds || 0) / 60))} 分</td></tr>`).join('')}
       </tbody></table>` : '<div class="empty">暂无播放</div>'}
+      <h3 style="font-size:13px;margin:16px 0 6px">积分</h3>
+      ${pointsBlock(id, d)}
       <h3 style="font-size:13px;margin:16px 0 6px">审计时间线</h3>
       ${audit.length ? audit.slice(0, 20).map((a) => `<div class="list-row"><div>
         <div class="t">${esc(a.action)}</div><div class="s">${esc(a.detail)}</div></div>
         <span class="muted">${esc(fmtAgeTs(a.ts))}</span></div>`).join('') : '<div class="empty">暂无记录</div>'}`;
+    if ($('#pt-apply')) $('#pt-apply').onclick = () => adjustPoints(id);
     if ($('#ov-save')) $('#ov-save').onclick = () => saveOverrides(id);
     if ($('#ov-clear')) $('#ov-clear').onclick = () => clearAllOverrides(id);
     if ($('#md-group-save')) {
@@ -816,6 +828,36 @@ async function memberDetail(id) {
     const body = document.querySelector('#modal-root .modal-body');
     if (body) body.innerHTML = `<div class="page-error">${esc(e.message)}</div>`;
   }
+}
+/* Balance, recent rows, and the way to change it -- together, because an
+   operator adjusting points needs to see what they are adjusting from. The
+   reason box is not optional in spirit: an unexplained adjustment is the one
+   nobody can answer questions about later. */
+function pointsBlock(id, d) {
+  const rows = d.points_ledger || [];
+  return `<div class="help">当前余额 <b>${esc(d.points || 0)}</b></div>
+    <div class="detail-actions">
+      <input id="pt-delta" type="number" placeholder="增减，如 100 或 -50" style="width:170px">
+      <input id="pt-reason" placeholder="原因（会记入审计）" style="min-width:180px">
+      <button class="btn sm primary" id="pt-apply">调整积分</button>
+    </div>
+    ${rows.length ? `<table><thead><tr><th>时间</th><th>变动</th><th>原因</th></tr></thead><tbody>
+      ${rows.slice(0, 10).map((r) => `<tr><td>${esc(fmtAgeTs(r.created_at))}</td>
+        <td>${Number(r.delta) > 0 ? '+' : ''}${esc(r.delta)}</td>
+        <td>${esc(r.reason_label || r.reason)}${r.ref ? ' · ' + esc(r.ref) : ''}</td></tr>`).join('')}
+    </tbody></table>` : '<div class="empty">暂无积分记录</div>'}`;
+}
+async function adjustPoints(id) {
+  id = uq(id);
+  const delta = Number(($('#pt-delta') || {}).value || 0);
+  if (!delta) { toast('请输入非零的增减数量', 1); return; }
+  try {
+    await api(`/api/points/${encodeURIComponent(id)}/adjust`, {
+      method: 'POST',
+      body: JSON.stringify({ delta, reason: ($('#pt-reason') || {}).value || '' }),
+    });
+    toast('已调整积分'); memberDetail(id); renderPage('members');
+  } catch (e) { toast('失败: ' + e.message, 1); }
 }
 function sparkline(series) {
   if (!series.length) return '<div class="empty">暂无数据</div>';
@@ -1742,19 +1784,17 @@ PAGES.automation = async () => {
     `<button class="btn ${c.id === automation.category ? 'primary' : ''}"
        onclick="switchPluginCategory('${c.id}')">${esc(c.label)}</button>`).join('');
 
-  const body = automation.category === 'points'
-    ? `<div class="card"><div class="empty">
-         积分功能将在 PR-3 接入。届时签到、兑换等都会作为插件出现在这里，
-         和任务共用同一套开关、配置与运行记录。
-       </div></div>`
-    : (cards.length
-      ? `<div class="plugin-grid">${cards.map(pluginCard).join('')}</div>`
-      : '<div class="card"><div class="empty">还没有已注册的任务</div></div>');
+  const body = cards.length
+    ? `<div class="plugin-grid">${cards.map(pluginCard).join('')}</div>`
+    : `<div class="card"><div class="empty">${automation.category === 'points'
+      ? '还没有已注册的积分功能' : '还没有已注册的任务'}</div></div>`;
 
   $('#view').innerHTML = `
-    <div class="help">
-      定时任务在这里统一开关和配置。<b>「立即运行」不看开关</b>：先试一次再决定要不要常开。
-      任何一个任务出错都只影响它自己的卡片，不会影响其他任务。
+    <div class="help">${automation.category === 'points'
+    ? `积分功能和定时任务共用同一套开关与配置。<b>签到和转账由成员在机器人里触发</b>，
+       这里的「立即运行」只统计不发放；<b>关掉开关，机器人里对应的按钮就会消失</b>。`
+    : `定时任务在这里统一开关和配置。<b>「立即运行」不看开关</b>：先试一次再决定要不要常开。
+       任何一个任务出错都只影响它自己的卡片，不会影响其他任务。`}
     </div>
     <div class="toolbar" style="margin-bottom:14px">${tabs}</div>
     ${body}`;
@@ -2060,3 +2100,171 @@ PAGES.sharing = async () => {
         <td class="muted">${(it.networks || []).map((n) => esc(n)).join(' · ')}</td>
       </tr>`).join(''))}`;
 };
+
+/* ---------- 兑换商城 ----------
+   Items are data, so this page is a plain editor over them: the operator
+   prices and retires things without a release. The orders table underneath is
+   the other half -- a catalogue with no record of what it handed out cannot
+   answer "why does this member have 500GB extra". */
+const SHOP_KINDS = [
+  { id: 'traffic', label: '流量包', unit: 'GB' },
+  { id: 'days', label: '会员天数', unit: '天' },
+  { id: 'bandwidth', label: '带宽提速', unit: 'Mbps' },
+  { id: 'invite', label: '邀请名额', unit: '个' },
+];
+function shopUnit(kind) {
+  const found = SHOP_KINDS.find((k) => k.id === kind);
+  return found ? found.unit : '';
+}
+PAGES.shop = async () => {
+  $('#view').innerHTML = pageLoading();
+  const [items, orders] = await Promise.all([
+    api('/api/shop/items').catch(() => null),
+    api('/api/shop/orders?limit=50').catch(() => []),
+  ]);
+  if (!items) { $('#view').innerHTML = pageError('无法读取商城商品'); return; }
+  // Kept so the edit dialog can prefill from the row already on screen
+  // rather than re-fetching one item.
+  state.shopItems = items;
+  const live = items.filter((i) => i.enabled).length;
+  const spent = orders.reduce((sum, o) => sum + Number(o.cost || 0), 0);
+  $('#view').innerHTML = `
+    <div class="help">
+      成员用积分在机器人的「背包 → 兑换商城」里兑换这些商品。
+      <b>新建的商品默认要手动开启</b>，开启后成员才看得到；
+      带宽提速对<b>不限速</b>的账号无意义，系统会直接拒绝并且不扣分。
+    </div>
+    <div class="stat-grid">
+      ${stat('🎁', items.length, '商品', `${live} 个已上架`)}
+      ${stat('📜', orders.length, '兑换记录', '最近 50 条')}
+      ${stat('💰', spent, '消耗积分', '这些记录合计')}
+    </div>
+    ${card('新增商品', '数量的单位随类型变化：流量按 GB，天数按天，提速按 Mbps，名额按个',
+    `<div class="card-body">
+        <div class="form-row"><label>类型</label>
+          <select id="sh-kind">${SHOP_KINDS.map((k) =>
+    `<option value="${esc(k.id)}">${esc(k.label)}</option>`).join('')}</select>
+          <span class="muted" id="sh-unit">单位 GB</span></div>
+        <div class="form-row"><label>名称</label>
+          <input id="sh-name" placeholder="例如「流量包 50GB」"></div>
+        <div class="form-row"><label>说明</label>
+          <input id="sh-desc" placeholder="成员在机器人里看到的一句话说明"></div>
+        <div class="form-row"><label>消耗积分</label>
+          <input id="sh-cost" type="number" min="1" value="100" style="width:110px"></div>
+        <div class="form-row"><label>数量</label>
+          <input id="sh-amount" type="number" min="1" value="50" style="width:110px"></div>
+        <div class="form-row"><label>每人限兑</label>
+          <input id="sh-limit" type="number" min="0" value="0" style="width:110px">
+          <span class="muted">0 = 不限</span></div>
+        <div class="form-row"><label>排序</label>
+          <input id="sh-sort" type="number" value="0" style="width:110px">
+          <span class="muted">越小越靠前</span></div>
+        <div class="form-row"><label>立即上架</label>
+          <input id="sh-enabled" type="checkbox"></div>
+        <div class="toolbar"><button class="btn primary" id="sh-add">新增商品</button></div>
+      </div>`)}
+    ${tableCard('商品', `${items.length} 个`,
+    ['名称', '类型', '消耗', '数量', '每人限兑', '排序', '上架', ''],
+    items.length ? items.map((i) => `<tr>
+        <td><div class="u-name">${esc(i.name)}</div>
+          ${i.description ? `<div class="u-sub muted">${esc(i.description)}</div>` : ''}</td>
+        <td>${esc(i.kind_label || i.kind)}</td>
+        <td><b>${esc(i.cost)}</b> 分</td>
+        <td>${esc(i.amount)} ${esc(i.unit || shopUnit(i.kind))}</td>
+        <td>${i.per_user_limit ? esc(i.per_user_limit) + ' 次' : '<span class="muted">不限</span>'}</td>
+        <td>${esc(i.sort)}</td>
+        <td><input type="checkbox" ${i.enabled ? 'checked' : ''}
+          onchange="toggleShopItem(${Number(i.id)}, this.checked)"></td>
+        <td class="icon-actions">
+          <button class="btn sm" title="编辑" onclick="editShopItem(${Number(i.id)})">✎</button>
+          <button class="btn sm danger" title="删除"
+            onclick="deleteShopItem(${Number(i.id)}, '${q(i.name)}')">🗑</button>
+        </td></tr>`).join('')
+      : '<tr><td colspan="8"><div class="empty">还没有商品</div></td></tr>')}
+    ${tableCard('兑换记录', '最近 50 条', ['时间', '用户', '商品', '发放', '消耗'],
+    orders.length ? orders.map((o) => `<tr>
+        <td>${esc(fmtAgeTs(o.created_at))}</td>
+        <td>${esc(o.username || o.emby_user_id || '-')}</td>
+        <td>${esc(o.item_name || '-')}</td>
+        <td>${esc(o.amount)} ${esc(o.unit || shopUnit(o.kind))}</td>
+        <td>-${esc(o.cost)} 分</td></tr>`).join('')
+      : '<tr><td colspan="5"><div class="empty">还没有人兑换过</div></td></tr>')}`;
+  const kindSel = $('#sh-kind');
+  if (kindSel) {
+    kindSel.onchange = () => {
+      const unit = $('#sh-unit');
+      if (unit) unit.textContent = '单位 ' + shopUnit(kindSel.value);
+    };
+  }
+  if ($('#sh-add')) $('#sh-add').onclick = addShopItem;
+};
+function shopFormPayload() {
+  return {
+    kind: ($('#sh-kind') || {}).value,
+    name: (($('#sh-name') || {}).value || '').trim(),
+    description: (($('#sh-desc') || {}).value || '').trim(),
+    cost: Number(($('#sh-cost') || {}).value || 0),
+    amount: Number(($('#sh-amount') || {}).value || 0),
+    per_user_limit: Number(($('#sh-limit') || {}).value || 0),
+    sort: Number(($('#sh-sort') || {}).value || 0),
+    enabled: !!(($('#sh-enabled') || {}).checked),
+  };
+}
+async function addShopItem() {
+  const payload = shopFormPayload();
+  if (!payload.name) { toast('请填写商品名称', 1); return; }
+  try {
+    await api('/api/shop/items', { method: 'POST', body: JSON.stringify(payload) });
+    toast('已新增商品'); renderPage('shop');
+  } catch (e) { toast('失败: ' + e.message, 1); }
+}
+async function toggleShopItem(id, enabled) {
+  try {
+    await api(`/api/shop/items/${Number(id)}`, {
+      method: 'PUT', body: JSON.stringify({ enabled }) });
+    toast(enabled ? '已上架' : '已下架'); renderPage('shop');
+  } catch (e) { toast('失败: ' + e.message, 1); renderPage('shop'); }
+}
+function editShopItem(id) {
+  const item = ((state.shopItems || []).find((i) => i.id === id));
+  const row = item || { id };
+  openModal('编辑商品', `
+    <div class="form-row"><label>名称</label><input id="se-name" value="${esc(row.name || '')}"></div>
+    <div class="form-row"><label>说明</label><input id="se-desc" value="${esc(row.description || '')}"></div>
+    <div class="form-row"><label>消耗积分</label>
+      <input id="se-cost" type="number" min="1" value="${esc(row.cost || 1)}" style="width:110px"></div>
+    <div class="form-row"><label>数量</label>
+      <input id="se-amount" type="number" min="1" value="${esc(row.amount || 1)}" style="width:110px"></div>
+    <div class="form-row"><label>每人限兑</label>
+      <input id="se-limit" type="number" min="0" value="${esc(row.per_user_limit || 0)}" style="width:110px">
+      <span class="muted">0 = 不限</span></div>
+    <div class="form-row"><label>排序</label>
+      <input id="se-sort" type="number" value="${esc(row.sort || 0)}" style="width:110px"></div>
+    <div class="toolbar"><button class="btn primary" id="se-save">保存</button></div>`);
+  const save = $('#se-save');
+  if (save) {
+    save.onclick = async () => {
+      try {
+        await api(`/api/shop/items/${Number(id)}`, {
+          method: 'PUT',
+          body: JSON.stringify({
+            name: ($('#se-name') || {}).value,
+            description: ($('#se-desc') || {}).value,
+            cost: Number(($('#se-cost') || {}).value || 0),
+            amount: Number(($('#se-amount') || {}).value || 0),
+            per_user_limit: Number(($('#se-limit') || {}).value || 0),
+            sort: Number(($('#se-sort') || {}).value || 0),
+          }),
+        });
+        closeModal(); toast('已保存'); renderPage('shop');
+      } catch (e) { toast('失败: ' + e.message, 1); }
+    };
+  }
+}
+async function deleteShopItem(id, name) {
+  if (!confirm(`确定删除商品「${uq(name)}」？已产生的兑换记录会保留。`)) return;
+  try {
+    await api(`/api/shop/items/${Number(id)}`, { method: 'DELETE' });
+    toast('已删除'); renderPage('shop');
+  } catch (e) { toast('失败: ' + e.message, 1); }
+}
