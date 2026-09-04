@@ -49,6 +49,7 @@ from app.modules.signing import user_tag
 from app.modules.stats import StatsService
 from app.modules.storage import MockStorage, StorageManager
 from app.modules.tasks import MockTasks, TasksReader
+from app.modules.telegram import TelegramBot
 from app.modules.updater import MockUpdater, Updater
 from app.modules.usage import UsageSampler
 
@@ -307,6 +308,35 @@ async def _startup() -> None:
             await app.state.scheduler.wait_for_change(15)
 
     app.state.probe_task = asyncio.create_task(probe_loop())
+
+    # ---- telegram bot ----------------------------------------------------
+    # Long polling, not a webhook: a webhook needs a public HTTPS route into
+    # the panel, while polling reaches out instead and leaves the panel
+    # reachable only from where it already was.
+    app.state.telegram = TelegramBot(
+        app.state.settings_service.telegram_config, app.state.members)
+    app.state.telegram.start()
+
+    async def telegram_notify_loop() -> None:
+        """Daily expiry reminders to members who linked a chat.
+
+        Keyed by day rather than by an interval so a restart cannot produce a
+        second round of the same reminder a few hours after the first.
+        """
+        sent_on = ""
+        while True:
+            await asyncio.sleep(300)
+            with contextlib.suppress(Exception):
+                cfg = app.state.settings_service.telegram_config()
+                today = time.strftime("%Y-%m-%d")
+                if (cfg["enabled"] and cfg["notify_expiring"]
+                        and sent_on != today and time.localtime().tm_hour >= 10):
+                    due = app.state.members.expiring_within(
+                        cfg["notify_expiring_days"])
+                    await app.state.telegram.notify_expiring(due)
+                    sent_on = today
+
+    app.state.telegram_task = asyncio.create_task(telegram_notify_loop())
 
     async def _nodes_topic() -> Any:
         config = {n["name"]: n for n in app.state.settings_service.nodes_public()}
@@ -1475,6 +1505,56 @@ async def image_cache_clear(user: str = Depends(_auth)) -> dict[str, Any]:
 @app.post("/api/settings/image-cache/sweep", dependencies=[Depends(_auth)])
 async def image_cache_sweep() -> dict[str, Any]:
     return app.state.images.sweep(force=True)
+
+
+@app.get("/api/settings/telegram", dependencies=[Depends(_auth)])
+async def telegram_get() -> dict[str, Any]:
+    # Never the raw token: it is a bearer credential, and anyone holding it can
+    # read every message the bot receives and post as it.
+    return {**app.state.settings_service.telegram_public(),
+            "status": app.state.telegram.status()}
+
+
+@app.post("/api/settings/telegram", dependencies=[Depends(_auth)])
+async def telegram_save(payload: dict[str, Any] = Body(...),  # noqa: B008
+                        user: str = Depends(_auth)) -> dict[str, Any]:
+    saved = app.state.settings_service.save_telegram(payload)
+    # The audit trail records that the token changed, never what it changed to.
+    app.state.members.audit(
+        user, "settings.telegram", "",
+        f"enabled={saved['enabled']} token_set={saved['bot_token_set']}")
+    return {**saved, "status": app.state.telegram.status()}
+
+
+@app.post("/api/settings/telegram/verify", dependencies=[Depends(_auth)])
+async def telegram_verify() -> dict[str, Any]:
+    """Ask Telegram who the bot is. Proves the token without printing it."""
+    return await app.state.telegram.verify()
+
+
+@app.post("/api/members/{user_id}/telegram/bind-code", dependencies=[Depends(_auth)])
+async def telegram_bind_code(user_id: str, user: str = Depends(_auth)) -> dict[str, Any]:
+    """Issue a one-time code the member types into the bot.
+
+    The bot never asks for an Emby password: a chat transcript is not a safe
+    place to type one, and a code that expires limits the damage if it is
+    pasted into the wrong window.
+    """
+    member = app.state.members.get(user_id)
+    if not member:
+        raise HTTPException(404, "member not found")
+    code, ttl = app.state.telegram.codes.issue(user_id, member.get("username") or "")
+    app.state.members.audit(user, "member.telegram.code", user_id, "bind code issued")
+    return {"code": code, "expires_in": ttl,
+            "username": member.get("username") or ""}
+
+
+@app.post("/api/members/{user_id}/telegram/unbind", dependencies=[Depends(_auth)])
+async def telegram_unbind(user_id: str, user: str = Depends(_auth)) -> dict[str, Any]:
+    try:
+        return app.state.members.unbind_telegram(user_id, actor=user)
+    except KeyError:
+        raise HTTPException(404, "member not found") from None
 
 
 @app.get("/api/settings/membership", dependencies=[Depends(_auth)])

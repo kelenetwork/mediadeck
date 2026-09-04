@@ -4,6 +4,36 @@ Newest entries first. Every working session appends one entry.
 
 ---
 
+## 2026-09-05 — Telegram bot, and it knows who it is talking to
+**Done**
+- Menu-driven bot over long polling. A webhook would need a public HTTPS route
+  into the panel; polling reaches out instead, so the panel stays reachable
+  only from where it already was.
+- Two audiences, one entry point. The keyboard is chosen from binding state on
+  every render: a guest is offered only a way to link an account, a linked
+  member lands on their own status. A fixed keyboard would give half of them
+  dead ends.
+- Binding uses a 6-character one-time code issued from the panel, valid ten
+  minutes, single use, and re-issuing invalidates the previous one. The bot
+  never asks for an Emby password: a chat transcript is not a safe place to
+  type one.
+- One chat speaks for one member, enforced by a partial unique index. Rebinding
+  detaches the previous holder and says so in the audit trail — silently moving
+  a link would leave the old member believing they still get notifications.
+- `bot_token` is stored like the Emby API key: masked on read, `__KEEP__`
+  sentinel on save so an unretyped field cannot wipe it, and the audit line
+  records *that* it changed, never what to. It is a bearer credential; anyone
+  holding it can read every message the bot receives and post as it.
+- Daily expiry reminders to linked members, keyed by day rather than by an
+  interval so a restart cannot fire the same reminder twice.
+- `members` gained `tg_user_id` / `tg_username` / `tg_bound_at` via the
+  idempotent column migration, plus `find_by_telegram`, `bind_telegram`,
+  `unbind_telegram` and `expiring_within`.
+
+**Next**
+- Member list UI: bind-code button, TG column, batch renew.
+- Then shared-account detection and UA/region access rules.
+
 ## 2026-09-05 — dashboard shows the library, not just counters
 **Done**
 - Dashboard renders a poster wall of recent additions, plus playback cards

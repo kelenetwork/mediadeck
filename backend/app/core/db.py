@@ -238,6 +238,16 @@ class Database:
             self._ensure_column("members", "roles", "TEXT NOT NULL DEFAULT ''")
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_members_group ON members(group_id)")
+            # v0.18: Telegram linkage. Stored on the member rather than in a
+            # side table because it is strictly one chat per member: the unique
+            # index is what stops a second account from claiming a chat that
+            # already answers for someone else.
+            self._ensure_column("members", "tg_user_id", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column("members", "tg_username", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column("members", "tg_bound_at", "INTEGER")
+            self._conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_members_tg "
+                "ON members(tg_user_id) WHERE tg_user_id <> ''")
             self._conn.commit()
 
     def _ensure_column(self, table: str, name: str, ddl: str) -> None:
