@@ -39,6 +39,12 @@ from app.modules.members import MemberService, random_password, rate_bytes_per_s
 from app.modules.mounts import MockMounts, MountsReader
 from app.modules.pipeline import MockPipeline, PipelineReader
 from app.modules.playback import PlaybackRouter, caller_device, caller_token
+from app.modules.plugins import PluginRegistry
+from app.modules.plugins_builtin import (
+    PluginContext,
+    migrate_legacy_telegram_jobs,
+    register_builtin,
+)
 from app.modules.provisioning import (
     emby_frontend_snippet,
     enroll_command,
@@ -325,41 +331,28 @@ async def _startup() -> None:
         emby=app.state.emby, stats=app.state.stats, db=app.state.db)
     app.state.telegram.start()
 
-    async def telegram_notify_loop() -> None:
-        """Daily expiry reminders, and the daily ranking post.
-
-        Both are keyed by day rather than by an interval, so a restart cannot
-        produce a second round of the same message a few hours after the first.
-        The two are tracked separately: they fire at different hours, and a
-        restart between them must not cancel whichever has not gone out yet.
-        """
-        reminded_on = ""
-        ranked_on = ""
-        while True:
-            await asyncio.sleep(300)
-            with contextlib.suppress(Exception):
-                cfg = app.state.settings_service.telegram_config()
-                if not cfg["enabled"]:
-                    continue
-                today = time.strftime("%Y-%m-%d")
-                hour = time.localtime().tm_hour
-
-                # Not before 10:00: a reminder that arrives at 04:00 wakes
-                # someone up to tell them about a renewal days away.
-                if (cfg["notify_expiring"] and reminded_on != today
-                        and hour >= 10):
-                    due = app.state.members.expiring_within(
-                        cfg["notify_expiring_days"])
-                    await app.state.telegram.notify_expiring(due)
-                    reminded_on = today
-
-                if (cfg["rankings_enabled"] and cfg["rankings_chat"]
-                        and ranked_on != today and hour >= cfg["rankings_hour"]):
-                    await app.state.telegram.broadcast_rankings(
-                        cfg["rankings_chat"], days=1)
-                    ranked_on = today
-
-    app.state.telegram_task = asyncio.create_task(telegram_notify_loop())
+    # ---- plugins ---------------------------------------------------------
+    # Everything that used to be a bespoke background loop is a plugin now.
+    # The daily expiry reminder and ranking post in particular were hard-coded
+    # here with their own day-keys; running both mechanisms at once would post
+    # twice, so the loop is gone rather than merely disabled.
+    app.state.plugin_ctx = PluginContext(
+        members=app.state.members,
+        emby=app.state.emby,
+        telegram=app.state.telegram,
+        stats=app.state.stats,
+        db=app.state.db,
+        settings=app.state.settings_service,
+        store=store,
+    )
+    # Carry the old loop's settings onto the new cards before the scheduler
+    # starts, so an operator who had the ranking post switched on keeps it,
+    # at the same hour and to the same chat.
+    with contextlib.suppress(Exception):
+        migrate_legacy_telegram_jobs(store)
+    app.state.plugins = register_builtin(
+        PluginRegistry(store, app.state.db), app.state.plugin_ctx)
+    app.state.plugins.start()
 
     async def _nodes_topic() -> Any:
         config = {n["name"]: n for n in app.state.settings_service.nodes_public()}
@@ -1750,8 +1743,13 @@ async def telegram_group_audit() -> dict[str, Any]:
 @app.post("/api/telegram/rankings/send", dependencies=[Depends(_auth)])
 async def telegram_send_rankings(payload: dict[str, Any] = Body(default={}),  # noqa: B008
                                  user: str = Depends(_auth)) -> dict[str, bool]:
-    cfg = app.state.settings_service.telegram_config()
-    chat = str(payload.get("chat_id") or cfg.get("rankings_chat") or "").strip()
+    # The stored target lives on the ranking plugin's card now, not in the
+    # Telegram settings: one place to configure it, so "send one now" and the
+    # scheduled post can never disagree about where it goes.
+    stored = ""
+    with contextlib.suppress(Exception):
+        stored = str(app.state.plugins.config("rankings_post").get("chat_id") or "")
+    chat = str(payload.get("chat_id") or stored or "").strip()
     if not chat:
         raise HTTPException(400, "未配置排行榜推送目标")
     days = int(payload.get("days") or 1)
@@ -1766,6 +1764,71 @@ async def telegram_unbind(user_id: str, user: str = Depends(_auth)) -> dict[str,
         return app.state.members.unbind_telegram(user_id, actor=user)
     except KeyError:
         raise HTTPException(404, "member not found") from None
+
+
+# ---- plugins (automation cards) --------------------------------------------
+# One mechanism for every scheduled job. The panel renders a card straight from
+# each plugin's declaration, so adding a feature is adding a file rather than
+# adding an endpoint and a page.
+def _plugin_or_404(plugin_id: str) -> Any:
+    registry = getattr(app.state, "plugins", None)
+    if registry is None or registry.get(plugin_id) is None:
+        raise HTTPException(404, "unknown plugin")
+    return registry
+
+
+@app.get("/api/plugins", dependencies=[Depends(_auth)])
+async def plugins_list(category: str | None = None) -> list[dict[str, Any]]:
+    return app.state.plugins.cards(category)
+
+
+@app.get("/api/plugins/{plugin_id}", dependencies=[Depends(_auth)])
+async def plugin_get(plugin_id: str) -> dict[str, Any]:
+    return _plugin_or_404(plugin_id).card(plugin_id)
+
+
+@app.post("/api/plugins/{plugin_id}", dependencies=[Depends(_auth)])
+async def plugin_save(plugin_id: str, payload: dict[str, Any] = Body(default={}),  # noqa: B008
+                      user: str = Depends(_auth)) -> dict[str, Any]:
+    registry = _plugin_or_404(plugin_id)
+    enabled = payload.get("enabled")
+    config = payload.get("config")
+    if config is not None and not isinstance(config, dict):
+        raise HTTPException(400, "config 必须是对象")
+    try:
+        card = registry.save(
+            plugin_id,
+            None if enabled is None else bool(enabled),
+            config)
+    except ValueError as exc:
+        # Field.coerce raises with the operator-facing reason already in
+        # Chinese; passing it through is the whole point of validating there.
+        raise HTTPException(400, str(exc)) from None
+    app.state.members.audit(
+        user, "plugin.save", plugin_id,
+        f"enabled={card['enabled']}")
+    return card
+
+
+@app.post("/api/plugins/{plugin_id}/run", dependencies=[Depends(_auth)])
+async def plugin_run(plugin_id: str, user: str = Depends(_auth)) -> dict[str, Any]:
+    """Run one plugin now, regardless of its switch or schedule.
+
+    Enabled-state is ignored on purpose: the button exists so a plugin can be
+    tried *before* it is switched on. A failing run answers 200 with
+    ``ok: false`` rather than an error status -- the failure is the result the
+    operator asked for, and it is recorded on the card either way.
+    """
+    registry = _plugin_or_404(plugin_id)
+    result = await registry.run_now(plugin_id, trigger="manual")
+    app.state.members.audit(user, "plugin.run", plugin_id,
+                            f"ok={result.get('ok')}")
+    return {**result, "card": registry.card(plugin_id)}
+
+
+@app.get("/api/plugins/{plugin_id}/history", dependencies=[Depends(_auth)])
+async def plugin_history(plugin_id: str, limit: int = 20) -> list[dict[str, Any]]:
+    return _plugin_or_404(plugin_id).history(plugin_id, limit)
 
 
 @app.get("/api/settings/membership", dependencies=[Depends(_auth)])

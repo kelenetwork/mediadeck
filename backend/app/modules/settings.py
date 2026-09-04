@@ -66,15 +66,14 @@ TELEGRAM_DEFAULTS: dict[str, Any] = {
     "max_users": 0,
     # Chat id or @name a user must belong to before registering. Empty = open.
     "require_group": "",
-    # Where the daily ranking post goes. Empty = do not post.
-    "rankings_chat": "",
-    "rankings_enabled": False,
-    "rankings_hour": 21,
     # Shown to a new member alongside their credentials; without it they have
     # a username and password and nowhere to use them.
     "emby_public_url": "",
-    "notify_expiring": True,
-    "notify_expiring_days": 3,
+    # NOTE: the daily ranking post and the expiry reminder used to be
+    # configured here (rankings_* / notify_expiring*). They are plugins now
+    # ("排行推送" / "到期提醒" on the automation page), and their settings live
+    # on those cards. Two switches for one post is how it goes out twice;
+    # migrate_legacy_telegram_jobs() moves any stored values across on upgrade.
 }
 
 # Artwork cache. Enabled by default because it is pure win: posters never
@@ -376,12 +375,8 @@ class SettingsService:
         # Registration cannot outlive the bot: with polling stopped nobody could
         # reach it anyway, and reporting it as open would mislead the operator.
         cfg["registration_enabled"] = bool(cfg["registration_enabled"]) and cfg["enabled"]
-        cfg["notify_expiring"] = bool(cfg["notify_expiring"])
-        cfg["rankings_enabled"] = bool(cfg["rankings_enabled"])
         for key, low, high, fallback in (
-            ("notify_expiring_days", 1, 30, 3),
             ("register_days", 0, 3650, 30),
-            ("rankings_hour", 0, 23, 21),
         ):
             try:
                 cfg[key] = max(low, min(high, int(cfg[key])))
@@ -391,8 +386,7 @@ class SettingsService:
             cfg["max_users"] = max(0, int(cfg["max_users"]))
         except (TypeError, ValueError):
             cfg["max_users"] = 0
-        for key in ("default_group_id", "require_group", "rankings_chat",
-                    "emby_public_url"):
+        for key in ("default_group_id", "require_group", "emby_public_url"):
             cfg[key] = str(cfg[key] or "").strip()
         return cfg
 
@@ -424,22 +418,16 @@ class SettingsService:
             raise ConfigError("启用 Telegram 机器人前必须填写 Bot Token")
 
         try:
-            days = int(payload.get("notify_expiring_days", current["notify_expiring_days"]))
             reg_days = int(payload.get("register_days", current["register_days"]))
             max_users = int(payload.get("max_users", current["max_users"]))
-            hour = int(payload.get("rankings_hour", current["rankings_hour"]))
         except (TypeError, ValueError):
-            raise ConfigError("天数、名额与时间必须是整数") from None
+            raise ConfigError("天数与名额必须是整数") from None
 
-        if not 1 <= days <= 30:
-            raise ConfigError("到期提醒天数必须在 1–30 之间")
         # 0 means "never expires", which is a real choice; negative is not.
         if not 0 <= reg_days <= 3650:
             raise ConfigError("注册赠送天数必须在 0–3650 之间")
         if max_users < 0:
             raise ConfigError("注册名额不能为负数")
-        if not 0 <= hour <= 23:
-            raise ConfigError("排行榜推送时间必须在 0–23 之间")
 
         registration = bool(payload.get("registration_enabled",
                                         current["registration_enabled"]))
@@ -463,15 +451,7 @@ class SettingsService:
             "max_users": max_users,
             "require_group": str(payload.get(
                 "require_group", current["require_group"]) or "").strip(),
-            "rankings_chat": str(payload.get(
-                "rankings_chat", current["rankings_chat"]) or "").strip(),
-            "rankings_enabled": bool(payload.get(
-                "rankings_enabled", current["rankings_enabled"])),
-            "rankings_hour": hour,
             "emby_public_url": emby_url,
-            "notify_expiring": bool(payload.get(
-                "notify_expiring", current["notify_expiring"])),
-            "notify_expiring_days": days,
         })
         return self.telegram_public()
 

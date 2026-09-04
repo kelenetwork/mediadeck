@@ -416,3 +416,41 @@ tbody tr:hover { background: #111830; }
   .modal.drawer { width: 100%; border-radius: 12px; }
   .poster-grid { grid-template-columns: repeat(auto-fill, minmax(104px, 1fr)); gap: 10px; padding: 12px; }
 }
+
+/* ---------- automation (plugin cards) ----------
+   A grid rather than a list: these are independent switches that are scanned
+   for state, not read top to bottom. */
+.plugin-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(420px, 1fr)); gap: 14px;
+}
+.plugin-card .card-head { align-items: flex-start; }
+.plugin-card .ic-box {
+  width: 34px; height: 34px; flex: 0 0 34px; border-radius: 9px;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--control); border: 1px solid var(--line); font-size: 16px;
+}
+.plugin-switch { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+.plugin-switch input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--accent); }
+.plugin-last {
+  border-top: 1px solid var(--line-soft); padding-top: 10px; font-size: 12px;
+}
+.kv-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.kv {
+  display: inline-flex; gap: 6px; align-items: baseline; padding: 3px 9px;
+  border-radius: 6px; background: var(--control); border: 1px solid var(--line);
+  font-size: 11.5px; font-variant-numeric: tabular-nums;
+}
+.kv b { color: var(--muted); font-weight: 500; }
+.plugin-history:not(:empty) { margin-top: 10px; }
+.plugin-history table { font-size: 11.5px; }
+/* input/select are styled globally; textarea is not, and an unstyled one
+   renders as a white box in a dark panel. */
+.plugin-card textarea {
+  background: var(--control); border: 1px solid var(--line); color: var(--text);
+  border-radius: var(--radius-sm); padding: 7px 10px; font: inherit; font-size: 13px;
+}
+.plugin-card textarea:focus {
+  outline: none; border-color: var(--accent-line);
+  box-shadow: 0 0 0 3px rgba(34, 211, 238, .1);
+}
+@media (max-width: 900px) { .plugin-grid { grid-template-columns: 1fr; } }

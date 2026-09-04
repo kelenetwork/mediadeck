@@ -58,9 +58,9 @@ def test_unretyped_credential_keeps_the_stored_one() -> None:
         client.post("/api/settings/telegram", auth=ADMIN,
                     json={"bot_token": FAKE_CRED, "enabled": True})
         after = client.post("/api/settings/telegram", auth=ADMIN,
-                            json={"notify_expiring_days": 5}).json()
+                            json={"register_days": 5}).json()
         assert after["bot_token_set"] is True
-        assert after["notify_expiring_days"] == 5
+        assert after["register_days"] == 5
 
 
 def test_enabling_without_a_credential_is_refused() -> None:
@@ -86,10 +86,24 @@ def test_settings_bounds_are_enforced() -> None:
         client.post("/api/settings/telegram", auth=ADMIN,
                     json={"bot_token": FAKE_CRED, "enabled": True})
         for bad in ({"register_days": -1}, {"register_days": 99999},
-                    {"max_users": -5}, {"rankings_hour": 25},
-                    {"notify_expiring_days": 0}):
+                    {"max_users": -5}, {"register_days": "abc"}):
             assert client.post("/api/settings/telegram", auth=ADMIN,
                                json=bad).status_code >= 400, bad
+
+
+def test_scheduling_settings_moved_to_the_plugin_cards() -> None:
+    """The ranking post and expiry reminder are plugins now.
+
+    Two switches for one post is how it ends up going out twice, so the old
+    keys must be gone from the Telegram payload rather than merely ignored.
+    """
+    with TestClient(app) as client:
+        cfg = client.get("/api/settings/telegram", auth=ADMIN).json()
+        for gone in ("rankings_enabled", "rankings_hour", "rankings_chat",
+                     "notify_expiring", "notify_expiring_days"):
+            assert gone not in cfg
+        ids = {c["id"] for c in client.get("/api/plugins", auth=ADMIN).json()}
+        assert {"rankings_post", "expiry_reminder"} <= ids
 
 
 def test_telegram_endpoints_require_auth() -> None:

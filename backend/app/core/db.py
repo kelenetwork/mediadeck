@@ -185,6 +185,45 @@ CREATE TABLE IF NOT EXISTS tg_requests (
 );
 CREATE INDEX IF NOT EXISTS idx_tgreq_status ON tg_requests(status, created_at);
 
+-- Plugin run history. Append-heavy, so it lives here rather than in the
+-- settings document, which is rewritten in full on every save.
+CREATE TABLE IF NOT EXISTS plugin_runs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    plugin_id   TEXT NOT NULL,
+    ok          INTEGER NOT NULL DEFAULT 1,
+    summary     TEXT NOT NULL DEFAULT '{}',
+    started_at  INTEGER NOT NULL,
+    duration_ms INTEGER NOT NULL DEFAULT 0,
+    trigger     TEXT NOT NULL DEFAULT 'schedule'
+);
+CREATE INDEX IF NOT EXISTS idx_plugin_runs ON plugin_runs(plugin_id, started_at);
+
+-- Media requests from members. One row per request; the uploader who claims
+-- it is recorded so every other uploader sees it as taken rather than open.
+CREATE TABLE IF NOT EXISTS media_requests (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    emby_user_id  TEXT NOT NULL,
+    username      TEXT NOT NULL DEFAULT '',
+    tg_user_id    TEXT NOT NULL DEFAULT '',
+    tmdb_id       INTEGER NOT NULL,
+    media_type    TEXT NOT NULL,
+    title         TEXT NOT NULL DEFAULT '',
+    year          INTEGER,
+    poster_path   TEXT NOT NULL DEFAULT '',
+    note          TEXT NOT NULL DEFAULT '',
+    status        TEXT NOT NULL DEFAULT 'open',
+    claimed_by    TEXT NOT NULL DEFAULT '',
+    claimed_at    INTEGER,
+    resolved_at   INTEGER,
+    result_note   TEXT NOT NULL DEFAULT '',
+    created_at    INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_mreq_status ON media_requests(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_mreq_user ON media_requests(emby_user_id, created_at);
+-- The same title requested twice while still open is one request, not two.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mreq_open_title
+    ON media_requests(tmdb_id, media_type) WHERE status IN ('open', 'claimed');
+
 -- Rolled up per user per day. Sampling writes here continuously, so it is kept
 -- narrow and indexed for the two questions actually asked: one user's history,
 -- and one day across all users.

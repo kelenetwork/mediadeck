@@ -4,6 +4,86 @@ Newest entries first. Every working session appends one entry.
 
 ---
 
+## 2026-09-05 — every scheduled job becomes a plugin
+**Done**
+- Plugin framework. A plugin declares what it is, what it can be configured
+  with, and how to run; the card, the form, the schedule and the run history
+  all derive from that declaration. Adding a job is adding a file, not editing
+  the front end. Config lives in the settings store under `plugins.<id>`, run
+  history in SQLite (`plugin_runs`) because it is append-heavy and the settings
+  document is rewritten in full on every save.
+- A plugin that raises never takes the scheduler down. The failure is recorded
+  on that plugin's card and the loop moves on — the alternative is one bad
+  plugin silently stopping every other job.
+- Five built-in tasks: group audit, inactive cleanup, viewing report, rankings
+  post, expiry reminder. **None of them can delete an account.** The strongest
+  action is suspension, which is reversible from the member page; deleting a
+  member takes their history and, in a household, other people's access with
+  it, and that is not a decision a timer should make.
+- Escalation is gradual where it acts at all: group audit and inactive cleanup
+  notify first, start a clock, and only suspend after a configurable grace
+  period. Someone who comes back has their clock cleared, so leaving twice does
+  not get them suspended off a stale note.
+- `telegram_notify_loop` is deleted, not disabled. It kept its own day-key for
+  the ranking post, so running it alongside the plugins would post the
+  leaderboard twice. For the same reason `rankings_*` and `notify_expiring*`
+  are gone from the Telegram settings: two switches for one post is how it goes
+  out twice, or stops because the wrong one was flipped.
+- Upgrades keep working: `migrate_legacy_telegram_jobs()` carries the old
+  settings onto the new cards before the scheduler starts — same hour, same
+  chat — then drops the legacy keys in the same write, which makes it
+  idempotent. Config already set on a card always wins, so the migration cannot
+  overwrite a deliberate edit.
+- Two framework fixes found while writing the built-ins. A daily plugin that
+  declares an `hour` field now schedules on the *configured* value, otherwise
+  the field is decoration and the card lies about when the job runs.
+  `Plugin.due_today()` lets a plugin add a calendar condition (weekly on
+  Monday, monthly on the 1st) without teaching the scheduler about every
+  calendar; it gates scheduled runs only, so the manual button can still test a
+  weekly report on a Wednesday.
+
+**Panel**
+- New 自动化 → 任务中心 page, generated entirely from the plugin payload:
+  switch, auto-rendered form per field kind, save / run now, last result with
+  timing and a readable summary, and the last ten runs on demand. Category tabs
+  are in place with 积分 showing an empty state, so PR-3 adds plugins rather
+  than a page.
+- 立即运行 saves first and ignores the enabled switch: the button exists to try
+  a job *before* switching it on, and running last-saved values instead of
+  what is on screen is not what "试一次" means.
+- New 安全 group: 访问拦截 (rules, per-rule enable, block log with the reason
+  and rule that matched) and 共享检测 (status plus findings, captioned to say it
+  only records — a household on Wi-Fi and mobile data looks identical to a
+  shared account, so acting on it would lock out paying members).
+- A successful 测试连接 now switches the bot on if it was off, and says so. The
+  owner tested the bot, read 连接成功 as "it is running", and walked away from
+  a stopped bot. Verification proves the credential works, so there is nothing
+  left to decide.
+- Deleted the duplicate Telegram form on the settings page. Two forms writing
+  the same settings meant whichever page was saved last silently reverted the
+  other; settings now links to the bot page instead.
+
+**Tests** — 214 → 285.
+- `test_plugins.py` covers coercion per kind from both sides, duplicate ids,
+  unknown categories and field kinds, unknown config keys being dropped, a
+  refused save leaving the previous value intact, failures being recorded
+  rather than raised, concurrent runs being refused, and the scheduling rules
+  (disabled skipped, interval respected, daily once per day, configured hour
+  winning, `due_today` vetoing and a raising `due_today` not breaking the tick).
+  Each built-in has both an acting and a non-acting case.
+- Two guards on the front end that had no coverage before: every NAV id must
+  have a `PAGES` handler (a mismatch renders 页面不存在 and reads as a broken
+  deployment), and only one form may own the bot credential field.
+
+**Next**
+- PR-2: media requests. `media_requests` is already in the schema, including
+  the partial unique index that makes the same title requested twice while open
+  one request rather than two.
+- PR-3: points plugins into the tab that is already there.
+- Account deletion still has no home. Inactive cleanup deliberately stops at
+  suspend; if deletion is wanted it needs an operator-reviewed queue showing
+  what else goes with the account, not a timer.
+
 ## 2026-09-05 — Telegram bot, and it knows who it is talking to
 **Done**
 - Menu-driven bot over long polling. A webhook would need a public HTTPS route
