@@ -125,6 +125,66 @@ CREATE TABLE IF NOT EXISTS devices (
 CREATE INDEX IF NOT EXISTS idx_devices_user ON devices(emby_user_id);
 CREATE INDEX IF NOT EXISTS idx_devices_seen ON devices(last_seen_at);
 
+-- Account-sharing findings. Recorded for a person to judge, never acted on
+-- automatically: the cost of being wrong is locking out a paying member over a
+-- VPN reconnect, and that call is not the panel's to make.
+CREATE TABLE IF NOT EXISTS sharing_findings (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    emby_user_id  TEXT NOT NULL,
+    username      TEXT NOT NULL DEFAULT '',
+    networks      TEXT NOT NULL DEFAULT '',
+    network_count INTEGER NOT NULL DEFAULT 0,
+    detected_at   INTEGER NOT NULL,
+    reviewed      INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_sharing_detected ON sharing_findings(detected_at);
+CREATE INDEX IF NOT EXISTS idx_sharing_user ON sharing_findings(emby_user_id);
+
+-- Access rules for the playback edge. Country-level rules are deliberately
+-- absent: they need a GeoIP database this host does not carry, and a rule that
+-- silently matches nothing is worse than no rule at all.
+CREATE TABLE IF NOT EXISTS access_rules (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind        TEXT NOT NULL,
+    pattern     TEXT NOT NULL,
+    action      TEXT NOT NULL DEFAULT 'deny',
+    note        TEXT NOT NULL DEFAULT '',
+    enabled     INTEGER NOT NULL DEFAULT 1,
+    created_at  INTEGER NOT NULL
+);
+
+-- A refused request that leaves no trace is indistinguishable from a broken
+-- node, and the operator ends up debugging the wrong thing.
+CREATE TABLE IF NOT EXISTS access_blocks (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    username    TEXT NOT NULL DEFAULT '',
+    user_agent  TEXT NOT NULL DEFAULT '',
+    remote_ip   TEXT NOT NULL DEFAULT '',
+    reason      TEXT NOT NULL DEFAULT '',
+    rule_id     INTEGER,
+    item_id     TEXT NOT NULL DEFAULT '',
+    blocked_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_blocks_time ON access_blocks(blocked_at);
+
+-- Claim and rebind requests from the bot. Registration does not come through
+-- here: the chat already proves who is asking, so a new account needs no
+-- review. These two do -- both are attempts to take control of an account the
+-- requester cannot otherwise prove they own.
+CREATE TABLE IF NOT EXISTS tg_requests (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind            TEXT NOT NULL DEFAULT 'bind',
+    tg_user_id      TEXT NOT NULL,
+    tg_username     TEXT NOT NULL DEFAULT '',
+    wanted_username TEXT NOT NULL DEFAULT '',
+    status          TEXT NOT NULL DEFAULT 'pending',
+    note            TEXT NOT NULL DEFAULT '',
+    created_at      INTEGER NOT NULL,
+    reviewed_at     INTEGER,
+    reviewed_by     TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_tgreq_status ON tg_requests(status, created_at);
+
 -- Rolled up per user per day. Sampling writes here continuously, so it is kept
 -- narrow and indexed for the two questions actually asked: one user's history,
 -- and one day across all users.
@@ -238,6 +298,16 @@ class Database:
             self._ensure_column("members", "roles", "TEXT NOT NULL DEFAULT ''")
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_members_group ON members(group_id)")
+            # v0.18: Telegram linkage. Stored on the member rather than in a
+            # side table because it is strictly one chat per member: the unique
+            # index is what stops a second account from claiming a chat that
+            # already answers for someone else.
+            self._ensure_column("members", "tg_user_id", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column("members", "tg_username", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column("members", "tg_bound_at", "INTEGER")
+            self._conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_members_tg "
+                "ON members(tg_user_id) WHERE tg_user_id <> ''")
             self._conn.commit()
 
     def _ensure_column(self, table: str, name: str, ddl: str) -> None:

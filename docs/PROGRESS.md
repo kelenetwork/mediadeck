@@ -4,6 +4,135 @@ Newest entries first. Every working session appends one entry.
 
 ---
 
+## 2026-09-05 — Telegram bot, and it knows who it is talking to
+**Done**
+- Menu-driven bot over long polling. A webhook would need a public HTTPS route
+  into the panel; polling reaches out instead, so the panel stays reachable
+  only from where it already was.
+- Two audiences, one entry point. The keyboard is chosen from binding state on
+  every render: a guest is offered only a way to link an account, a linked
+  member lands on their own status. A fixed keyboard would give half of them
+  dead ends.
+- Binding uses a 6-character one-time code issued from the panel, valid ten
+  minutes, single use, and re-issuing invalidates the previous one. The bot
+  never asks for an Emby password: a chat transcript is not a safe place to
+  type one.
+- One chat speaks for one member, enforced by a partial unique index. Rebinding
+  detaches the previous holder and says so in the audit trail — silently moving
+  a link would leave the old member believing they still get notifications.
+- `bot_token` is stored like the Emby API key: masked on read, `__KEEP__`
+  sentinel on save so an unretyped field cannot wipe it, and the audit line
+  records *that* it changed, never what to. It is a bearer credential; anyone
+  holding it can read every message the bot receives and post as it.
+- Daily expiry reminders to linked members, keyed by day rather than by an
+  interval so a restart cannot fire the same reminder twice.
+- `members` gained `tg_user_id` / `tg_username` / `tg_bound_at` via the
+  idempotent column migration, plus `find_by_telegram`, `bind_telegram`,
+  `unbind_telegram` and `expiring_within`.
+
+**Also in this branch: member list gets selection and batch actions**
+- Checkbox column plus a bulk bar that only appears once something is ticked:
+  a row of buttons above an empty selection invites a click that cannot do
+  anything.
+- `POST /api/members/bulk` with renew / activate / suspend / reset-traffic.
+  Each id is attempted independently and failures are named, because partial
+  success is the normal case: a member can be deleted in another tab while the
+  operator is ticking boxes, and failing the whole batch would make them redo
+  work that already succeeded.
+- Deletion is deliberately absent from the batch path. A mis-click on a
+  checkbox column is easy, and bulk delete is the one action with no way back.
+- Renew days are bounded 1–3650 server-side, so a typo of an extra zero cannot
+  hand out a decade of access.
+- One audit summary line per batch carrying `ok=`/`failed=`, so a 200-member
+  action is traceable as one operator decision rather than only as 200 rows.
+- Telegram column shows who can actually be reached, with per-member
+  bind-code and unbind buttons.
+
+**Also in this branch: shared-account detection**
+- `SharingDetector` rides along with the usage sampler, which already holds the
+  only live view of who is playing from where, so detection costs no extra
+  Emby calls.
+- The signal is *distinct networks playing simultaneously*, not session count.
+  Finding concurrent sessions is easy; the value is in not crying wolf, because
+  an operator who stops reading alerts is worse off than one with none:
+  - sessions from one address are one place, however many devices
+  - addresses inside a /24 (or /48 for v6) are one place too, so a household
+    behind NAT or a dual-stack router is not split into several
+  - a network must hold playback for 90s before it counts, so a wifi-to-mobile
+    handover that briefly overlaps the old session does not register
+  - a network that stops playing is forgotten, so moving house does not
+    accumulate places forever
+- One finding per account per hour. Repeating the same alert every 15s tick
+  would bury the real ones.
+- Findings are recorded for a person to judge. Nothing is suspended
+  automatically: the cost of being wrong is locking out a paying member over a
+  VPN reconnect. A test asserts the class exposes no suspend/block/kick path.
+- Fixed while testing: `_last_reported` defaulted to `0.0`, which conflates
+  "never reported" with "reported at the epoch". It only worked because a real
+  clock is a large number.
+- Also fixed: `usage.py` used `contextlib.suppress` without importing it. The
+  module imported fine; it would only have raised the first time detection
+  actually fired.
+
+**Also in this branch: access rules on the playback edge**
+- Two rule kinds, both evaluated against the request asking for media:
+  `client` (regex against User-Agent) and `network` (single address or CIDR,
+  v4 and v6).
+- **Country-level rules are deliberately absent.** They need a GeoIP database
+  this host does not carry, and a rule that silently matches nothing is worse
+  than no rule at all.
+- Fail-open throughout. An empty rule set, a stored pattern that no longer
+  compiles, a malformed address, an exception inside evaluation — every
+  uncertain outcome resolves to allow. The panel sits on the media path; if a
+  rule bug can deny playback it is worse than not being there.
+- Excluded users bypass every rule, so one bad regex typed at 3am cannot end
+  access for the person who would have to fix it.
+- An explicit `allow` wins over any `deny`, so one exception can be carved out
+  without rewriting the deny around it.
+- Patterns are validated at save time, where a person is present to read the
+  error, never at match time on the playback path.
+- Rules run *before* routing: a denied request never causes a node to be
+  selected or a signature to be minted.
+- Refusals are recorded with agent, address (port stripped) and matched rule.
+  A block that leaves no trace is indistinguishable from a broken node, and
+  the operator ends up debugging the wrong machine.
+
+**Reworked before release: the bot registers, it does not hand out codes**
+- Registration creates the Emby account from the chat directly. There is no
+  code to copy, because the chat already proves who is asking: the Telegram id
+  *is* the identity and is recorded as owner at creation time. Passwords are
+  generated and shown once, never typed into a transcript.
+- That leaves exactly two cases a requester cannot self-prove, and both go to
+  an approval queue instead: claiming an account that predates the bot, and
+  moving an account to a different Telegram id.
+- Every gate is re-checked at creation, not only when the conversation began:
+  a slot can fill or registration can close while someone is still typing a
+  username. A test covers exactly that race.
+- Group requirement for registration, with the lookup failing *open*: Telegram
+  being unreachable, or the bot not being an admin of the group, must not
+  silently close registration for everyone.
+- Group audit reports who has left, and never acts. Leaving a chat is not the
+  same as ceasing to pay.
+- Daily rankings (top viewers by hours, top titles by plays) both in-bot and
+  as a scheduled post to a group.
+- Telegram now has its own nav section — bot settings, approval queue, group
+  audit — because scattering them through "settings" and "members" made each
+  one hard to find.
+
+**Two bugs caught in the pre-release review**
+- The scheduled ranking post had settings and an endpoint but was never wired
+  into the background loop: turning it on did nothing. Expiry reminders and
+  rankings now track their own send-day separately, so a restart between the
+  two cannot cancel whichever has not gone out.
+- `audit_group_membership` walked `members.list()`, which caps at 500 rows. A
+  larger install would have skipped everyone past the cap and still reported
+  "all present". Added `linked_telegram()`, unpaginated. An audit that
+  under-reports is worse than none, because it is believed.
+
+**Next**
+- Country rules once a GeoIP source exists.
+- Access-rule and sharing-finding UI pages.
+
 ## 2026-09-05 — dashboard shows the library, not just counters
 **Done**
 - Dashboard renders a poster wall of recent additions, plus playback cards

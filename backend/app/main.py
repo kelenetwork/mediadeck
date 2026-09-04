@@ -29,6 +29,7 @@ from app.core.config import settings
 from app.core.db import Database
 from app.core.errors import ConfigError, ConflictError, NotConfigured, UpstreamError
 from app.core.store import SettingsStore
+from app.modules.access import AccessRules
 from app.modules.enforcement import EnforcementService
 from app.modules.events import EventStream, safe_stream
 from app.modules.groups import GroupService
@@ -45,10 +46,12 @@ from app.modules.provisioning import (
 )
 from app.modules.scheduler import Scheduler
 from app.modules.settings import SettingsService
+from app.modules.sharing import SharingDetector
 from app.modules.signing import user_tag
 from app.modules.stats import StatsService
 from app.modules.storage import MockStorage, StorageManager
 from app.modules.tasks import MockTasks, TasksReader
+from app.modules.telegram import TelegramBot
 from app.modules.updater import MockUpdater, Updater
 from app.modules.usage import UsageSampler
 
@@ -235,8 +238,13 @@ async def _startup() -> None:
     app.state.enforcement = EnforcementService(
         app.state.db, app.state.members, app.state.emby)
     app.state.stats = StatsService(app.state.db)
+    # Rides along with the sampler: it already holds the only live view of who
+    # is playing from where, so detection costs no extra Emby calls.
+    app.state.sharing = SharingDetector(app.state.db)
+    app.state.access = AccessRules(app.state.db)
     app.state.usage = UsageSampler(
-        app.state.db, app.state.members, app.state.emby, app.state.enforcement)
+        app.state.db, app.state.members, app.state.emby, app.state.enforcement,
+        sharing=app.state.sharing)
 
     image_cfg = app.state.settings_service.image_cache_config()
     app.state.images = ImageCache(
@@ -307,6 +315,51 @@ async def _startup() -> None:
             await app.state.scheduler.wait_for_change(15)
 
     app.state.probe_task = asyncio.create_task(probe_loop())
+
+    # ---- telegram bot ----------------------------------------------------
+    # Long polling, not a webhook: a webhook needs a public HTTPS route into
+    # the panel, while polling reaches out instead and leaves the panel
+    # reachable only from where it already was.
+    app.state.telegram = TelegramBot(
+        app.state.settings_service.telegram_config, app.state.members,
+        emby=app.state.emby, stats=app.state.stats, db=app.state.db)
+    app.state.telegram.start()
+
+    async def telegram_notify_loop() -> None:
+        """Daily expiry reminders, and the daily ranking post.
+
+        Both are keyed by day rather than by an interval, so a restart cannot
+        produce a second round of the same message a few hours after the first.
+        The two are tracked separately: they fire at different hours, and a
+        restart between them must not cancel whichever has not gone out yet.
+        """
+        reminded_on = ""
+        ranked_on = ""
+        while True:
+            await asyncio.sleep(300)
+            with contextlib.suppress(Exception):
+                cfg = app.state.settings_service.telegram_config()
+                if not cfg["enabled"]:
+                    continue
+                today = time.strftime("%Y-%m-%d")
+                hour = time.localtime().tm_hour
+
+                # Not before 10:00: a reminder that arrives at 04:00 wakes
+                # someone up to tell them about a renewal days away.
+                if (cfg["notify_expiring"] and reminded_on != today
+                        and hour >= 10):
+                    due = app.state.members.expiring_within(
+                        cfg["notify_expiring_days"])
+                    await app.state.telegram.notify_expiring(due)
+                    reminded_on = today
+
+                if (cfg["rankings_enabled"] and cfg["rankings_chat"]
+                        and ranked_on != today and hour >= cfg["rankings_hour"]):
+                    await app.state.telegram.broadcast_rankings(
+                        cfg["rankings_chat"], days=1)
+                    ranked_on = today
+
+    app.state.telegram_task = asyncio.create_task(telegram_notify_loop())
 
     async def _nodes_topic() -> Any:
         config = {n["name"]: n for n in app.state.settings_service.nodes_public()}
@@ -838,6 +891,25 @@ async def emby_video_stream(item_id: str, rest: str, request: Request) -> Redire
     Emby applies its own decision and the fail-open contract still holds.
     """
     query = dict(request.query_params)
+
+    # Access rules run before routing. They decide whether this caller may be
+    # handed a signed node URL at all; refusing here rather than after routing
+    # means a denied request never causes a node to be selected or a signature
+    # to be minted.
+    verdict = app.state.access.evaluate(
+        user_agent=request.headers.get("user-agent", ""),
+        remote_ip=request.client.host if request.client else "",
+    )
+    if not verdict["allowed"]:
+        with contextlib.suppress(Exception):
+            app.state.access.record_block(
+                username="",
+                user_agent=request.headers.get("user-agent", ""),
+                remote_ip=request.client.host if request.client else "",
+                reason=verdict["reason"], rule_id=verdict["rule_id"],
+                item_id=item_id)
+        raise HTTPException(403, "access denied by rule")
+
     # Preserve the exact incoming path: the fallback URL must point back at the
     # same Emby endpoint the client actually asked for, not a normalised guess.
     decision = await app.state.playback.route(
@@ -1247,6 +1319,136 @@ async def members_renew(user_id: str, payload: dict[str, Any] = Body(default={})
     return member
 
 
+@app.get("/api/access/rules", dependencies=[Depends(_auth)])
+async def access_rules_list() -> list[dict[str, Any]]:
+    return app.state.access.list()
+
+
+@app.post("/api/access/rules", dependencies=[Depends(_auth)])
+async def access_rule_add(payload: dict[str, Any] = Body(...),  # noqa: B008
+                          user: str = Depends(_auth)) -> dict[str, Any]:
+    try:
+        created = app.state.access.add(
+            str(payload.get("kind") or ""),
+            str(payload.get("pattern") or ""),
+            str(payload.get("action") or "deny"),
+            str(payload.get("note") or ""),
+            bool(payload.get("enabled", True)))
+    except ValueError as exc:
+        # Validation happens at save time, where a person is present to read the
+        # error, rather than at match time on the playback path.
+        raise HTTPException(400, str(exc)) from None
+    app.state.members.audit(user, "access.rule.add", "",
+                            f"{created['kind']} {created['action']}")
+    return created
+
+
+@app.delete("/api/access/rules/{rule_id}", dependencies=[Depends(_auth)])
+async def access_rule_remove(rule_id: int, user: str = Depends(_auth)) -> dict[str, bool]:
+    if not app.state.access.remove(rule_id):
+        raise HTTPException(404, "rule not found")
+    app.state.members.audit(user, "access.rule.remove", str(rule_id), "")
+    return {"removed": True}
+
+
+@app.post("/api/access/rules/{rule_id}/enabled", dependencies=[Depends(_auth)])
+async def access_rule_toggle(rule_id: int, payload: dict[str, Any] = Body(...),  # noqa: B008
+                             user: str = Depends(_auth)) -> dict[str, bool]:
+    enabled = bool(payload.get("enabled", True))
+    if not app.state.access.set_enabled(rule_id, enabled):
+        raise HTTPException(404, "rule not found")
+    app.state.members.audit(user, "access.rule.toggle", str(rule_id),
+                            f"enabled={enabled}")
+    return {"enabled": enabled}
+
+
+@app.get("/api/access/blocks", dependencies=[Depends(_auth)])
+async def access_blocks(limit: int = 100) -> list[dict[str, Any]]:
+    """Refused requests. A block that leaves no trace is indistinguishable
+    from a broken node, and the operator debugs the wrong thing."""
+    return app.state.access.blocks(limit)
+
+
+@app.get("/api/sharing", dependencies=[Depends(_auth)])
+async def sharing_findings(limit: int = 50) -> dict[str, Any]:
+    """Accounts seen playing from more than one network at once.
+
+    Reported, never acted on: the cost of being wrong is locking out a paying
+    member over a VPN reconnect, so the judgement stays with a person.
+    """
+    return {
+        "items": app.state.sharing.recent(limit),
+        "status": app.state.sharing.status(),
+    }
+
+
+@app.post("/api/members/bulk", dependencies=[Depends(_auth)])
+async def members_bulk(payload: dict[str, Any] = Body(...),  # noqa: B008
+                       user: str = Depends(_auth)) -> dict[str, Any]:
+    """Apply one action to many members, reporting per-member outcomes.
+
+    Partial success is the normal case: one member may have been deleted in
+    another tab while the operator was ticking boxes. Failing the whole batch
+    for that would make the operator redo work that already succeeded, so each
+    id is attempted independently and the failures are named.
+
+    Deliberately excludes deletion. A mis-click on a checkbox column is easy,
+    and a bulk delete is the one action with no way back.
+    """
+    action = str(payload.get("action") or "").strip()
+    ids = payload.get("user_ids") or []
+    if not isinstance(ids, list) or not ids:
+        raise HTTPException(400, "user_ids 不能为空")
+    if len(ids) > 500:
+        raise HTTPException(400, "单次最多处理 500 个成员")
+
+    allowed = {"renew", "suspend", "activate", "reset-traffic"}
+    if action not in allowed:
+        raise HTTPException(400, f"action 必须是 {'/'.join(sorted(allowed))} 之一")
+
+    days = payload.get("days")
+    if action == "renew":
+        try:
+            days = int(days) if days is not None else None
+        except (TypeError, ValueError):
+            raise HTTPException(400, "days 必须是整数") from None
+        if days is not None and not 1 <= days <= 3650:
+            raise HTTPException(400, "续期天数必须在 1–3650 之间")
+
+    ok: list[str] = []
+    failed: list[dict[str, str]] = []
+    for raw in ids:
+        user_id = str(raw)
+        try:
+            if action == "renew":
+                app.state.members.renew(user_id, days, actor=user)
+            elif action == "suspend":
+                app.state.members.set_status(user_id, "suspended", actor=user)
+            elif action == "activate":
+                app.state.members.set_status(user_id, "active", actor=user)
+            else:
+                app.state.members.reset_traffic(user_id, actor=user)
+            ok.append(user_id)
+        except KeyError:
+            failed.append({"user_id": user_id, "error": "成员不存在"})
+        except Exception as exc:  # noqa: BLE001 - reported per member, not raised
+            failed.append({"user_id": user_id, "error": str(exc)})
+
+    app.state.members.audit(
+        user, f"member.bulk.{action}", "",
+        f"requested={len(ids)} ok={len(ok)} failed={len(failed)}")
+
+    # Enforcement runs once after the batch rather than per member: pushing the
+    # same policy change 200 times would hammer Emby for no extra correctness.
+    if ok and app.state.settings_service.membership_config()["enforcement_enabled"]:
+        for user_id in ok:
+            with contextlib.suppress(Exception):
+                await app.state.enforcement.enforce_now(user_id, f"bulk {action}")
+
+    return {"action": action, "requested": len(ids),
+            "ok": len(ok), "failed": failed}
+
+
 @app.post("/api/members/{user_id}/reset-traffic", dependencies=[Depends(_auth)])
 async def members_reset_traffic(user_id: str, user: str = Depends(_auth)) -> dict[str, Any]:
     try:
@@ -1475,6 +1677,95 @@ async def image_cache_clear(user: str = Depends(_auth)) -> dict[str, Any]:
 @app.post("/api/settings/image-cache/sweep", dependencies=[Depends(_auth)])
 async def image_cache_sweep() -> dict[str, Any]:
     return app.state.images.sweep(force=True)
+
+
+@app.get("/api/settings/telegram", dependencies=[Depends(_auth)])
+async def telegram_get() -> dict[str, Any]:
+    # Never the raw token: it is a bearer credential, and anyone holding it can
+    # read every message the bot receives and post as it.
+    return {**app.state.settings_service.telegram_public(),
+            "status": app.state.telegram.status()}
+
+
+@app.post("/api/settings/telegram", dependencies=[Depends(_auth)])
+async def telegram_save(payload: dict[str, Any] = Body(...),  # noqa: B008
+                        user: str = Depends(_auth)) -> dict[str, Any]:
+    saved = app.state.settings_service.save_telegram(payload)
+    # The audit trail records that the token changed, never what it changed to.
+    app.state.members.audit(
+        user, "settings.telegram", "",
+        f"enabled={saved['enabled']} token_set={saved['bot_token_set']}")
+    return {**saved, "status": app.state.telegram.status()}
+
+
+@app.post("/api/settings/telegram/verify", dependencies=[Depends(_auth)])
+async def telegram_verify() -> dict[str, Any]:
+    """Ask Telegram who the bot is. Proves the token without printing it."""
+    return await app.state.telegram.verify()
+
+
+@app.get("/api/telegram/requests", dependencies=[Depends(_auth)])
+async def telegram_requests() -> list[dict[str, Any]]:
+    """Claim and rebind requests awaiting a decision.
+
+    Registration never appears here: the chat itself proves who is asking, so
+    a brand-new account needs no review. These two do, because both are
+    attempts to take control of an account the requester cannot otherwise
+    prove they own.
+    """
+    return app.state.telegram.pending_requests()
+
+
+@app.post("/api/telegram/requests/{request_id}/review", dependencies=[Depends(_auth)])
+async def telegram_request_review(request_id: int,
+                                  payload: dict[str, Any] = Body(default={}),  # noqa: B008
+                                  user: str = Depends(_auth)) -> dict[str, Any]:
+    approve = bool(payload.get("approve", False))
+    try:
+        result = app.state.telegram.review_request(request_id, approve, reviewer=user)
+    except KeyError:
+        raise HTTPException(404, "request not found") from None
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
+    # Tell the requester either way: silence reads as the operator ignoring
+    # them, and they open a second request.
+    with contextlib.suppress(Exception):
+        await app.state.telegram.send(
+            result["tg_user_id"],
+            "✅ 申请已通过，账号已关联到这个 Telegram。" if approve
+            else "❌ 申请未通过，如有疑问请联系管理员。")
+    return result
+
+
+@app.post("/api/telegram/group-audit", dependencies=[Depends(_auth)])
+async def telegram_group_audit() -> dict[str, Any]:
+    """Which linked members have left the required group.
+
+    Reported, never enforced: leaving a chat is not the same as stopping
+    paying, and suspending on that basis is a person's call.
+    """
+    return await app.state.telegram.audit_group_membership()
+
+
+@app.post("/api/telegram/rankings/send", dependencies=[Depends(_auth)])
+async def telegram_send_rankings(payload: dict[str, Any] = Body(default={}),  # noqa: B008
+                                 user: str = Depends(_auth)) -> dict[str, bool]:
+    cfg = app.state.settings_service.telegram_config()
+    chat = str(payload.get("chat_id") or cfg.get("rankings_chat") or "").strip()
+    if not chat:
+        raise HTTPException(400, "未配置排行榜推送目标")
+    days = int(payload.get("days") or 1)
+    ok = await app.state.telegram.broadcast_rankings(chat, days)
+    app.state.members.audit(user, "telegram.rankings", "", f"days={days} ok={ok}")
+    return {"sent": ok}
+
+
+@app.post("/api/members/{user_id}/telegram/unbind", dependencies=[Depends(_auth)])
+async def telegram_unbind(user_id: str, user: str = Depends(_auth)) -> dict[str, Any]:
+    try:
+        return app.state.members.unbind_telegram(user_id, actor=user)
+    except KeyError:
+        raise HTTPException(404, "member not found") from None
 
 
 @app.get("/api/settings/membership", dependencies=[Depends(_auth)])

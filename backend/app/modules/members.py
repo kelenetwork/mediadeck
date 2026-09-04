@@ -507,6 +507,105 @@ class MemberService:
             }))
         return self.get(user_id)  # type: ignore[return-value]
 
+    # -- telegram linkage -----------------------------------------------------
+
+    def find_by_telegram(self, tg_user_id: str) -> dict[str, Any] | None:
+        """The member a Telegram chat currently answers for, if any."""
+        tg_user_id = str(tg_user_id or "").strip()
+        if not tg_user_id:
+            return None
+        row = self._db.one(
+            "SELECT * FROM members WHERE tg_user_id=?", (tg_user_id,))
+        return self._decorate(row) if row else None
+
+    def find_by_username(self, username: str) -> dict[str, Any] | None:
+        """Look a member up by their Emby login name.
+
+        Case-insensitive: someone claiming an old account types the name from
+        memory, and rejecting them over capitalisation would send a real owner
+        to the operator for nothing.
+        """
+        username = str(username or "").strip()
+        if not username:
+            return None
+        row = self._db.one(
+            "SELECT * FROM members WHERE username=? COLLATE NOCASE", (username,))
+        return self._decorate(row) if row else None
+
+    def linked_telegram(self) -> list[dict[str, Any]]:
+        """Every member with a linked chat, unpaginated.
+
+        Deliberately not ``list()``: that caps at 500 rows, so a group audit
+        built on it would quietly skip everyone past the cap and still report
+        "all present". An audit that under-reports is worse than none, because
+        it is believed.
+        """
+        rows = self._db.query(
+            "SELECT * FROM members WHERE tg_user_id <> '' ORDER BY username")
+        return [self._decorate(r) for r in rows]
+
+    def bind_telegram(self, user_id: str, tg_user_id: str,
+                      tg_username: str = "", actor: str = "operator") -> dict[str, Any]:
+        """Link a chat to a member.
+
+        A chat may only speak for one account. Rebinding is allowed, but it
+        detaches the previous holder first and says so in the audit trail --
+        silently moving a link would leave the old member believing they still
+        get notifications.
+        """
+        member = self.get(user_id)
+        if not member:
+            raise KeyError(user_id)
+        tg_user_id = str(tg_user_id or "").strip()
+        if not tg_user_id:
+            raise ValueError("tg_user_id 不能为空")
+
+        previous = self.find_by_telegram(tg_user_id)
+        now = int(time.time())
+        if previous and previous["emby_user_id"] != user_id:
+            self._db.execute(
+                "UPDATE members SET tg_user_id='',tg_username='',tg_bound_at=NULL,"
+                "updated_at=? WHERE emby_user_id=?",
+                (now, previous["emby_user_id"]))
+            self.audit(actor, "member.telegram.unbind", previous["emby_user_id"],
+                       "chat rebound to another member")
+
+        self._db.execute(
+            "UPDATE members SET tg_user_id=?,tg_username=?,tg_bound_at=?,"
+            "updated_at=? WHERE emby_user_id=?",
+            (tg_user_id, str(tg_username or "").strip(), now, now, user_id))
+        # The numeric chat id is an identifier, not a secret, but there is no
+        # reason to spill it into the log either.
+        self.audit(actor, "member.telegram.bind", user_id,
+                   f"linked to @{tg_username}" if tg_username else "linked")
+        return self.get(user_id)  # type: ignore[return-value]
+
+    def unbind_telegram(self, user_id: str, actor: str = "operator") -> dict[str, Any]:
+        member = self.get(user_id)
+        if not member:
+            raise KeyError(user_id)
+        if member.get("tg_user_id"):
+            self._db.execute(
+                "UPDATE members SET tg_user_id='',tg_username='',tg_bound_at=NULL,"
+                "updated_at=? WHERE emby_user_id=?",
+                (int(time.time()), user_id))
+            self.audit(actor, "member.telegram.unbind", user_id, "unlinked")
+        return self.get(user_id)  # type: ignore[return-value]
+
+    def expiring_within(self, days: int = 7) -> list[dict[str, Any]]:
+        """Members whose access ends inside the window, soonest first.
+
+        Already-expired members are excluded: they need a different message
+        than "expiring soon", and reminding them daily forever is noise.
+        """
+        now = int(time.time())
+        until = now + max(1, days) * 86400
+        rows = self._db.query(
+            "SELECT * FROM members WHERE expires_at IS NOT NULL "
+            "AND expires_at > ? AND expires_at <= ? ORDER BY expires_at ASC",
+            (now, until))
+        return [self._decorate(r) for r in rows]
+
     def delete(self, user_id: str, actor: str = "system") -> bool:
         if not self._db.one("SELECT 1 AS x FROM members WHERE emby_user_id=?", (user_id,)):
             raise KeyError(user_id)

@@ -16,6 +16,11 @@ const NAV = [
     { id: 'stats', icon: '📈', label: '运营统计', sub: '流量、时长与热门内容' },
     { id: 'audit', icon: '☰', label: '审计日志', sub: '操作记录与变更追踪' },
   ]},
+  { group: 'Telegram', items: [
+    { id: 'tgbot', icon: '✈', label: '机器人', sub: '注册开关、名额与运行状态' },
+    { id: 'tgrequests', icon: '⇋', label: '关联审批', sub: '认领与换绑申请' },
+    { id: 'tggroup', icon: '⚑', label: '群组核查', sub: '已关联成员的群成员状态' },
+  ]},
   { group: '工作台', items: [
     { id: 'library', icon: '▤', label: '媒体库', sub: '媒体库分布与条目统计' },
     { id: 'imports', icon: '⇪', label: '网盘上片', sub: '网盘链接与云盘目录导入' },
@@ -805,6 +810,7 @@ PAGES.settings = async () => {
   const s = await api('/api/settings').catch(() => null);
   if (!s) { $('#view').innerHTML = `<div class="card"><div class="empty">设置加载失败</div></div>`; return; }
   const e = s.emby, d = s.dispatch, p = s.playback, ig = s.integration;
+  const tg = await api('/api/settings/telegram').catch(() => ({}));
   const connected = e.enabled && e.api_key_set;
   const mapped = (s.nodes || []).filter((n) => (n.pools || []).length).length;
   $('#view').innerHTML = `
@@ -897,6 +903,32 @@ PAGES.settings = async () => {
           : '<span class="tag bad">未配置</span>'}</td>
         <td>${n.sign_secret_set ? '<span class="tag ok">已设置</span>' : '<span class="tag bad">未设置</span>'}</td>
         <td><span class="tag ${n.enabled ? 'ok' : 'idle'}">${n.enabled ? '启用' : '停用'}</span></td></tr>`).join(''))}
+    ${card('Telegram 机器人', tg.bot_token_set
+      ? (tg.enabled ? '已启用 · 菜单式交互' : '已配置但未启用')
+      : '未配置 — 用于成员绑定与到期提醒',
+      `<div class="card-body">
+        <div class="muted" style="margin-bottom:12px">
+          成员在机器人里输入面板发放的 6 位绑定码即可关联账号，之后可自助查询有效期、设备和用量。
+          未绑定与已绑定看到的是不同菜单。<b>机器人只接收消息，不需要对外开放端口。</b>
+        </div>
+        <div class="form-row"><label>Bot Token</label>
+          <input id="tg-token" type="password" autocomplete="new-password"
+            placeholder="${tg.bot_token_set ? esc(tg.bot_token_masked) + '（留空则不修改）' : '向 @BotFather 申请后粘贴到这里'}"></div>
+        <div class="form-row"><label>启用机器人</label>
+          <input id="tg-enabled" type="checkbox" ${tg.enabled ? 'checked' : ''}>
+          <span class="muted">关闭后停止收发消息，配置保留</span></div>
+        <div class="form-row"><label>到期提醒</label>
+          <input id="tg-notify" type="checkbox" ${tg.notify_expiring ? 'checked' : ''}>
+          <span class="muted">每天向已绑定且即将到期的成员发送提醒</span></div>
+        <div class="form-row"><label>提前天数</label>
+          <input id="tg-days" type="number" min="1" max="30" value="${esc(tg.notify_expiring_days || 3)}" style="width:90px">
+          <span class="muted">天（1–30）</span></div>
+        <div class="toolbar">
+          <button class="btn" id="tg-test">测试连接</button>
+          <button class="btn primary" id="tg-save">保存</button>
+          <span id="tg-result" class="muted">${tgStatusText(tg)}</span>
+        </div>
+      </div>`)}
     ${card('会员与计费', '流量采样与 Emby 策略下发',
       `<div class="card-body">
         <div class="form-row"><label>自动下发</label>
@@ -929,6 +961,8 @@ PAGES.settings = async () => {
       </div>`)}`;
   $('#em-save').onclick = saveEmby;
   $('#em-test').onclick = testEmby;
+  $('#tg-save').onclick = saveTelegram;
+  $('#tg-test').onclick = testTelegram;
   $('#dp-save').onclick = saveDispatch;
   $('#pb-save').onclick = savePlayback;
   $('#pb-preview').onclick = previewPlayback;
@@ -997,6 +1031,49 @@ function embyPayload() {
     enabled: $('#em-enabled').checked,
     verify_ssl: $('#em-verify').checked,
   };
+}
+/* The token field is write-only from the browser's point of view: an empty box
+   means "leave the stored one alone", never "clear it". Sending the sentinel
+   rather than an empty string is what tells the server which one was meant. */
+function telegramPayload() {
+  const typed = $('#tg-token').value.trim();
+  return {
+    bot_token: typed || '__KEEP__',
+    enabled: $('#tg-enabled').checked,
+    notify_expiring: $('#tg-notify').checked,
+    notify_expiring_days: Number($('#tg-days').value || 3),
+  };
+}
+function tgStatusText(tg) {
+  if (!tg || !tg.bot_token_set) return '未配置';
+  const st = tg.status || {};
+  if (!tg.enabled) return '已配置，未启用';
+  if (st.last_error) return `运行中 · 最近错误：${esc(st.last_error)}`;
+  return st.running ? '运行中' : '已启用，正在连接…';
+}
+async function saveTelegram() {
+  try {
+    await api('/api/settings/telegram', {
+      method: 'POST', body: JSON.stringify(telegramPayload()) });
+    toast('Telegram 配置已保存');
+    renderPage('settings');
+  } catch (e) { toast('保存失败: ' + e.message, 1); }
+}
+async function testTelegram() {
+  const el = $('#tg-result');
+  el.textContent = '正在测试…';
+  try {
+    // Save first: verification asks Telegram who the bot is, which needs the
+    // credential to already be stored rather than sent along for inspection.
+    await api('/api/settings/telegram', {
+      method: 'POST', body: JSON.stringify(telegramPayload()) });
+    const r = await api('/api/settings/telegram/verify', { method: 'POST' });
+    el.innerHTML = r.ok
+      ? `<span class="tag ok">连接成功</span> @${esc(r.username || '')}`
+      : `<span class="tag bad">连接失败</span> ${esc(r.error || '')}`;
+  } catch (e) {
+    el.innerHTML = `<span class="tag bad">连接失败</span> ${esc(e.message)}`;
+  }
 }
 async function saveEmby() {
   try {

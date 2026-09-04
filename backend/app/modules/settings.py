@@ -50,6 +50,33 @@ INTEGRATION_DEFAULTS: dict[str, Any] = {
     "emby_public_url": "",
 }
 
+# Telegram bot. Off until a token is stored: an enabled bot with no token would
+# just spin a polling loop that can never succeed.
+TELEGRAM_DEFAULTS: dict[str, Any] = {
+    "enabled": False,
+    "bot_token": "",
+    # Registration is off by default. Turning it on means anyone who finds the
+    # bot can create an Emby account, which has to be a deliberate act rather
+    # than something an upgrade switches on quietly.
+    "registration_enabled": False,
+    "register_days": 30,
+    "default_group_id": "",
+    # 0 = unlimited. A cap is the only thing standing between a leaked bot link
+    # and an unbounded number of accounts.
+    "max_users": 0,
+    # Chat id or @name a user must belong to before registering. Empty = open.
+    "require_group": "",
+    # Where the daily ranking post goes. Empty = do not post.
+    "rankings_chat": "",
+    "rankings_enabled": False,
+    "rankings_hour": 21,
+    # Shown to a new member alongside their credentials; without it they have
+    # a username and password and nowhere to use them.
+    "emby_public_url": "",
+    "notify_expiring": True,
+    "notify_expiring_days": 3,
+}
+
 # Artwork cache. Enabled by default because it is pure win: posters never
 # change for a given item+size, so re-deriving them on every scroll only burns
 # Emby CPU at the moment the UI most needs to feel instant.
@@ -335,6 +362,118 @@ class SettingsService:
             "retention_days": retention,
         })
         return self.membership_config()
+
+    # -- telegram -------------------------------------------------------------
+    def telegram_config(self) -> dict[str, Any]:
+        """Full config including the token. Server-side callers only."""
+        section = self._store.section("telegram")
+        cfg = dict(TELEGRAM_DEFAULTS)
+        for key in cfg:
+            if key in section:
+                cfg[key] = section[key]
+        cfg["bot_token"] = str(cfg["bot_token"] or "").strip()
+        cfg["enabled"] = bool(cfg["enabled"]) and bool(cfg["bot_token"])
+        # Registration cannot outlive the bot: with polling stopped nobody could
+        # reach it anyway, and reporting it as open would mislead the operator.
+        cfg["registration_enabled"] = bool(cfg["registration_enabled"]) and cfg["enabled"]
+        cfg["notify_expiring"] = bool(cfg["notify_expiring"])
+        cfg["rankings_enabled"] = bool(cfg["rankings_enabled"])
+        for key, low, high, fallback in (
+            ("notify_expiring_days", 1, 30, 3),
+            ("register_days", 0, 3650, 30),
+            ("rankings_hour", 0, 23, 21),
+        ):
+            try:
+                cfg[key] = max(low, min(high, int(cfg[key])))
+            except (TypeError, ValueError):
+                cfg[key] = fallback
+        try:
+            cfg["max_users"] = max(0, int(cfg["max_users"]))
+        except (TypeError, ValueError):
+            cfg["max_users"] = 0
+        for key in ("default_group_id", "require_group", "rankings_chat",
+                    "emby_public_url"):
+            cfg[key] = str(cfg[key] or "").strip()
+        return cfg
+
+    def telegram_public(self) -> dict[str, Any]:
+        """Same config with the token reduced to a recognisable stub.
+
+        A bot token is a bearer credential: anyone holding it can read every
+        message the bot receives and post as it. It must never travel back to a
+        browser, so the UI gets a preview and a boolean instead.
+        """
+        cfg = self.telegram_config()
+        public = {k: v for k, v in cfg.items() if k != "bot_token"}
+        public["bot_token_masked"] = mask_secret(cfg["bot_token"])
+        public["bot_token_set"] = bool(cfg["bot_token"])
+        return public
+
+    def save_telegram(self, payload: dict[str, Any]) -> dict[str, Any]:
+        current = self.telegram_config()
+        token = payload.get("bot_token", SECRET_UNCHANGED)
+        # The sentinel means "the field was not retyped", which is what an edit
+        # form sends when the operator only flipped a checkbox.
+        if token == SECRET_UNCHANGED or token is None:
+            token = current["bot_token"]
+        token = str(token).strip()
+        if token and ":" not in token:
+            raise ConfigError("Bot Token 格式不正确，应形如 <数字ID>:<字符串>")
+        enabled = bool(payload.get("enabled", current["enabled"]))
+        if enabled and not token:
+            raise ConfigError("启用 Telegram 机器人前必须填写 Bot Token")
+
+        try:
+            days = int(payload.get("notify_expiring_days", current["notify_expiring_days"]))
+            reg_days = int(payload.get("register_days", current["register_days"]))
+            max_users = int(payload.get("max_users", current["max_users"]))
+            hour = int(payload.get("rankings_hour", current["rankings_hour"]))
+        except (TypeError, ValueError):
+            raise ConfigError("天数、名额与时间必须是整数") from None
+
+        if not 1 <= days <= 30:
+            raise ConfigError("到期提醒天数必须在 1–30 之间")
+        # 0 means "never expires", which is a real choice; negative is not.
+        if not 0 <= reg_days <= 3650:
+            raise ConfigError("注册赠送天数必须在 0–3650 之间")
+        if max_users < 0:
+            raise ConfigError("注册名额不能为负数")
+        if not 0 <= hour <= 23:
+            raise ConfigError("排行榜推送时间必须在 0–23 之间")
+
+        registration = bool(payload.get("registration_enabled",
+                                        current["registration_enabled"]))
+        # Opening registration on a bot that is not running would advertise a
+        # door nobody can walk through.
+        if registration and not enabled:
+            raise ConfigError("机器人未启用时无法开放注册")
+
+        emby_url = str(payload.get("emby_public_url",
+                                   current["emby_public_url"]) or "").strip()
+        if emby_url:
+            emby_url = _require_http_url(emby_url, "Emby 对外地址")
+
+        self._store.set_section("telegram", {
+            "enabled": enabled,
+            "bot_token": token,
+            "registration_enabled": registration,
+            "register_days": reg_days,
+            "default_group_id": str(payload.get(
+                "default_group_id", current["default_group_id"]) or "").strip(),
+            "max_users": max_users,
+            "require_group": str(payload.get(
+                "require_group", current["require_group"]) or "").strip(),
+            "rankings_chat": str(payload.get(
+                "rankings_chat", current["rankings_chat"]) or "").strip(),
+            "rankings_enabled": bool(payload.get(
+                "rankings_enabled", current["rankings_enabled"])),
+            "rankings_hour": hour,
+            "emby_public_url": emby_url,
+            "notify_expiring": bool(payload.get(
+                "notify_expiring", current["notify_expiring"])),
+            "notify_expiring_days": days,
+        })
+        return self.telegram_public()
 
     # -- nodes ---------------------------------------------------------------
     def nodes(self) -> list[StreamNode]:

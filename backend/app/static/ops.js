@@ -176,8 +176,17 @@ PAGES.members = async () => {
       <button class="btn" id="mf-preview">预览变更</button>
       <button class="btn danger" id="mf-apply-enf">应用策略</button>
     </div>
+    <div class="filter-bar" id="bulk-bar" style="display:none">
+      <span id="bulk-count" class="muted">已选 0 人</span>
+      <button class="btn primary" onclick="bulkRenew()">批量续期</button>
+      <button class="btn" onclick="bulkAction('activate')">批量启用</button>
+      <button class="btn" onclick="bulkAction('suspend')">批量停用</button>
+      <button class="btn" onclick="bulkAction('reset-traffic')">重置流量</button>
+      <button class="btn" onclick="toggleAllMembers(false)">取消选择</button>
+    </div>
     ${listing.truncated ? '<div class="help">后端返回已达上限，计数可能不完整。筛选只作用于当前这一页。</div>' : ''}
-    ${tableCard('成员', `${members.length} 人`, ['用户', '用户组', '状态', '到期', '流量', '设备', '最后活跃', ''],
+    ${tableCard('成员', `${members.length} 人`,
+      ['', '用户', '用户组', '状态', '到期', '流量', '设备', 'Telegram', '最后活跃', ''],
       members.map((m) => memberRow(m)).join(''))}
     ${card('纳入现有 Emby 账号', '未纳入的账号不受任何限制，也不计流量',
       `<div class="card-body">
@@ -190,6 +199,11 @@ PAGES.members = async () => {
   if (memberCard) {
     const table = memberCard.querySelector('table');
     if (table) table.id = 'member-table';
+  }
+  const headCell = document.querySelector('#member-table thead th');
+  if (headCell) {
+    headCell.innerHTML = '<input type="checkbox" id="m-pick-all">';
+    $('#m-pick-all').onchange = (e) => toggleAllMembers(e.target.checked);
   }
   $('#mf-apply').onclick = filterMembers;
   $('#mf-q').onkeydown = (e) => { if (e.key === 'Enter') filterMembers(); };
@@ -210,16 +224,31 @@ function roleTags(m) {
     ? ' <span class="tag warn">管理员</span>'
     : ' <span class="tag idle">上片员</span>').join('');
 }
+/* Telegram column: a linked chat is what makes expiry reminders possible, so
+   the list has to show at a glance who can actually be reached. */
+function tgCell(m) {
+  const id = q(m.emby_user_id);
+  if (m.tg_user_id) {
+    const who = m.tg_username ? `@${m.tg_username}` : '已关联';
+    return `<span class="tag ok" title="${esc(who)}">${esc(who)}</span>
+      <button class="btn sm" onclick="memberTgUnbind('${id}')">解绑</button>`;
+  }
+  // Accounts link themselves: a member registers in the bot, or claims an old
+  // account and an operator approves it. There is nothing to hand out here.
+  return '<span class="muted">未关联</span>';
+}
 function memberRow(m) {
   const devices = m.max_devices ? `${m.device_count || 0}/${m.max_devices}` : `${m.device_count || 0}/不限`;
   const id = q(m.emby_user_id);
   const tog = m.state === 'suspended' ? 'active' : 'suspended';
   const togLabel = m.state === 'suspended' ? '启用' : '停用';
   return `<tr>
+    <td><input type="checkbox" class="m-pick" value="${id}" onchange="syncBulkBar()"></td>
     <td>${esc(m.username)}${roleTags(m)}</td><td>${esc(m.group_name)}</td>
     <td>${stateTag(m.state)}</td><td>${daysLeftHtml(m)}</td>
     <td>${trafficBar(m.traffic_used_bytes, m.traffic_quota_bytes)}</td>
-    <td>${esc(devices)}</td><td>${esc(fmtAgeTs(m.last_seen_at))}</td>
+    <td>${esc(devices)}</td><td>${tgCell(m)}</td>
+    <td>${esc(fmtAgeTs(m.last_seen_at))}</td>
     <td class="row-actions">
       <button class="btn sm" onclick="memberDetail('${id}')">详情</button>
       <button class="btn sm" onclick="memberRenew('${id}')">续期</button>
@@ -229,6 +258,64 @@ function memberRow(m) {
       <button class="btn sm" onclick="memberPassword('${id}')">改密</button>
       <button class="btn sm danger" onclick="memberDelete('${id}','${q(m.username)}')">删除</button>
     </td></tr>`;
+}
+
+/* ---------- bulk selection ----------
+   The bar only appears once something is ticked: a row of destructive-looking
+   buttons above an empty selection invites a click that cannot do anything. */
+function pickedIds() {
+  return [...document.querySelectorAll('.m-pick:checked')].map((el) => el.value);
+}
+function syncBulkBar() {
+  const n = pickedIds().length;
+  const bar = $('#bulk-bar');
+  if (!bar) return;
+  bar.style.display = n ? 'flex' : 'none';
+  const label = $('#bulk-count');
+  if (label) label.textContent = `已选 ${n} 人`;
+  const all = document.querySelectorAll('.m-pick').length;
+  const head = $('#m-pick-all');
+  if (head) {
+    head.checked = n > 0 && n === all;
+    head.indeterminate = n > 0 && n < all;
+  }
+}
+function toggleAllMembers(on) {
+  document.querySelectorAll('.m-pick').forEach((el) => { el.checked = on; });
+  syncBulkBar();
+}
+async function bulkAction(action, extra) {
+  const ids = pickedIds();
+  if (!ids.length) return;
+  try {
+    const r = await api('/api/members/bulk', {
+      method: 'POST',
+      body: JSON.stringify({ action, user_ids: ids, ...(extra || {}) }),
+    });
+    // Partial success is normal, and saying only "done" would hide it.
+    if (r.failed && r.failed.length) {
+      toast(`成功 ${r.ok} 人，失败 ${r.failed.length} 人：${esc(r.failed[0].error)}`, 1);
+    } else {
+      toast(`已处理 ${r.ok} 人`);
+    }
+    renderPage('members', true);
+  } catch (e) { toast('批量操作失败: ' + e.message, 1); }
+}
+async function bulkRenew() {
+  const days = prompt('批量续期天数', '30');
+  if (!days) return;
+  const n = Number(days);
+  if (!Number.isFinite(n) || n <= 0) { toast('天数必须大于 0', 1); return; }
+  await bulkAction('renew', { days: n });
+}
+async function memberTgUnbind(id) {
+  if (!confirm('解绑后该成员将不再收到到期提醒，确认？')) return;
+  try {
+    await api(`/api/members/${encodeURIComponent(id)}/telegram/unbind`,
+      { method: 'POST' });
+    toast('已解绑');
+    renderPage('members', true);
+  } catch (e) { toast('解绑失败: ' + e.message, 1); }
 }
 function enrolmentTable(unmanaged, groups) {
   if (!unmanaged.length) return '<div class="empty">所有 Emby 账号都已纳入</div>';
@@ -256,7 +343,9 @@ function filterMembers() {
     return true;
   });
   const tbody = document.querySelector('#member-table tbody');
-  if (tbody) tbody.innerHTML = rows.map(memberRow).join('') || '<tr><td colspan="8" class="empty">没有匹配的成员</td></tr>';
+  if (tbody) tbody.innerHTML = rows.map(memberRow).join('') || '<tr><td colspan="10" class="empty">没有匹配的成员</td></tr>';
+  // Filtering re-renders the rows, so any previous ticks are gone with them.
+  syncBulkBar();
 }
 async function createEmbyUser() {
   const name = prompt('新 Emby 用户名', '');
@@ -983,3 +1072,220 @@ function auditRows(rows) {
 }
 
 if (typeof bootPanel === 'function') bootPanel();
+
+/* ---------- Telegram ----------
+   Grouped as their own nav section: the bot is a second front door with its
+   own settings, its own approval queue and its own audit, and scattering those
+   across "settings" and "members" made each of them hard to find. */
+
+PAGES.tgbot = async () => {
+  $('#view').innerHTML = pageLoading();
+  const tg = await api('/api/settings/telegram').catch(() => null);
+  if (!tg) { $('#view').innerHTML = pageError('无法读取 Telegram 配置'); return; }
+  const st = tg.status || {};
+  const running = st.running && tg.enabled;
+  $('#view').innerHTML = `
+    <div class="stat-grid">
+      ${stat('✈', running ? '运行中' : (tg.bot_token_set ? '已停止' : '未配置'), '机器人',
+        st.last_error ? `最近错误：${st.last_error}` : (tg.bot_token_set ? tg.bot_token_masked : '尚未填写 Token'))}
+      ${stat('🆕', tg.registration_enabled ? '开放' : '关闭', '注册',
+        tg.register_days ? `赠送 ${tg.register_days} 天` : '不限期')}
+      ${stat('☺', tg.max_users ? `上限 ${tg.max_users}` : '不限', '名额',
+        tg.require_group ? `需加入 ${tg.require_group}` : '无群组要求')}
+      ${stat('🏆', tg.rankings_enabled ? `每天 ${tg.rankings_hour}:00` : '关闭', '排行推送',
+        tg.rankings_chat || '未设置目标')}
+    </div>
+    ${card('机器人对接', 'Token 仅保存在服务端，不会回传浏览器',
+      `<div class="card-body">
+        <div class="form-row"><label>Bot Token</label>
+          <input id="tg-token" type="password" autocomplete="new-password"
+            placeholder="${tg.bot_token_set ? esc(tg.bot_token_masked) + '（留空则不修改）' : '向 @BotFather 申请后粘贴'}"></div>
+        <div class="form-row"><label>启用机器人</label>
+          <input id="tg-enabled" type="checkbox" ${tg.enabled ? 'checked' : ''}>
+          <span class="muted">关闭后停止收发消息，配置保留</span></div>
+        <div class="form-row"><label>Emby 地址</label>
+          <input id="tg-embyurl" value="${esc(tg.emby_public_url || '')}" placeholder="https://emby.example.com">
+          <span class="muted">随账号一起发给新成员</span></div>
+        <div class="toolbar">
+          <button class="btn" id="tg-test">测试连接</button>
+          <button class="btn primary" id="tg-save">保存</button>
+          <span id="tg-result" class="muted"></span>
+        </div>
+      </div>`)}
+    ${card('注册开户', '成员在机器人里直接创建 Emby 账号，密码由系统生成',
+      `<div class="card-body">
+        <div class="form-row"><label>开放注册</label>
+          <input id="tg-reg" type="checkbox" ${tg.registration_enabled ? 'checked' : ''}>
+          <span class="muted">关闭后仍可认领已有账号</span></div>
+        <div class="form-row"><label>赠送天数</label>
+          <input id="tg-regdays" type="number" min="0" max="3650" value="${esc(tg.register_days)}" style="width:100px">
+          <span class="muted">0 = 不限期</span></div>
+        <div class="form-row"><label>注册名额</label>
+          <input id="tg-max" type="number" min="0" value="${esc(tg.max_users)}" style="width:100px">
+          <span class="muted">0 = 不限；名额是防止链接外泄后被刷爆的唯一闸门</span></div>
+        <div class="form-row"><label>默认用户组</label>
+          <input id="tg-group" value="${esc(tg.default_group_id || '')}" placeholder="留空使用系统默认组"></div>
+        <div class="form-row"><label>要求群组</label>
+          <input id="tg-reqgroup" value="${esc(tg.require_group || '')}" placeholder="@yourgroup 或 -100xxxxxxxxx">
+          <span class="muted">留空则不限制</span></div>
+        <div class="toolbar"><button class="btn primary" id="tg-save2">保存</button></div>
+      </div>`)}
+    ${card('通知与排行', '到期提醒发给已关联成员；排行发到指定群组',
+      `<div class="card-body">
+        <div class="form-row"><label>到期提醒</label>
+          <input id="tg-notify" type="checkbox" ${tg.notify_expiring ? 'checked' : ''}></div>
+        <div class="form-row"><label>提前天数</label>
+          <input id="tg-days" type="number" min="1" max="30" value="${esc(tg.notify_expiring_days)}" style="width:100px"></div>
+        <div class="form-row"><label>排行推送</label>
+          <input id="tg-rank" type="checkbox" ${tg.rankings_enabled ? 'checked' : ''}></div>
+        <div class="form-row"><label>推送目标</label>
+          <input id="tg-rankchat" value="${esc(tg.rankings_chat || '')}" placeholder="@channel 或 -100xxxxxxxxx"></div>
+        <div class="form-row"><label>推送时间</label>
+          <input id="tg-rankhour" type="number" min="0" max="23" value="${esc(tg.rankings_hour)}" style="width:100px">
+          <span class="muted">点（0–23）</span></div>
+        <div class="toolbar">
+          <button class="btn" id="tg-sendrank">立即发送一次</button>
+          <button class="btn primary" id="tg-save3">保存</button>
+          <span id="tg-rankresult" class="muted"></span>
+        </div>
+      </div>`)}`;
+  ['tg-save', 'tg-save2', 'tg-save3'].forEach((id) => {
+    if ($('#' + id)) $('#' + id).onclick = saveTelegramPage;
+  });
+  $('#tg-test').onclick = testTelegramPage;
+  $('#tg-sendrank').onclick = sendRankingsNow;
+};
+
+/* An empty token box means "keep the stored one", never "clear it": the
+   sentinel is what tells the server which of the two was meant. */
+function telegramPagePayload() {
+  const typed = ($('#tg-token') || {}).value || '';
+  const num = (id, dflt) => {
+    const el = $('#' + id);
+    return el ? Number(el.value || dflt) : dflt;
+  };
+  const str = (id) => (($('#' + id) || {}).value || '').trim();
+  const flag = (id) => (($('#' + id) || {}).checked) || false;
+  return {
+    bot_token: typed.trim() || SECRET_KEEP,
+    enabled: flag('tg-enabled'),
+    emby_public_url: str('tg-embyurl'),
+    registration_enabled: flag('tg-reg'),
+    register_days: num('tg-regdays', 30),
+    max_users: num('tg-max', 0),
+    default_group_id: str('tg-group'),
+    require_group: str('tg-reqgroup'),
+    notify_expiring: flag('tg-notify'),
+    notify_expiring_days: num('tg-days', 3),
+    rankings_enabled: flag('tg-rank'),
+    rankings_chat: str('tg-rankchat'),
+    rankings_hour: num('tg-rankhour', 21),
+  };
+}
+async function saveTelegramPage() {
+  try {
+    await api('/api/settings/telegram', {
+      method: 'POST', body: JSON.stringify(telegramPagePayload()) });
+    toast('已保存');
+    renderPage('tgbot', true);
+  } catch (e) { toast('保存失败: ' + e.message, 1); }
+}
+async function testTelegramPage() {
+  const el = $('#tg-result');
+  el.textContent = '正在测试…';
+  try {
+    // Save first: verification asks Telegram who the bot is, which needs the
+    // credential already stored rather than sent along for inspection.
+    await api('/api/settings/telegram', {
+      method: 'POST', body: JSON.stringify(telegramPagePayload()) });
+    const r = await api('/api/settings/telegram/verify', { method: 'POST' });
+    el.innerHTML = r.ok
+      ? `<span class="tag ok">连接成功</span> @${esc(r.username || '')}`
+      : `<span class="tag bad">连接失败</span> ${esc(r.error || '')}`;
+  } catch (e) {
+    el.innerHTML = `<span class="tag bad">连接失败</span> ${esc(e.message)}`;
+  }
+}
+async function sendRankingsNow() {
+  const el = $('#tg-rankresult');
+  el.textContent = '发送中…';
+  try {
+    const r = await api('/api/telegram/rankings/send', {
+      method: 'POST', body: JSON.stringify({ days: 1 }) });
+    el.innerHTML = r.sent
+      ? '<span class="tag ok">已发送</span>'
+      : '<span class="tag bad">发送失败</span>';
+  } catch (e) { el.innerHTML = `<span class="tag bad">${esc(e.message)}</span>`; }
+}
+
+PAGES.tgrequests = async () => {
+  $('#view').innerHTML = pageLoading();
+  const rows = await api('/api/telegram/requests').catch(() => []);
+  const kindLabel = (k) => (k === 'rebind' ? '换绑' : '认领');
+  $('#view').innerHTML = `
+    <div class="help">
+      注册不经过这里：聊天本身已经证明了申请人是谁。
+      只有<b>认领旧账号</b>和<b>换绑到新 Telegram</b> 需要确认，因为这两件事申请人无法自证。
+    </div>
+    ${tableCard('待处理申请', `${rows.length} 条`,
+      ['类型', 'Telegram', '申请账号', '提交时间', ''],
+      rows.map((r) => `<tr>
+        <td><span class="tag ${r.kind === 'rebind' ? 'warn' : 'idle'}">${esc(kindLabel(r.kind))}</span></td>
+        <td>${r.tg_username ? '@' + esc(r.tg_username) : esc(r.tg_user_id)}</td>
+        <td>${esc(r.wanted_username)}</td>
+        <td>${esc(fmtAgeTs(r.created_at))}</td>
+        <td class="row-actions">
+          <button class="btn sm" onclick="reviewTgRequest(${r.id}, true)">通过</button>
+          <button class="btn sm danger" onclick="reviewTgRequest(${r.id}, false)">拒绝</button>
+        </td></tr>`).join(''))}`;
+};
+async function reviewTgRequest(id, approve) {
+  if (!approve && !confirm('拒绝这条申请？申请人会收到通知。')) return;
+  try {
+    await api(`/api/telegram/requests/${id}/review`, {
+      method: 'POST', body: JSON.stringify({ approve }) });
+    toast(approve ? '已通过并关联' : '已拒绝');
+    renderPage('tgrequests', true);
+  } catch (e) { toast('操作失败: ' + e.message, 1); }
+}
+
+PAGES.tggroup = async () => {
+  $('#view').innerHTML = `
+    <div class="help">
+      核查已关联成员是否还在要求的群组里。<b>只报告，不自动停用</b>：
+      退群和停止付费不是一回事，这个判断留给人。
+    </div>
+    ${card('群组核查', '需要机器人是该群管理员才能查询',
+      `<div class="card-body">
+        <div class="toolbar">
+          <button class="btn primary" id="ga-run">开始核查</button>
+          <span id="ga-status" class="muted">尚未执行</span>
+        </div>
+        <div id="ga-result" style="margin-top:12px"></div>
+      </div>`)}`;
+  $('#ga-run').onclick = runGroupAudit;
+};
+async function runGroupAudit() {
+  const st = $('#ga-status');
+  const box = $('#ga-result');
+  st.textContent = '核查中…（成员较多时需要一会儿）';
+  box.innerHTML = '';
+  try {
+    const r = await api('/api/telegram/group-audit', { method: 'POST' });
+    if (r.unavailable) {
+      st.innerHTML = '<span class="tag idle">未配置群组</span>';
+      box.innerHTML = '<div class="empty">先在「机器人」页填写要求群组</div>';
+      return;
+    }
+    st.innerHTML = `<span class="tag ok">已核查 ${r.checked} 人</span>`;
+    box.innerHTML = (r.left || []).length
+      ? `<table><thead><tr><th>用户</th><th>Telegram</th><th>状态</th></tr></thead><tbody>
+          ${r.left.map((m) => `<tr><td>${esc(m.username || '-')}</td>
+            <td>${esc(m.tg_user_id)}</td>
+            <td><span class="tag warn">${esc(m.status || '已离开')}</span></td></tr>`).join('')}
+        </tbody></table>`
+      : '<div class="empty">所有已关联成员都还在群里</div>';
+  } catch (e) {
+    st.innerHTML = `<span class="tag bad">核查失败</span> ${esc(e.message)}`;
+  }
+}
