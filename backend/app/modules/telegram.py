@@ -86,13 +86,22 @@ class TelegramBot:
 
     def __init__(self, config_provider: Any, members: Any, emby: Any = None,
                  stats: Any = None, db: Any = None,
-                 registration: Any = None) -> None:
+                 registration: Any = None, points: Any = None,
+                 shop: Any = None, plugins: Any = None,
+                 scheduler: Any = None) -> None:
         self._config = config_provider
         self._members = members
         self._emby = emby
         self._stats = stats
         self._db = db
         self._registration = registration
+        self._points = points
+        self._shop = shop
+        # The registry, not the plugins themselves: whether a feature is on is
+        # an operator decision that can change between two taps of the same
+        # keyboard, so it is read at render time rather than captured here.
+        self._plugins = plugins
+        self._scheduler = scheduler
         self._offset = 0
         self._task: asyncio.Task | None = None
         self._last_error = ""
@@ -100,6 +109,15 @@ class TelegramBot:
         self._started_at = 0.0
         # chat id -> what the bot is waiting for, with a deadline
         self._pending: dict[str, tuple[str, float, dict[str, Any]]] = {}
+
+    def bind_plugins(self, registry: Any) -> None:
+        """Late-bind the plugin registry.
+
+        The bot is constructed before the plugins are registered -- they take
+        it as a context member so they can message people -- so the dependency
+        runs both ways and one of them has to be attached afterwards.
+        """
+        self._plugins = registry
 
     # -- config ---------------------------------------------------------------
 
@@ -212,17 +230,63 @@ class TelegramBot:
              {"text": "❓ 使用说明", "callback_data": "help"}],
         ]
 
+    def _plugin_on(self, plugin_id: str) -> bool:
+        """Is this points feature switched on right now?
+
+        A button for a disabled feature is worse than no button: it promises
+        something and then explains why it cannot. So the keyboard is built
+        from the current answer, every time it is drawn.
+        """
+        if self._plugins is None:
+            return False
+        try:
+            return bool(self._plugins.enabled(plugin_id))
+        except Exception:  # noqa: BLE001 - a broken registry hides the button
+            return False
+
+    def member_menu(self) -> list[list[dict[str, str]]]:
+        """Top level: identity, backpack, and whatever points features are on.
+
+        Two entry points rather than ten buttons. The old flat menu grew a row
+        every time something was added, and a member looking for their expiry
+        date had to read past invite codes to find it.
+        """
+        rows: list[list[dict[str, str]]] = [
+            [{"text": "👤 我的信息", "callback_data": "me"},
+             {"text": "🎒 背包", "callback_data": "bag"}],
+        ]
+        points_row = []
+        if self._plugin_on("checkin"):
+            points_row.append({"text": "✅ 签到", "callback_data": "checkin"})
+        if self._plugin_on("points_transfer"):
+            points_row.append({"text": "💸 转账", "callback_data": "transfer"})
+        if points_row:
+            rows.append(points_row)
+        rows.append([{"text": "🏆 排行", "callback_data": "top"},
+                     {"text": "🔄 刷新", "callback_data": "home"}])
+        return rows
+
     @staticmethod
-    def member_menu() -> list[list[dict[str, str]]]:
+    def info_menu() -> list[list[dict[str, str]]]:
+        """Everything about this one account, one level down."""
         return [
-            [{"text": "👤 我的账号", "callback_data": "me"},
-             {"text": "⏳ 有效期", "callback_data": "expiry"}],
-            [{"text": "📺 我的设备", "callback_data": "devices"},
-             {"text": "📊 观看统计", "callback_data": "usage"}],
+            [{"text": "📋 账号状态", "callback_data": "me_status"},
+             {"text": "💰 积分", "callback_data": "me_points"}],
+            [{"text": "📡 线路", "callback_data": "me_nodes"},
+             {"text": "📺 设备", "callback_data": "devices"}],
+            [{"text": "📊 观看统计", "callback_data": "usage"},
+             {"text": "🔑 重置密码", "callback_data": "resetpw"}],
+            [{"text": "◀ 返回", "callback_data": "home"}],
+        ]
+
+    @staticmethod
+    def bag_menu() -> list[list[dict[str, str]]]:
+        """What the member owns or can spend."""
+        return [
             [{"text": "🎫 我的邀请码", "callback_data": "invites"},
-             {"text": "🏆 本站排行", "callback_data": "top"}],
-            [{"text": "🔑 重置密码", "callback_data": "resetpw"},
-             {"text": "🔄 刷新", "callback_data": "home"}],
+             {"text": "🎁 兑换商城", "callback_data": "shop"}],
+            [{"text": "📜 兑换记录", "callback_data": "orders"}],
+            [{"text": "◀ 返回", "callback_data": "home"}],
         ]
 
     def _member_for_chat(self, tg_user_id: str) -> dict[str, Any] | None:
@@ -474,7 +538,7 @@ class TelegramBot:
         """
         if self._registration is None:
             await self._edit(chat_id, message_id, "邀请功能暂未开放。",
-                             self.member_menu())
+                             self.bag_menu())
             return
         user_id = str(member.get("emby_user_id") or "")
         notice = ""
@@ -512,8 +576,309 @@ class TelegramBot:
             keyboard.append(
                 [{"text": f"➕ 生成新码（剩 {quota}）",
                   "callback_data": "invite_new"}])
-        keyboard.append([{"text": "↩️ 返回", "callback_data": "home"}])
+        keyboard.append([{"text": "◀ 返回", "callback_data": "bag"}])
         await self._edit(chat_id, message_id, "\n".join(lines), keyboard)
+
+    # -- points ---------------------------------------------------------------
+
+    def _plugin(self, plugin_id: str) -> Any:
+        if self._plugins is None:
+            return None
+        with contextlib.suppress(Exception):
+            return self._plugins.get(plugin_id)
+        return None
+
+    def _balance(self, user_id: str) -> int:
+        if self._points is None:
+            return 0
+        with contextlib.suppress(Exception):
+            return int(self._points.balance(user_id))
+        return 0
+
+    def _points_text(self, member: dict[str, Any]) -> str:
+        """Balance plus the last few rows that produced it.
+
+        The history is the point: a number on its own invites 'where did my
+        points go', and the answer is already written down.
+        """
+        user_id = str(member.get("emby_user_id") or "")
+        lines = [f"💰 <b>我的积分</b>\n\n当前余额：<b>{self._balance(user_id)}</b>"]
+        rows: list[dict[str, Any]] = []
+        if self._points is not None:
+            with contextlib.suppress(Exception):
+                rows = self._points.ledger(user_id, limit=5)
+        if rows:
+            lines.append("\n<b>最近流水</b>")
+            for row in rows:
+                delta = int(row.get("delta") or 0)
+                when = time.strftime("%m-%d %H:%M",
+                                     time.localtime(row.get("created_at") or 0))
+                sign = "+" if delta > 0 else ""
+                lines.append(
+                    f"{when} · {row.get('reason_label') or row.get('reason')} "
+                    f"· <b>{sign}{delta}</b>")
+        else:
+            lines.append("\n还没有积分记录。")
+        return "\n".join(lines)
+
+    async def _checkin(self, chat_id: Any, message_id: int,
+                       member: dict[str, Any]) -> None:
+        plugin = self._plugin("checkin")
+        if plugin is None or not self._plugin_on("checkin"):
+            await self._edit(chat_id, message_id, "签到功能未开启。",
+                             self.member_menu())
+            return
+        user_id = str(member.get("emby_user_id") or "")
+        try:
+            result = plugin.checkin(user_id)
+        except Exception as exc:  # noqa: BLE001 - shown to a member
+            await self._edit(chat_id, message_id, f"❌ 签到失败：{exc}",
+                             self.member_menu())
+            return
+        if not result.get("ok"):
+            await self._edit(
+                chat_id, message_id,
+                f"📅 {result.get('reason') or '今天已签到'}\n\n"
+                f"当前余额：<b>{result.get('balance', self._balance(user_id))}</b>",
+                self.member_menu())
+            return
+        bonus = int(result.get("bonus") or 0)
+        extra = f"（含连签奖励 +{bonus}）" if bonus else ""
+        await self._edit(
+            chat_id, message_id,
+            f"✅ <b>签到成功</b>\n\n获得积分：<b>+{result.get('points')}</b>{extra}\n"
+            f"连续签到：<b>{result.get('streak')}</b> 天\n"
+            f"当前余额：<b>{result.get('balance')}</b>",
+            self.member_menu())
+
+    async def _nodes_text(self) -> str:
+        """Which line a member would be served from, and how busy it is.
+
+        Utilisation is shown as a percentage rather than stream counts: the
+        capacity of a node is an operator concept, and '3 streams' means
+        nothing without it.
+        """
+        if self._scheduler is None:
+            return "📡 <b>线路</b>\n\n暂无线路信息。"
+        nodes: list[dict[str, Any]] = []
+        with contextlib.suppress(Exception):
+            nodes = self._scheduler.snapshot()
+        if not nodes:
+            return "📡 <b>线路</b>\n\n暂无线路信息。"
+        lines = ["📡 <b>线路</b>\n"]
+        for node in nodes:
+            percent = round(float(node.get("utilisation") or 0) * 100)
+            if not node.get("enabled", True) or node.get("manually_disabled"):
+                mark = "⛔ 维护中"
+            elif not node.get("ok", True):
+                mark = "⚠️ 不可用"
+            elif percent >= 90:
+                mark = f"🔴 {percent}%"
+            elif percent >= 60:
+                mark = f"🟡 {percent}%"
+            else:
+                mark = f"🟢 {percent}%"
+            lines.append(f"{node.get('name') or '-'} · {mark}")
+        lines.append("\n<i>水位越低越空闲，系统会自动为你选择线路。</i>")
+        return "\n".join(lines)
+
+    # -- shop -----------------------------------------------------------------
+
+    async def _shop_view(self, chat_id: Any, message_id: int,
+                         member: dict[str, Any]) -> None:
+        if self._shop is None:
+            await self._edit(chat_id, message_id, "商城暂未开放。", self.bag_menu())
+            return
+        items: list[dict[str, Any]] = []
+        with contextlib.suppress(Exception):
+            items = self._shop.items(enabled_only=True)
+        balance = self._balance(str(member.get("emby_user_id") or ""))
+        if not items:
+            await self._edit(
+                chat_id, message_id,
+                f"🎁 <b>兑换商城</b>\n\n当前余额：<b>{balance}</b>\n\n"
+                "暂时没有上架的商品。", self.bag_menu())
+            return
+        lines = [f"🎁 <b>兑换商城</b>\n\n当前余额：<b>{balance}</b>\n"]
+        keyboard: list[list[dict[str, str]]] = []
+        for item in items:
+            lines.append(
+                f"· <b>{item['name']}</b> · {item['cost']} 分"
+                + (f"\n  {item['description']}" if item.get("description") else ""))
+            keyboard.append([{
+                "text": f"{item['name']} · 消耗 {item['cost']} 分",
+                "callback_data": f"buy:{item['id']}",
+            }])
+        keyboard.append([{"text": "◀ 返回", "callback_data": "bag"}])
+        await self._edit(chat_id, message_id, "\n".join(lines), keyboard)
+
+    async def _shop_confirm(self, chat_id: Any, message_id: int,
+                            item_id: str) -> None:
+        """Ask before spending. Points are earned slowly and spent in one tap."""
+        item = None
+        if self._shop is not None:
+            with contextlib.suppress(Exception):
+                item = self._shop.get(int(item_id))
+        if not item or not item.get("enabled"):
+            await self._edit(chat_id, message_id, "该商品已下架。", self.bag_menu())
+            return
+        await self._edit(
+            chat_id, message_id,
+            f"确定用 <b>{item['cost']}</b> 积分兑换 <b>{item['name']}</b>？\n\n"
+            f"内容：{item['amount']}{item.get('unit') or ''} · "
+            f"{item.get('kind_label') or ''}",
+            [[{"text": "✅ 确认兑换", "callback_data": f"buyok:{item['id']}"},
+              {"text": "取消", "callback_data": "shop"}]])
+
+    async def _shop_redeem(self, chat_id: Any, message_id: int,
+                           member: dict[str, Any], item_id: str) -> None:
+        if self._shop is None:
+            await self._edit(chat_id, message_id, "商城暂未开放。", self.bag_menu())
+            return
+        try:
+            result = self._shop.redeem(
+                str(member.get("emby_user_id") or ""), int(item_id),
+                actor="telegram")
+        except Exception as exc:  # noqa: BLE001 - the reason is for the member
+            await self._edit(chat_id, message_id, f"❌ 兑换失败：{exc}",
+                             self.bag_menu())
+            return
+        item = result.get("item") or {}
+        await self._edit(
+            chat_id, message_id,
+            f"✅ <b>兑换成功</b>\n\n商品：{item.get('name')}\n"
+            f"发放：{result.get('granted')}\n"
+            f"消耗：{result.get('cost')} 分\n"
+            f"余额：<b>{result.get('balance')}</b>",
+            self.bag_menu())
+
+    async def _orders_view(self, chat_id: Any, message_id: int,
+                           member: dict[str, Any]) -> None:
+        rows: list[dict[str, Any]] = []
+        if self._shop is not None:
+            with contextlib.suppress(Exception):
+                rows = self._shop.orders(
+                    user_id=str(member.get("emby_user_id") or ""), limit=10)
+        if not rows:
+            await self._edit(chat_id, message_id,
+                             "📜 <b>兑换记录</b>\n\n你还没有兑换过任何商品。",
+                             self.bag_menu())
+            return
+        lines = ["📜 <b>兑换记录</b>\n"]
+        for row in rows:
+            when = time.strftime("%m-%d %H:%M",
+                                 time.localtime(row.get("created_at") or 0))
+            lines.append(
+                f"{when} · {row.get('item_name') or '-'} · -{row.get('cost')} 分")
+        await self._edit(chat_id, message_id, "\n".join(lines), self.bag_menu())
+
+    # -- transfer -------------------------------------------------------------
+
+    async def _transfer_start(self, chat_id: Any, message_id: int) -> None:
+        if not self._plugin_on("points_transfer"):
+            await self._edit(chat_id, message_id, "转账功能未开启。",
+                             self.member_menu())
+            return
+        self._pending[str(chat_id)] = (
+            "transfer_to", time.time() + PENDING_TTL, {})
+        await self._edit(
+            chat_id, message_id,
+            "💸 <b>积分转账</b>\n\n请发送对方的 <b>Emby 用户名</b>。\n\n"
+            "<i>10 分钟内有效，发送 /start 可取消。</i>")
+
+    async def _transfer_pick_target(self, chat_id: Any,
+                                    member: dict[str, Any],
+                                    username: str) -> None:
+        target = None
+        with contextlib.suppress(Exception):
+            target = self._members.find_by_username(username.strip())
+        if not target:
+            self._pending.pop(str(chat_id), None)
+            await self.send(chat_id, f"❌ 找不到用户「{username}」，请确认后重试。",
+                            self.member_menu())
+            return
+        if str(target.get("emby_user_id")) == str(member.get("emby_user_id")):
+            self._pending.pop(str(chat_id), None)
+            await self.send(chat_id, "❌ 不能转给自己。", self.member_menu())
+            return
+        self._pending[str(chat_id)] = (
+            "transfer_amount", time.time() + PENDING_TTL,
+            {"to_id": str(target.get("emby_user_id")),
+             "to_name": str(target.get("username") or username)})
+        balance = self._balance(str(member.get("emby_user_id") or ""))
+        await self.send(
+            chat_id,
+            f"收款人：<b>{target.get('username') or username}</b>\n"
+            f"你的余额：<b>{balance}</b>\n\n请发送要转多少积分。")
+
+    async def _transfer_pick_amount(self, chat_id: Any,
+                                    member: dict[str, Any],
+                                    extra: dict[str, Any], raw: str) -> None:
+        plugin = self._plugin("points_transfer")
+        if plugin is None:
+            self._pending.pop(str(chat_id), None)
+            await self.send(chat_id, "转账功能未开启。", self.member_menu())
+            return
+        try:
+            amount = int(str(raw).strip())
+        except ValueError:
+            await self.send(chat_id, "请输入一个正整数，例如 <code>50</code>。")
+            return
+        ok, reason = plugin.can_transfer(
+            str(member.get("emby_user_id") or ""), amount)
+        if not ok:
+            self._pending.pop(str(chat_id), None)
+            await self.send(chat_id, f"❌ {reason}", self.member_menu())
+            return
+        fee = plugin.fee_for(amount)
+        self._pending[str(chat_id)] = (
+            "transfer_confirm", time.time() + PENDING_TTL,
+            {**extra, "amount": amount})
+        fee_line = f"\n手续费：{fee}（对方到账 {amount - fee}）" if fee else ""
+        await self.send(
+            chat_id,
+            f"请确认转账：\n\n收款人：<b>{extra.get('to_name')}</b>\n"
+            f"数量：<b>{amount}</b>{fee_line}",
+            [[{"text": "✅ 确认转账", "callback_data": "transfer_ok"},
+              {"text": "取消", "callback_data": "home"}]])
+
+    async def _transfer_execute(self, chat_id: Any, message_id: int,
+                                member: dict[str, Any]) -> None:
+        waiting = self._pending.pop(str(chat_id), None)
+        plugin = self._plugin("points_transfer")
+        if not waiting or waiting[0] != "transfer_confirm" or plugin is None:
+            await self._edit(chat_id, message_id, "转账已取消或超时，请重新发起。",
+                             self.member_menu())
+            return
+        extra = waiting[2]
+        to_id = str(extra.get("to_id") or "")
+        try:
+            result = plugin.transfer(
+                str(member.get("emby_user_id") or ""), to_id,
+                int(extra.get("amount") or 0))
+        except Exception as exc:  # noqa: BLE001 - the reason is for the member
+            await self._edit(chat_id, message_id, f"❌ 转账失败：{exc}",
+                             self.member_menu())
+            return
+        await self._edit(
+            chat_id, message_id,
+            f"✅ <b>转账成功</b>\n\n收款人：{extra.get('to_name')}\n"
+            f"转出：<b>{result.get('amount')}</b>"
+            + (f"（手续费 {result.get('fee')}）" if result.get("fee") else "")
+            + f"\n对方到账：<b>{result.get('received')}</b>\n"
+            f"你的余额：<b>{result.get('from_balance')}</b>",
+            self.member_menu())
+        # Telling the recipient is the difference between a transfer and a
+        # number quietly changing. Best effort: a failed notification must not
+        # undo a transfer that already committed.
+        with contextlib.suppress(Exception):
+            target = self._members.get(to_id)
+            if target and target.get("tg_user_id"):
+                await self.send(
+                    str(target["tg_user_id"]),
+                    f"💰 收到 <b>{member.get('username') or '一位成员'}</b> "
+                    f"转来的 <b>{result.get('received')}</b> 积分\n"
+                    f"当前余额：<b>{result.get('to_balance')}</b>")
 
     # -- claim / rebind requests ---------------------------------------------
 
@@ -590,6 +955,21 @@ class TelegramBot:
                 for i, t in enumerate(titles, 1):
                     lines.append(
                         f"{i}. {t['title']} · {t['plays']} 次 · {t['hours']} 小时")
+                lines.append("")
+        # Points are a different kind of ranking -- earned rather than watched
+        # -- so it is a separate section, and it is only shown once someone has
+        # actually earned something.
+        if self._points is not None:
+            with contextlib.suppress(Exception):
+                rich = self._points.top(limit=5)
+                if rich:
+                    lines.append("<b>积分排行</b>")
+                    for i, r in enumerate(rich, 1):
+                        lines.append(
+                            f"{i}. {r.get('username') or '-'} · "
+                            f"{int(r.get('balance') or 0)} 分")
+        while lines and not lines[-1]:
+            lines.pop()
         if len(lines) == 1:
             lines.append("暂时还没有播放记录。")
         return "\n".join(lines)
@@ -617,6 +997,18 @@ class TelegramBot:
                 await self._finish_registration(
                     chat_id, tg_user_id, tg_username, text,
                     admission=extra.get("admission"))
+                return
+            if kind in ("transfer_to", "transfer_amount"):
+                member = self._member_for_chat(tg_user_id)
+                if not member:
+                    self._pending.pop(str(chat_id), None)
+                    await self.send(chat_id, "这个 Telegram 还没有账号。",
+                                    self.guest_menu())
+                    return
+                if kind == "transfer_to":
+                    await self._transfer_pick_target(chat_id, member, text)
+                else:
+                    await self._transfer_pick_amount(chat_id, member, extra, text)
                 return
             if kind == "claim":
                 self._pending.pop(str(chat_id), None)
@@ -691,10 +1083,57 @@ class TelegramBot:
                 chat_id, message_id,
                 f"👤 <b>{member.get('username') or '-'}</b>\n\n"
                 f"状态：{self._status_label(member)}\n"
+                f"积分：<b>{self._balance(str(member.get('emby_user_id')))}</b>\n\n"
+                "选择要查看的内容：",
+                self.info_menu())
+            return
+        if data == "me_status":
+            await self._edit(
+                chat_id, message_id,
+                f"📋 <b>{member.get('username') or '-'}</b>\n\n"
+                f"状态：{self._status_label(member)}\n"
                 f"用户组：{member.get('group_name') or '默认'}\n"
                 f"有效期：{_fmt_expiry(member.get('expires_at'))}\n"
                 f"备注：{member.get('note') or '—'}",
-                self.member_menu())
+                self.info_menu())
+            return
+        if data == "me_points":
+            await self._edit(chat_id, message_id, self._points_text(member),
+                             self.info_menu())
+            return
+        if data == "me_nodes":
+            await self._edit(chat_id, message_id, await self._nodes_text(),
+                             self.info_menu())
+            return
+        if data == "bag":
+            await self._edit(
+                chat_id, message_id,
+                "🎒 <b>背包</b>\n\n"
+                f"当前积分：<b>{self._balance(str(member.get('emby_user_id')))}</b>\n\n"
+                "这里是你的邀请码、可兑换的商品和兑换记录。",
+                self.bag_menu())
+            return
+        if data == "checkin":
+            await self._checkin(chat_id, message_id, member)
+            return
+        if data == "transfer":
+            await self._transfer_start(chat_id, message_id)
+            return
+        if data == "transfer_ok":
+            await self._transfer_execute(chat_id, message_id, member)
+            return
+        if data == "shop":
+            await self._shop_view(chat_id, message_id, member)
+            return
+        if data.startswith("buy:"):
+            await self._shop_confirm(chat_id, message_id, data.split(":", 1)[1])
+            return
+        if data.startswith("buyok:"):
+            await self._shop_redeem(chat_id, message_id, member,
+                                    data.split(":", 1)[1])
+            return
+        if data == "orders":
+            await self._orders_view(chat_id, message_id, member)
             return
         if data == "expiry":
             expires = member.get("expires_at")

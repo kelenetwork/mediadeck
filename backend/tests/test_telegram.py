@@ -220,7 +220,11 @@ def test_guest_and_member_see_different_menus() -> None:
 
     # A member is past that step and must not be offered it again.
     assert "register" not in member_actions
-    assert {"me", "expiry", "devices", "usage", "top"} <= member_actions
+    # The member menu is two levels: the top offers identity and backpack, and
+    # the per-account views hang off 「我的信息」 rather than crowding the root.
+    assert {"me", "bag", "top", "home"} <= member_actions
+    info_actions = {b["callback_data"] for row in bot.info_menu() for b in row}
+    assert {"devices", "usage", "me_points", "me_nodes", "resetpw"} <= info_actions
 
     assert "没有账号" in guest_body
     assert "someone" in member_body

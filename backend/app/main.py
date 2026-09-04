@@ -341,7 +341,8 @@ async def _startup() -> None:
     app.state.telegram = TelegramBot(
         app.state.settings_service.telegram_config, app.state.members,
         emby=app.state.emby, stats=app.state.stats, db=app.state.db,
-        registration=app.state.registration)
+        registration=app.state.registration, points=app.state.points,
+        shop=app.state.shop, scheduler=app.state.scheduler)
     app.state.telegram.start()
 
     # ---- plugins ---------------------------------------------------------
@@ -368,6 +369,10 @@ async def _startup() -> None:
         migrate_legacy_telegram_jobs(store)
     app.state.plugins = register_builtin(
         PluginRegistry(store, app.state.db), app.state.plugin_ctx)
+    # Handed over after registration rather than at construction: the bot
+    # renders its keyboard from which points plugins are switched on, and the
+    # registry does not exist until the plugins are registered against it.
+    app.state.telegram.bind_plugins(app.state.plugins)
     app.state.plugins.start()
 
     async def _nodes_topic() -> Any:
