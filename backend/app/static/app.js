@@ -104,6 +104,78 @@ function fmtMoney(cents, currency) {
 function fmtQuota(n) {
   return n ? fmtBytes(n) : '不限';
 }
+/* ---------- artwork + playback ----------
+   Posters are addressed through the panel's own cached-image route, never
+   Emby directly: a dashboard renders a dozen tiles and auto-refreshes, and
+   Emby re-derives every thumbnail it is asked for. */
+function posterUrl(itemId, maxHeight) {
+  return `/emby/Items/${encodeURIComponent(itemId)}/Images/Primary`
+    + `?maxHeight=${maxHeight || 420}&quality=88`;
+}
+function ticksToClock(ticks) {
+  const total = Math.max(0, Math.floor(Number(ticks || 0) / 10000000));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  const pad = (n) => String(n).padStart(2, '0');
+  return h ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
+}
+const posterTile = (it) => `
+  <figure class="poster">
+    <div class="poster-img">
+      <img src="${esc(posterUrl(it.Id, 420))}" alt="" loading="lazy">
+      <span class="poster-badge">${it.Type === 'Series' ? '剧集' : '电影'}</span>
+    </div>
+    <figcaption class="poster-cap">
+      <div class="t">${esc(it.Name || '')}</div>
+      <div class="y">${esc(it.ProductionYear || '')}</div>
+    </figcaption>
+  </figure>`;
+/* Compact row for the "who is watching" column. Progress is only drawn when
+   the server actually reported it: a bar defaulting to 0% is indistinguishable
+   from a session that genuinely just started. */
+const playRow = (s) => {
+  const pct = s.ProgressPercent;
+  const known = pct !== null && pct !== undefined;
+  return `
+  <div class="play-row">
+    ${s.ItemId ? `<img class="thumb" src="${esc(posterUrl(s.ItemId, 180))}" alt="" loading="lazy">`
+      : '<div class="thumb"></div>'}
+    <div class="bd">
+      <div class="t">${esc(s.SeriesName ? `${s.SeriesName} · ${s.Item}` : (s.Item || '-'))}</div>
+      <div class="s">${s.Paused ? '' : '<span class="live-dot"></span>'}${esc(s.UserName || '-')} · ${esc(s.Client || '-')}</div>
+      ${known ? `<div class="bar wide"><i style="width:${Math.min(100, pct)}%"></i></div>` : ''}
+    </div>
+    <div class="pct">${known ? `${esc(pct)}%` : '<span class="muted">—</span>'}</div>
+  </div>`;
+};
+const playCard = (s) => {
+  const pct = s.ProgressPercent;
+  const known = pct !== null && pct !== undefined;
+  const meta = [s.ItemType === 'Episode' ? '剧集' : '电影',
+    ...(s.Genres || [])].filter(Boolean).join(' / ');
+  return `
+  <article class="play-card">
+    <div class="pc-poster">
+      ${s.ItemId ? `<img src="${esc(posterUrl(s.ItemId, 300))}" alt="" loading="lazy">` : ''}
+      <span class="pc-live">${s.Paused ? '❚❚ 已暂停' : '● 播放中'}</span>
+    </div>
+    <div class="pc-bd">
+      <div class="pc-title">${esc(s.SeriesName ? `${s.SeriesName} · ${s.Item}` : (s.Item || '-'))}${s.ProductionYear ? `（${esc(s.ProductionYear)}）` : ''}</div>
+      <div class="pc-meta">${esc(meta || '—')}</div>
+      <p class="pc-ov">${esc(s.Overview || '暂无简介')}</p>
+      <div class="pc-user">
+        <div class="avatar">${esc((s.UserName || '?').slice(0, 1).toUpperCase())}</div>
+        <div><b>${esc(s.UserName || '-')}</b><span>${esc(s.Client || '-')} · ${sessionSpeedCell(s)}</span></div>
+      </div>
+      ${known ? `<div class="bar wide"><i style="width:${Math.min(100, pct)}%"></i></div>
+      <div class="pc-time"><span>${esc(ticksToClock(s.PositionTicks))}</span>
+        <b>${esc(pct)}%</b><span>${esc(ticksToClock(s.RunTimeTicks))}</span></div>`
+      : '<div class="pc-time"><span class="muted">进度不可用</span></div>'}
+    </div>
+  </article>`;
+};
+
 function sessionSpeedCell(s) {
   /* MB/s: the unit the owner reads on his own devices. A node-measured value
      is real wire bytes; the sampler fallback is an estimate and says so,
@@ -226,12 +298,13 @@ async function renderPage(page, manual, live) {
 
 /* ---------------- pages ---------------- */
 PAGES.dashboard = async () => {
-  const [sessions, pipe, nodes, libs, overview] = await Promise.all([
+  const [sessions, pipe, nodes, libs, overview, latest] = await Promise.all([
     api('/api/emby/sessions').catch(() => []),
     api('/api/pipeline').catch(() => ({ available: false })),
     api('/api/nodes').catch(() => []),
     api('/api/emby/libraries').catch(() => []),
     api('/api/stats/overview?days=30').catch(() => null),
+    api('/api/emby/latest?limit=12').catch(() => []),
   ]);
   const online = nodes.filter((n) => n.available).length;
   const d = pipe.available ? pipe.data : {};
@@ -251,6 +324,18 @@ PAGES.dashboard = async () => {
       ${stat('⇄', queued, '管线待处理', pipe.available ? '整理与上传队列' : '快照不可用')}
       ${stat('⚠', alerts.length + limited + expiring.length + exhaustedN, '待处理事项', limited ? `${limited} 个上传身份受限` : '系统关键状态')}
     </div>
+    <div class="grid-2">
+      ${card('最新入库', latest.length ? `最近 ${latest.length} 部` : '暂无数据',
+        latest.length
+          ? `<div class="poster-grid">${latest.map(posterTile).join('')}</div>`
+          : '<div class="empty">暂无最近入库</div>')}
+      ${card('正在播放', sessions.length ? `${sessions.length} 个会话` : '暂无活跃会话',
+        sessions.length
+          ? `<div class="card-body flush">${sessions.map(playRow).join('')}</div>`
+          : '<div class="empty">当前没有播放会话</div>')}
+    </div>
+    ${sessions.length ? card('播放详情', '海报 · 观众 · 进度',
+      `<div class="play-grid">${sessions.map(playCard).join('')}</div>`) : ''}
     <div class="grid-2">
       ${tableCard('当前播放', '实时会话 · 节点实测速率', ['用户', '客户端', '方式', '实时速度'],
         sessions.map((s) => `<tr><td>${esc(s.UserName)}</td><td>${esc(s.Client)}</td>

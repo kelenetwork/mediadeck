@@ -162,8 +162,25 @@ class MockEmby:
                 "Client": "Demo Player",
                 "PlayMethod": "DirectStream",
                 "Item": "Demo Show S01E01",
+                "ItemId": "mock-item-1",
+                "ItemType": "Episode",
+                "ProductionYear": 2024,
+                "Genres": ["Demo"],
+                "Overview": "Demo overview for the mock session.",
+                "RunTimeTicks": 36_000_000_000,
+                "PositionTicks": 9_000_000_000,
+                "ProgressPercent": 25.0,
             }
         ]
+
+    async def latest_items(self, limit: int = 12) -> list[dict[str, Any]]:
+        items = [
+            {"Id": "mock-item-1", "Name": "Demo Movie One", "Type": "Movie",
+             "ProductionYear": 2024, "DateCreated": "2026-09-01T10:00:00Z"},
+            {"Id": "mock-item-2", "Name": "Demo Series Two", "Type": "Series",
+             "ProductionYear": 2023, "DateCreated": "2026-08-31T10:00:00Z"},
+        ]
+        return items[:max(1, limit)]
 
 
 class MockProbe:
