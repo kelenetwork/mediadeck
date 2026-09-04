@@ -37,7 +37,10 @@ from typing import Any
 
 import httpx
 
+from app.core.errors import ConfigError
+from app.modules.groups import WHITELIST_GROUP_ID
 from app.modules.requests import RequestError
+from app.modules.shop import ShopError
 from app.modules.tmdb import parse_link, poster_url
 
 API_ROOT = "https://api.telegram.org"
@@ -64,6 +67,33 @@ REQUEST_STATUS_ICONS = {
 # Callbacks whose handler sends its own answerCallbackQuery, because it has
 # something to say. Everything else is acked immediately.
 SELF_ANSWERING_CALLBACKS = ("req_claim:", "req_done:", "req_fail:")
+
+ADMIN_HELP = """🛠 <b>管理员命令</b>
+
+<b>查询</b>
+<code>/kk 用户</code> 查看账号详情
+<code>/req [open|claimed]</code> 最近 10 条求片
+
+<b>用户组</b>
+<code>/prouser 用户</code> 移入白名单（永不过期）
+<code>/revuser 用户</code> 移回默认组
+
+<b>有效期</b>
+<code>/renew 用户 天数</code> 续期
+<code>/renewall 天数</code> 全员续期（需确认）
+
+<b>积分与发放</b>
+<code>/score 用户 ±数量</code> 调整积分
+<code>/scoreall 数量</code> 全员加分（需确认）
+<code>/gift 用户 traffic|days|bandwidth|invite 数量</code> 直接发放
+<code>/invite 用户 次数</code> 增加邀请名额
+
+<b>账号</b>
+<code>/rm 用户</code> 删号（需确认，连带邀请人 + Emby）
+<code>/code 套餐id 天数 数量</code> 生成卡密
+<code>/auth TelegramID</code> 预授权注册
+
+<i>用户可写 Emby 用户名或 @Telegram 用户名。</i>"""
 
 
 def generate_password(length: int = 12) -> str:
@@ -1360,6 +1390,428 @@ class TelegramBot:
                     f"原因：{reason}")
         return await self.send(chat_id, body)
 
+    # -- admin commands -------------------------------------------------------
+
+    def is_admin(self, member: dict[str, Any] | None) -> bool:
+        """Admin is a role on a linked account, not a separate id list.
+
+        The operator already grants 'admin' in the panel to let someone log
+        in; a second list of privileged Telegram ids would be one more thing
+        to keep in sync, and the two would eventually disagree about who is
+        an admin.
+        """
+        return bool(member) and "admin" in (member.get("roles") or [])
+
+    def _find_target(self, token: str) -> dict[str, Any] | None:
+        """Resolve '@name' or a bare Emby username to a member."""
+        name = str(token or "").strip().lstrip("@")
+        if not name:
+            return None
+        found = self._members.find_by_username(name)
+        if found:
+            return found
+        # A Telegram @handle is not the Emby login, so fall back to the link
+        # table rather than telling an operator their own admin does not exist.
+        for candidate in self._members.linked_telegram():
+            if str(candidate.get("tg_username") or "").lower() == name.lower():
+                return candidate
+        return None
+
+    def _admin_actor(self, member: dict[str, Any], tg_username: str) -> str:
+        label = tg_username or member.get("username") or "admin"
+        return f"tg:{label}"
+
+    async def _handle_command(self, chat_id: Any, tg_user_id: str,
+                              tg_username: str, text: str) -> None:
+        """Dispatch an admin '/' command.
+
+        Every command re-checks the role: a member could have been demoted
+        between two messages, and the bot must not act on the authority they
+        used to have.
+        """
+        parts = text.split()
+        command = parts[0].lower().lstrip("/")
+        command = command.split("@", 1)[0]
+        args = parts[1:]
+
+        member = self._member_for_chat(tg_user_id)
+        if command == "help" and not self.is_admin(member):
+            body, keyboard = self._home(tg_user_id, tg_username or "朋友")
+            await self.send(chat_id, body, keyboard)
+            return
+        if not self.is_admin(member):
+            await self.send(chat_id, "⛔ 无权限。")
+            return
+
+        actor = self._admin_actor(member, tg_username)
+        handler = getattr(self, f"_cmd_{command}", None)
+        if handler is None:
+            await self.send(chat_id, f"未知命令 /{command}，发送 /help 查看命令清单。")
+            return
+        try:
+            await handler(chat_id, actor, args)
+        except (ConfigError, ShopError, RequestError) as exc:
+            await self.send(chat_id, f"❌ {exc}")
+        except Exception as exc:  # noqa: BLE001 - reported, never swallowed
+            self._last_error = f"{type(exc).__name__}"
+            await self.send(chat_id, f"❌ 命令执行失败：{type(exc).__name__}")
+
+    async def _need_target(self, chat_id: Any, args: list[str]
+                           ) -> dict[str, Any] | None:
+        if not args:
+            await self.send(chat_id, "请指定用户，例如 <code>/kk alice</code>")
+            return None
+        target = self._find_target(args[0])
+        if not target:
+            await self.send(chat_id, "找不到该用户。")
+            return None
+        return target
+
+    async def _cmd_help(self, chat_id: Any, actor: str,
+                        args: list[str]) -> None:
+        await self.send(chat_id, ADMIN_HELP)
+
+    async def _cmd_kk(self, chat_id: Any, actor: str,
+                      args: list[str]) -> None:
+        target = await self._need_target(chat_id, args)
+        if not target:
+            return
+        user_id = str(target.get("emby_user_id"))
+        devices = len(self._members.devices(user_id) or [])
+        seen = target.get("last_seen_at")
+        invitee_count = target.get("invitee_count")
+        if invitee_count is None:
+            invitee_count = len(self._members.invitees_of(user_id) or [])
+        inviter = self._members.inviter_of(user_id) or {}
+        left = (self._requests.remaining(user_id)
+                if self._requests_ready() else None)
+        await self.send(
+            chat_id,
+            f"👤 <b>{target.get('username') or '-'}</b>\n\n"
+            f"状态：{self._status_label(target)}\n"
+            f"用户组：{target.get('group_name') or '-'}\n"
+            f"有效期：{_fmt_expiry(target.get('expires_at'))}\n"
+            f"积分：{self._balance(user_id)}\n"
+            f"注册渠道：{target.get('register_via') or 'legacy'}\n"
+            f"邀请人：{inviter.get('username') or '—'}\n"
+            f"下级：{invitee_count} 人\n"
+            f"Telegram：{target.get('tg_user_id') or '未关联'}\n"
+            f"设备数：{devices}\n"
+            f"最近活跃："
+            f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(seen)) if seen else '—'}\n"
+            f"求片剩余：{self._remaining_text(left)}")
+
+    async def _move_group(self, chat_id: Any, actor: str, args: list[str],
+                          group_id: str, label: str) -> None:
+        target = await self._need_target(chat_id, args)
+        if not target:
+            return
+        if self._groups is not None:
+            # /prouser names a specific group, so make sure it is there even
+            # on a panel whose owner tidied their group list.
+            with contextlib.suppress(Exception):
+                self._groups.ensure_whitelist()
+            if not self._groups.get(group_id):
+                await self.send(chat_id, f"用户组 {group_id} 不存在。")
+                return
+        user_id = str(target.get("emby_user_id"))
+        self._members.upsert(user_id, str(target.get("username") or ""),
+                             {"group_id": group_id}, actor=actor)
+        await self.send(
+            chat_id,
+            f"✅ <b>{target.get('username')}</b> 已移入{label}。")
+
+    async def _cmd_prouser(self, chat_id: Any, actor: str,
+                           args: list[str]) -> None:
+        await self._move_group(chat_id, actor, args, WHITELIST_GROUP_ID,
+                               "白名单（永不过期）")
+
+    async def _cmd_revuser(self, chat_id: Any, actor: str,
+                           args: list[str]) -> None:
+        default_id = None
+        if self._groups is not None:
+            default_id = self._groups.default_group_id()
+        if not default_id:
+            await self.send(chat_id, "没有设置默认用户组。")
+            return
+        await self._move_group(chat_id, actor, args, default_id, "默认组")
+
+    async def _cmd_renew(self, chat_id: Any, actor: str,
+                         args: list[str]) -> None:
+        target = await self._need_target(chat_id, args)
+        if not target:
+            return
+        if len(args) < 2 or not args[1].lstrip("-").isdigit():
+            await self.send(chat_id, "用法：<code>/renew 用户名 天数</code>")
+            return
+        days = int(args[1])
+        updated = self._members.renew(str(target.get("emby_user_id")), days,
+                                      actor=actor)
+        await self.send(
+            chat_id,
+            f"✅ <b>{target.get('username')}</b> 已续期 {days} 天，"
+            f"现在{_fmt_expiry(updated.get('expires_at'))}。")
+
+    async def _cmd_renewall(self, chat_id: Any, actor: str,
+                            args: list[str]) -> None:
+        if not args or not args[0].lstrip("-").isdigit():
+            await self.send(chat_id, "用法：<code>/renewall 天数</code>")
+            return
+        days = int(args[0])
+        total = len(self._members.list(limit=5000))
+        # Everyone at once is not undoable, so it is confirmed before it runs.
+        self._pending[str(chat_id)] = (
+            "admin_confirm", time.time() + PENDING_TTL,
+            {"action": "renewall", "days": days, "actor": actor})
+        await self.send(
+            chat_id,
+            f"⚠ <b>全员续期</b>\n\n将给 <b>{total}</b> 个账号各加 {days} 天。\n\n确认执行？",
+            [[{"text": "✅ 确认", "callback_data": "admin_ok"},
+              {"text": "✖ 取消", "callback_data": "admin_cancel"}]])
+
+    async def _cmd_rm(self, chat_id: Any, actor: str,
+                      args: list[str]) -> None:
+        target = await self._need_target(chat_id, args)
+        if not target:
+            return
+        user_id = str(target.get("emby_user_id"))
+        preview = self._members.delete_preview(user_id)
+        cascade = preview.get("cascade") or []
+        lines = [
+            "⚠ <b>确认删除</b>\n",
+            f"账号：<b>{preview['target'].get('username') or user_id}</b>",
+            f"注册渠道：{preview['target'].get('register_via') or 'legacy'}",
+        ]
+        if cascade:
+            # Cascade means one click removes an account nobody named. The
+            # operator has to be told before they tap, not after.
+            lines.append("\n<b>连带删除：</b>")
+            lines.extend(
+                f"· {row.get('username') or row.get('emby_user_id')}"
+                f"（{row.get('reason') or ''}）" for row in cascade)
+        lines.append("\n同时会删除 Emby 账号，且<b>不可恢复</b>。")
+        self._pending[str(chat_id)] = (
+            "admin_confirm", time.time() + PENDING_TTL,
+            {"action": "rm", "user_id": user_id, "actor": actor,
+             "username": target.get("username") or user_id})
+        await self.send(
+            chat_id, "\n".join(lines),
+            [[{"text": "🗑 确认删除", "callback_data": "admin_ok"},
+              {"text": "✖ 取消", "callback_data": "admin_cancel"}]])
+
+    async def _cmd_score(self, chat_id: Any, actor: str,
+                         args: list[str]) -> None:
+        target = await self._need_target(chat_id, args)
+        if not target:
+            return
+        if len(args) < 2:
+            await self.send(chat_id, "用法：<code>/score 用户名 ±数量</code>")
+            return
+        raw = args[1].lstrip("+")
+        if not raw.lstrip("-").isdigit():
+            await self.send(chat_id, "积分数量必须是整数。")
+            return
+        delta = int(raw)
+        if self._points is None:
+            await self.send(chat_id, "积分服务不可用。")
+            return
+        user_id = str(target.get("emby_user_id"))
+        try:
+            balance = self._points.add(user_id, delta, "admin.adjust",
+                                       ref="tg", actor=actor)
+        except ValueError as exc:
+            await self.send(chat_id, f"❌ {exc}")
+            return
+        self._members.audit(actor, "points.adjust", user_id, f"delta={delta}")
+        await self.send(
+            chat_id,
+            f"✅ <b>{target.get('username')}</b> 积分 {delta:+d}，当前 {balance}。")
+
+    async def _cmd_scoreall(self, chat_id: Any, actor: str,
+                            args: list[str]) -> None:
+        if not args or not args[0].lstrip("+-").isdigit():
+            await self.send(chat_id, "用法：<code>/scoreall 数量</code>")
+            return
+        amount = int(args[0].lstrip("+"))
+        total = len(self._members.list(limit=5000))
+        self._pending[str(chat_id)] = (
+            "admin_confirm", time.time() + PENDING_TTL,
+            {"action": "scoreall", "amount": amount, "actor": actor})
+        await self.send(
+            chat_id,
+            f"⚠ <b>全员积分</b>\n\n将给 <b>{total}</b> 个账号各 {amount:+d} 分。\n\n确认执行？",
+            [[{"text": "✅ 确认", "callback_data": "admin_ok"},
+              {"text": "✖ 取消", "callback_data": "admin_cancel"}]])
+
+    async def _cmd_gift(self, chat_id: Any, actor: str,
+                        args: list[str]) -> None:
+        target = await self._need_target(chat_id, args)
+        if not target:
+            return
+        if len(args) < 3:
+            await self.send(
+                chat_id,
+                "用法：<code>/gift 用户名 traffic|days|bandwidth|invite 数量</code>")
+            return
+        kind = args[1].lower()
+        if not args[2].isdigit():
+            await self.send(chat_id, "数量必须是正整数。")
+            return
+        if self._shop is None:
+            await self.send(chat_id, "商城服务不可用。")
+            return
+        # Same write the shop performs, so a gift and a purchase cannot mean
+        # two different things.
+        note = self._shop.grant(str(target.get("emby_user_id")), kind,
+                                int(args[2]), actor=actor)
+        await self.send(chat_id, f"🎁 已发放给 <b>{target.get('username')}</b>：{note}")
+
+    async def _cmd_code(self, chat_id: Any, actor: str,
+                        args: list[str]) -> None:
+        if len(args) < 3 or not args[1].isdigit() or not args[2].isdigit():
+            await self.send(chat_id, "用法：<code>/code 套餐id 天数 数量</code>")
+            return
+        if self._registration is None:
+            await self.send(chat_id, "注册服务不可用。")
+            return
+        issued = self._registration.generate_redeem(
+            args[0], int(args[1]), int(args[2]), note=f"tg:{actor}")
+        self._members.audit(actor, "redeem.generate", "",
+                            f"group={args[0]} days={args[1]} count={args[2]}")
+        lines = [f"🎟 已生成 {len(issued)} 张卡密（{args[1]} 天）：\n"]
+        lines.extend(f"<code>{row.get('code')}</code>" for row in issued)
+        await self.send(chat_id, "\n".join(lines))
+
+    async def _cmd_invite(self, chat_id: Any, actor: str,
+                          args: list[str]) -> None:
+        target = await self._need_target(chat_id, args)
+        if not target:
+            return
+        if len(args) < 2 or not args[1].lstrip("-").isdigit():
+            await self.send(chat_id, "用法：<code>/invite 用户名 次数</code>")
+            return
+        amount = int(args[1])
+        user_id = str(target.get("emby_user_id"))
+        self._db.execute(
+            "UPDATE members SET invite_quota=MAX(0,COALESCE(invite_quota,0)+?),"
+            "updated_at=? WHERE emby_user_id=?",
+            (amount, int(time.time()), user_id))
+        self._members.audit(actor, "member.invite_quota", user_id,
+                            f"delta={amount}")
+        after = self._members.get(user_id) or {}
+        await self.send(
+            chat_id,
+            f"✅ <b>{target.get('username')}</b> 邀请名额 {amount:+d}，"
+            f"当前 {after.get('invite_quota') or 0} 个。")
+
+    async def _cmd_auth(self, chat_id: Any, actor: str,
+                        args: list[str]) -> None:
+        if not args:
+            await self.send(chat_id, "用法：<code>/auth Telegram数字ID</code>")
+            return
+        if self._registration is None:
+            await self.send(chat_id, "注册服务不可用。")
+            return
+        self._registration.grant_admin(args[0], granted_by=actor)
+        self._members.audit(actor, "registration.grant", str(args[0]),
+                            "admin grant via bot")
+        await self.send(
+            chat_id,
+            f"✅ 已授权 <code>{args[0]}</code>，该 Telegram 现在可以直接注册。")
+
+    async def _cmd_req(self, chat_id: Any, actor: str,
+                       args: list[str]) -> None:
+        if not self._requests_ready():
+            await self.send(chat_id, "求片功能暂未开启。")
+            return
+        wanted = args[0].lower() if args else "active"
+        if wanted not in ("open", "claimed", "active"):
+            wanted = "active"
+        rows = self._requests.list(status=wanted, limit=10)
+        if not rows:
+            await self.send(chat_id, "📋 当前没有符合条件的求片。")
+            return
+        stats = self._requests.stats()
+        lines = [f"📋 <b>求片（{wanted}）</b>\n"]
+        for row in rows:
+            holder = row.get("claimed_by_name")
+            lines.append(
+                f"#{row['id']} {row['display_title']} · {row['status_label']}"
+                + (f" · {holder}" if holder else "")
+                + f"\n    求片人 {row.get('username') or '-'}")
+        lines.append(
+            f"\n待接单 {stats['open']} · 处理中 {stats['claimed']} · "
+            f"本月 {stats['month_total']}")
+        await self.send(chat_id, "\n".join(lines))
+
+    # -- destructive confirmations -------------------------------------------
+
+    async def _admin_confirm(self, chat_id: Any, message_id: int,
+                             member: dict[str, Any]) -> None:
+        """Run the action the operator just confirmed.
+
+        Re-checks the role at execution time: the confirmation may have sat on
+        screen while the person tapping it was demoted.
+        """
+        waiting = self._pending.pop(str(chat_id), None)
+        if not waiting or waiting[0] != "admin_confirm":
+            await self._edit(chat_id, message_id, "这个确认已经过期了。")
+            return
+        if not self.is_admin(member):
+            await self._edit(chat_id, message_id, "⛔ 无权限。")
+            return
+        extra = waiting[2]
+        action = str(extra.get("action") or "")
+        actor = str(extra.get("actor") or "tg:admin")
+
+        if action == "renewall":
+            days = int(extra.get("days") or 0)
+            done = 0
+            for row in self._members.list(limit=5000):
+                with contextlib.suppress(Exception):
+                    self._members.renew(str(row.get("emby_user_id")), days,
+                                        actor=actor)
+                    done += 1
+            await self._edit(chat_id, message_id,
+                             f"✅ 已为 {done} 个账号各续期 {days} 天。")
+            return
+
+        if action == "scoreall":
+            amount = int(extra.get("amount") or 0)
+            done = 0
+            for row in self._members.list(limit=5000):
+                with contextlib.suppress(Exception):
+                    self._points.add(str(row.get("emby_user_id")), amount,
+                                     "admin.adjust", ref="scoreall",
+                                     actor=actor)
+                    done += 1
+            await self._edit(chat_id, message_id,
+                             f"✅ 已为 {done} 个账号各调整 {amount:+d} 分。")
+            return
+
+        if action == "rm":
+            user_id = str(extra.get("user_id") or "")
+            result = self._members.delete(user_id, actor=actor, cascade=True)
+            removed = result.get("deleted") or []
+            emby_gone = 0
+            if self._emby is not None:
+                for victim in removed:
+                    ok = False
+                    with contextlib.suppress(Exception):
+                        ok = bool(await self._emby.delete_user(victim))
+                    if ok:
+                        emby_gone += 1
+                    self._members.audit(
+                        actor, "member.delete_emby", victim,
+                        "Emby account deleted" if ok else "Emby delete failed")
+            await self._edit(
+                chat_id, message_id,
+                f"🗑 已删除 <b>{extra.get('username')}</b>"
+                f"（连带 {len(removed) - 1} 个账号，Emby 已删 {emby_gone} 个）。")
+            return
+
+        await self._edit(chat_id, message_id, "未知操作。")
+
     # -- update handling ------------------------------------------------------
 
     async def _handle_message(self, message: dict[str, Any]) -> None:
@@ -1420,6 +1872,14 @@ class TelegramBot:
                     self.guest_menu())
                 return
 
+        # Commands are dispatched after the pending-conversation check above,
+        # which deliberately ignores anything starting with '/': a member who
+        # typed a command instead of the answer they were asked for meant the
+        # command, not a title called "/help".
+        if text.startswith("/"):
+            await self._handle_command(chat_id, tg_user_id, tg_username, text)
+            return
+
         body, keyboard = self._home(tg_user_id, tg_name)
         await self.send(chat_id, body, keyboard)
 
@@ -1468,8 +1928,16 @@ class TelegramBot:
                 self.member_menu() if member else self.guest_menu())
             return
         if data == "home":
+            self._pending.pop(str(chat_id), None)
             body, keyboard = self._home(tg_user_id, tg_name)
             await self._edit(chat_id, message_id, body, keyboard)
+            return
+        if data == "admin_ok":
+            await self._admin_confirm(chat_id, message_id, member)
+            return
+        if data == "admin_cancel":
+            self._pending.pop(str(chat_id), None)
+            await self._edit(chat_id, message_id, "已取消，什么都没做。")
             return
         if data == "top":
             # Rankings are about the library, not one account, so they stay

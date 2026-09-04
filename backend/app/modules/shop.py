@@ -286,6 +286,27 @@ class ShopService:
             "granted": note,
         }
 
+    def grant(self, user_id: str, kind: str, amount: int,
+              actor: str = "operator") -> str:
+        """Deliver a reward without charging for it.
+
+        Exists so the admin /gift command hands out exactly what the shop
+        hands out. A second implementation would drift -- the shop's "+50GB"
+        and an admin's "+50GB" have to be the same write, or the two paths
+        eventually disagree about what a gift even is.
+        """
+        kind = str(kind or "").strip()
+        if kind not in KINDS:
+            raise ShopError(f"类型必须是 {'/'.join(KINDS)} 之一")
+        amount = _as_int(amount, "数量", 1, 1_000_000)
+        member = self._members.get(str(user_id)) if self._members else None
+        if not member:
+            raise ShopError("账号不存在")
+        with self._db.write() as conn:
+            note = self._grant(conn, str(user_id), member, kind, amount)
+        self._audit(actor, "shop.grant", str(user_id), f"{kind} {amount} {note}")
+        return note
+
     def _grant(self, conn: Any, user_id: str, member: dict[str, Any],
                kind: str, amount: int) -> str:
         """Deliver one reward on the caller's open transaction.
