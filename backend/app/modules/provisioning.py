@@ -84,11 +84,13 @@ def nginx_site(node: Any) -> str:
         alias {node_path}/;
 
         # Per-user cap from the signed r argument (bytes/second, 0 =
-        # uncapped). limit_rate is per request, so a second Range socket
-        # would double the number on the panel. HTTP/1.1 plus one live
-        # connection is what makes 15 MB/s mean 15 MB/s; players abort the
-        # previous request on seek. No burst window.
-        limit_conn mediadeck_peruser 1;
+        # uncapped). limit_rate is per request. HTTP/1.1 stops one TCP
+        # connection from multiplexing N full-rate Ranges (that was the
+        # 15 x N burst). Players still open a couple of sockets for seek
+        # overlap and a second allowed stream; 1 rejected those as 503 and
+        # clients showed "file corrupt". 4 covers two streams + seek.
+        # No burst window.
+        limit_conn mediadeck_peruser 4;
         limit_rate $mediadeck_rate;
 
         # Real transfer bytes per user for the panel's live-speed display.

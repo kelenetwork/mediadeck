@@ -700,7 +700,7 @@ def test_enroll_script_is_token_authenticated_and_self_contained() -> None:
         # there is no free burst window on every seek.
         assert "listen 443 ssl http2" not in script
         assert "limit_rate_after 2m" not in script
-        assert "limit_conn mediadeck_peruser 1" in script
+        assert "limit_conn mediadeck_peruser 4" in script
         assert "mediadeck_user_key" in script
 
 
