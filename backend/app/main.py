@@ -474,7 +474,7 @@ async def settings_overview() -> dict[str, Any]:
         "emby": service.emby_public(),
         "dispatch": service.dispatch_config(),
         "playback": service.playback_config(),
-        "integration": service.integration_config(),
+        "integration": service.integration_public(),
         "membership": service.membership_config(),
         "image_cache": service.image_cache_config(),
         "nodes": service.nodes_public(),
@@ -768,7 +768,8 @@ async def playback_preview(item_id: str) -> dict[str, Any]:
 # ---- integration / node provisioning ---------------------------------------
 @app.get("/api/settings/integration", dependencies=[Depends(_auth)])
 async def settings_integration_get() -> dict[str, Any]:
-    return app.state.settings_service.integration_config()
+    # Public view: the TMDB key is a credential and never travels back out.
+    return app.state.settings_service.integration_public()
 
 
 @app.put("/api/settings/integration", dependencies=[Depends(_auth)])

@@ -27,6 +27,10 @@ from app.core.errors import ConfigError
 GIB = 1024 ** 3
 BILLING_MODES = ("time", "traffic", "both", "none")
 
+# Media requests a member may open per calendar month unless their group says
+# otherwise. Small on purpose: the cost of a request is somebody's evening.
+DEFAULT_REQUEST_QUOTA = 3
+
 _ID_RE = re.compile(r"^[a-z][a-z0-9_-]{1,31}$")
 
 
@@ -59,6 +63,24 @@ DEFAULT_GROUPS: list[dict[str, Any]] = [
     },
 ]
 
+# The group the /prouser command moves someone into. Kept out of
+# DEFAULT_GROUPS because those seed only into an empty table: an operator who
+# curated their own groups would otherwise never get a target for /prouser,
+# and the command would fail on a database that is working exactly as intended.
+WHITELIST_GROUP_ID = "whitelist"
+
+WHITELIST_GROUP: dict[str, Any] = {
+    "id": WHITELIST_GROUP_ID, "name": "白名单",
+    "description": "管理员手动放行的账号：永不过期，限制放宽",
+    # duration_days 0 with billing_mode none is what "never expires" means
+    # here; a time-billed group with 0 days would be rejected by _validate.
+    "billing_mode": "none",
+    "duration_days": 0, "traffic_quota_bytes": 0,
+    "bandwidth_limit_kbps": 0, "max_streams": 10, "max_devices": 10,
+    "allow_download": 1, "allow_transcode": 1,
+    "is_default": 0, "request_quota": 0,
+}
+
 _INT_FIELDS = (
     # key, label, lo, hi
     ("duration_days", "默认时长(天)", 0, 36500),
@@ -66,6 +88,7 @@ _INT_FIELDS = (
     ("bandwidth_limit_kbps", "带宽限速 kbps", 0, 10_000_000),
     ("max_streams", "并发路数", 0, 100),
     ("max_devices", "设备数上限", 0, 100),
+    ("request_quota", "每月求片次数", 0, 10_000),
 )
 
 
@@ -81,11 +104,25 @@ class GroupService:
         must not resurrect on restart, so only an empty table is seeded.
         """
         if self._db.one("SELECT COUNT(*) AS n FROM groups")["n"]:
-            return 0
+            return self.ensure_whitelist()
         now = int(time.time())
         for spec in DEFAULT_GROUPS:
             self.create(dict(spec), now=now)
-        return len(DEFAULT_GROUPS)
+        return len(DEFAULT_GROUPS) + self.ensure_whitelist()
+
+    def ensure_whitelist(self) -> int:
+        """Guarantee the group /prouser promotes into. Idempotent.
+
+        Unlike the starter groups this one is re-created if missing, because a
+        command that names a specific group is not allowed to depend on the
+        operator never having tidied their group list. Deliberately does not
+        overwrite an existing row: if they renamed it or loosened its limits,
+        that is their decision.
+        """
+        if self.get(WHITELIST_GROUP_ID):
+            return 0
+        self.create(dict(WHITELIST_GROUP))
+        return 1
 
     # -- validation ----------------------------------------------------------
     @staticmethod
@@ -105,6 +142,11 @@ class GroupService:
         if mode not in BILLING_MODES:
             raise ConfigError(f"计费模式必须是 {'/'.join(BILLING_MODES)}")
 
+        # Absent means "the default allowance", not "unlimited": a form posted
+        # by a UI that predates this field must not silently uncap requests.
+        if src.get("request_quota") is None:
+            src["request_quota"] = DEFAULT_REQUEST_QUOTA
+
         out: dict[str, Any] = {
             "id": gid, "name": name,
             "description": str(src.get("description") or ""),
@@ -115,7 +157,7 @@ class GroupService:
         }
         for key, label, lo, hi in _INT_FIELDS:
             try:
-                val = int(src.get(key) or 0)
+                val = int(src.get(key) if src.get(key) is not None else 0)
             except (TypeError, ValueError) as exc:
                 raise ConfigError(f"{label} 必须是整数") from exc
             if not lo <= val <= hi:
@@ -160,14 +202,15 @@ class GroupService:
         self._db.execute(
             "INSERT INTO groups (id,name,description,billing_mode,duration_days,"
             "traffic_quota_bytes,bandwidth_limit_kbps,max_streams,max_devices,"
-            "allow_download,allow_transcode,is_default,created_at,updated_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "allow_download,allow_transcode,is_default,request_quota,"
+            "created_at,updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (group["id"], group["name"], group["description"],
              group["billing_mode"], group["duration_days"],
              group["traffic_quota_bytes"], group["bandwidth_limit_kbps"],
              group["max_streams"], group["max_devices"],
              group["allow_download"], group["allow_transcode"],
-             group["is_default"], now, now))
+             group["is_default"], group["request_quota"], now, now))
         return self.get(group["id"])  # type: ignore[return-value]
 
     def update(self, group_id: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -184,13 +227,13 @@ class GroupService:
             "UPDATE groups SET name=?,description=?,billing_mode=?,"
             "duration_days=?,traffic_quota_bytes=?,bandwidth_limit_kbps=?,"
             "max_streams=?,max_devices=?,allow_download=?,allow_transcode=?,"
-            "is_default=?,updated_at=? WHERE id=?",
+            "is_default=?,request_quota=?,updated_at=? WHERE id=?",
             (group["name"], group["description"], group["billing_mode"],
              group["duration_days"], group["traffic_quota_bytes"],
              group["bandwidth_limit_kbps"], group["max_streams"],
              group["max_devices"], group["allow_download"],
              group["allow_transcode"], group["is_default"],
-             int(time.time()), group_id))
+             group["request_quota"], int(time.time()), group_id))
         return self.get(group_id)  # type: ignore[return-value]
 
     def delete(self, group_id: str) -> bool:

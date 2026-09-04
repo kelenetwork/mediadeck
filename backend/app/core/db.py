@@ -42,6 +42,8 @@ CREATE TABLE IF NOT EXISTS groups (
     allow_download       INTEGER NOT NULL DEFAULT 0,
     allow_transcode      INTEGER NOT NULL DEFAULT 1,
     is_default           INTEGER NOT NULL DEFAULT 0,
+    -- Media requests allowed per calendar month. 0 = unlimited.
+    request_quota        INTEGER NOT NULL DEFAULT 3,
     created_at           INTEGER NOT NULL,
     updated_at           INTEGER NOT NULL
 );
@@ -220,6 +222,19 @@ CREATE TABLE IF NOT EXISTS media_requests (
 );
 CREATE INDEX IF NOT EXISTS idx_mreq_status ON media_requests(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_mreq_user ON media_requests(emby_user_id, created_at);
+
+-- One row per uploader who was told about a request, so the fan-out can be
+-- taken back. When somebody claims, every *other* uploader's message has to
+-- lose its button: without the message ids there is no way to reach them, and
+-- four people would each start hunting for the same title.
+CREATE TABLE IF NOT EXISTS request_notices (
+    request_id    INTEGER NOT NULL,
+    tg_user_id    TEXT NOT NULL,
+    message_id    INTEGER NOT NULL,
+    created_at    INTEGER NOT NULL,
+    PRIMARY KEY (request_id, tg_user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_mreq_notice ON request_notices(request_id);
 -- The same title requested twice while still open is one request, not two.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_mreq_open_title
     ON media_requests(tmdb_id, media_type) WHERE status IN ('open', 'claimed');
@@ -470,6 +485,16 @@ class Database:
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_members_inviter "
                 "ON members(inviter_id)")
+            # v0.21: monthly media-request allowance. Counted on the member
+            # rather than derived from media_requests because a request that
+            # was rejected still spent the slot -- deriving it would refund
+            # every refusal and make the cap unenforceable.
+            self._ensure_column(
+                "members", "request_used", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(
+                "members", "request_period", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(
+                "groups", "request_quota", "INTEGER NOT NULL DEFAULT 3")
             self._conn.commit()
 
     def _retire_legacy_redeem_codes(self) -> None:
