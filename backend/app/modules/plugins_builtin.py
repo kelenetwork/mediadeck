@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.modules.plugins import Field, Plugin, PluginRegistry, Spec
+from app.modules.plugins_points import POINTS_PLUGINS
 
 # How long a "we told you" note is kept before it is considered stale. Without
 # this the state document grows one entry per member forever, and a member who
@@ -52,6 +53,15 @@ class PluginContext:
     db: Any = None
     settings: Any = None
     store: Any = None
+    points: Any = None
+    shop: Any = None
+    # Node dispatcher, so a member can be shown where they will be served
+    # from and how busy it is.
+    scheduler: Any = None
+    # Set by register_builtin. A points plugin needs its own live config at
+    # the moment a member taps a button, which is not the config that was
+    # passed to the last scheduled run.
+    registry: Any = None
     # Fallback used when no settings store is available (tests, mock runs).
     _memory: dict[str, dict[str, Any]] = field(default_factory=dict)
 
@@ -472,11 +482,19 @@ BUILTIN_PLUGINS = (
     ViewingReportPlugin,
     RankingsPostPlugin,
     ExpiryReminderPlugin,
+    *POINTS_PLUGINS,
 )
 
 
 def register_builtin(registry: PluginRegistry, ctx: PluginContext) -> PluginRegistry:
-    """Register every shipped plugin. Called once at startup."""
+    """Register every shipped plugin. Called once at startup.
+
+    The registry is handed back to the context on the way through: points
+    plugins are invoked by the bot rather than by the scheduler, so they need
+    to read their own current config at that moment instead of being given a
+    snapshot from whenever the card was last saved.
+    """
+    ctx.registry = registry
     for cls in BUILTIN_PLUGINS:
         registry.register(cls(ctx))
     return registry

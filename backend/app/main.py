@@ -45,6 +45,7 @@ from app.modules.plugins_builtin import (
     migrate_legacy_telegram_jobs,
     register_builtin,
 )
+from app.modules.points import PointsService
 from app.modules.provisioning import (
     emby_frontend_snippet,
     enroll_command,
@@ -54,6 +55,7 @@ from app.modules.registration import RegistrationService
 from app.modules.scheduler import Scheduler
 from app.modules.settings import SettingsService
 from app.modules.sharing import SharingDetector
+from app.modules.shop import ShopError, ShopService
 from app.modules.signing import user_tag
 from app.modules.stats import StatsService
 from app.modules.storage import MockStorage, StorageManager
@@ -245,6 +247,12 @@ async def _startup() -> None:
     app.state.enforcement = EnforcementService(
         app.state.db, app.state.members, app.state.emby)
     app.state.stats = StatsService(app.state.db)
+    # Points are a ledger, so the service is a thin wrapper over the database
+    # and can be built as soon as it exists. The shop is what spends them.
+    app.state.points = PointsService(app.state.db)
+    app.state.shop = ShopService(app.state.db, app.state.members,
+                                 app.state.points)
+    app.state.shop.seed_defaults()
     # Rides along with the sampler: it already holds the only live view of who
     # is playing from where, so detection costs no extra Emby calls.
     app.state.sharing = SharingDetector(app.state.db)
@@ -349,6 +357,9 @@ async def _startup() -> None:
         db=app.state.db,
         settings=app.state.settings_service,
         store=store,
+        points=app.state.points,
+        shop=app.state.shop,
+        scheduler=app.state.scheduler,
     )
     # Carry the old loop's settings onto the new cards before the scheduler
     # starts, so an operator who had the ranking post switched on keeps it,
@@ -1170,8 +1181,14 @@ async def members_list(status: str | None = None, group_id: str | None = None,
     hours = {}
     with contextlib.suppress(Exception):
         hours = app.state.stats.hours_this_month()
+    # Same reasoning for balances: one GROUP BY for the page rather than a
+    # SUM per row.
+    balances = {}
+    with contextlib.suppress(Exception):
+        balances = app.state.points.balances()
     for member in members:
         member["watch_hours"] = hours.get(member["emby_user_id"], 0.0)
+        member["points"] = balances.get(member["emby_user_id"], 0)
     truncated = len(members) >= limit
     known = {m["emby_user_id"] for m in members}
     unmanaged: list[dict[str, Any]] = []
@@ -1237,6 +1254,8 @@ async def members_get(user_id: str, days: int = 30) -> dict[str, Any]:
         sessions = await app.state.emby.sessions_for_user(user_id)
     return {
         **detail,
+        "points": app.state.points.balance(user_id),
+        "points_ledger": app.state.points.ledger(user_id, 20),
         "usage": usage,
         "plays": plays,
         "series": series,
@@ -1988,6 +2007,88 @@ async def plugin_run(plugin_id: str, user: str = Depends(_auth)) -> dict[str, An
 @app.get("/api/plugins/{plugin_id}/history", dependencies=[Depends(_auth)])
 async def plugin_history(plugin_id: str, limit: int = 20) -> list[dict[str, Any]]:
     return _plugin_or_404(plugin_id).history(plugin_id, limit)
+
+
+# ---- points -----------------------------------------------------------------
+# The ledger is the product here: a balance with no rows behind it is a number
+# nobody can argue with, which is the wrong property for something members
+# earn and spend.
+@app.get("/api/points/top", dependencies=[Depends(_auth)])
+async def points_top(limit: int = 20) -> list[dict[str, Any]]:
+    return app.state.points.top(limit)
+
+
+@app.get("/api/points/{user_id}", dependencies=[Depends(_auth)])
+async def points_get(user_id: str, limit: int = 20) -> dict[str, Any]:
+    if app.state.members.get(user_id) is None:
+        raise HTTPException(404, "unknown member")
+    return {
+        "emby_user_id": user_id,
+        "balance": app.state.points.balance(user_id),
+        "ledger": app.state.points.ledger(user_id, limit),
+    }
+
+
+@app.post("/api/points/{user_id}/adjust", dependencies=[Depends(_auth)])
+async def points_adjust(user_id: str, payload: dict[str, Any] = Body(...),  # noqa: B008
+                        user: str = Depends(_auth)) -> dict[str, Any]:
+    """Operator credit or debit. Audited, because it creates value by hand."""
+    if app.state.members.get(user_id) is None:
+        raise HTTPException(404, "unknown member")
+    try:
+        delta = int(payload.get("delta"))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "delta 必须是整数") from None
+    reason = str(payload.get("reason") or "").strip()[:100]
+    try:
+        balance = app.state.points.add(
+            user_id, delta, "admin.adjust", ref=reason, actor=user)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
+    app.state.members.audit(user, "points.adjust", user_id,
+                            f"delta={delta} reason={reason}")
+    return {"emby_user_id": user_id, "balance": balance,
+            "ledger": app.state.points.ledger(user_id, 20)}
+
+
+# ---- shop -------------------------------------------------------------------
+@app.get("/api/shop/items", dependencies=[Depends(_auth)])
+async def shop_items(enabled_only: bool = False) -> list[dict[str, Any]]:
+    return app.state.shop.items(enabled_only=enabled_only)
+
+
+@app.post("/api/shop/items", dependencies=[Depends(_auth)])
+async def shop_item_create(payload: dict[str, Any] = Body(...),  # noqa: B008
+                           user: str = Depends(_auth)) -> dict[str, Any]:
+    try:
+        return app.state.shop.create(payload, actor=user)
+    except ShopError as exc:
+        raise HTTPException(400, str(exc)) from None
+
+
+@app.put("/api/shop/items/{item_id}", dependencies=[Depends(_auth)])
+async def shop_item_update(item_id: int, payload: dict[str, Any] = Body(...),  # noqa: B008
+                           user: str = Depends(_auth)) -> dict[str, Any]:
+    try:
+        return app.state.shop.update(item_id, payload, actor=user)
+    except KeyError:
+        raise HTTPException(404, "unknown item") from None
+    except ShopError as exc:
+        raise HTTPException(400, str(exc)) from None
+
+
+@app.delete("/api/shop/items/{item_id}", dependencies=[Depends(_auth)])
+async def shop_item_delete(item_id: int,
+                           user: str = Depends(_auth)) -> dict[str, Any]:
+    if not app.state.shop.delete(item_id, actor=user):
+        raise HTTPException(404, "unknown item")
+    return {"ok": True}
+
+
+@app.get("/api/shop/orders", dependencies=[Depends(_auth)])
+async def shop_orders(user_id: str | None = None,
+                      limit: int = 50) -> list[dict[str, Any]]:
+    return app.state.shop.orders(user_id=user_id, limit=limit)
 
 
 @app.get("/api/settings/membership", dependencies=[Depends(_auth)])
