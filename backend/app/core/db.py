@@ -140,6 +140,33 @@ CREATE TABLE IF NOT EXISTS sharing_findings (
 CREATE INDEX IF NOT EXISTS idx_sharing_detected ON sharing_findings(detected_at);
 CREATE INDEX IF NOT EXISTS idx_sharing_user ON sharing_findings(emby_user_id);
 
+-- Access rules for the playback edge. Country-level rules are deliberately
+-- absent: they need a GeoIP database this host does not carry, and a rule that
+-- silently matches nothing is worse than no rule at all.
+CREATE TABLE IF NOT EXISTS access_rules (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind        TEXT NOT NULL,
+    pattern     TEXT NOT NULL,
+    action      TEXT NOT NULL DEFAULT 'deny',
+    note        TEXT NOT NULL DEFAULT '',
+    enabled     INTEGER NOT NULL DEFAULT 1,
+    created_at  INTEGER NOT NULL
+);
+
+-- A refused request that leaves no trace is indistinguishable from a broken
+-- node, and the operator ends up debugging the wrong thing.
+CREATE TABLE IF NOT EXISTS access_blocks (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    username    TEXT NOT NULL DEFAULT '',
+    user_agent  TEXT NOT NULL DEFAULT '',
+    remote_ip   TEXT NOT NULL DEFAULT '',
+    reason      TEXT NOT NULL DEFAULT '',
+    rule_id     INTEGER,
+    item_id     TEXT NOT NULL DEFAULT '',
+    blocked_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_blocks_time ON access_blocks(blocked_at);
+
 -- Rolled up per user per day. Sampling writes here continuously, so it is kept
 -- narrow and indexed for the two questions actually asked: one user's history,
 -- and one day across all users.

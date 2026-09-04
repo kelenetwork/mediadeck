@@ -74,8 +74,33 @@ Newest entries first. Every working session appends one entry.
   module imported fine; it would only have raised the first time detection
   actually fired.
 
+**Also in this branch: access rules on the playback edge**
+- Two rule kinds, both evaluated against the request asking for media:
+  `client` (regex against User-Agent) and `network` (single address or CIDR,
+  v4 and v6).
+- **Country-level rules are deliberately absent.** They need a GeoIP database
+  this host does not carry, and a rule that silently matches nothing is worse
+  than no rule at all.
+- Fail-open throughout. An empty rule set, a stored pattern that no longer
+  compiles, a malformed address, an exception inside evaluation — every
+  uncertain outcome resolves to allow. The panel sits on the media path; if a
+  rule bug can deny playback it is worse than not being there.
+- Excluded users bypass every rule, so one bad regex typed at 3am cannot end
+  access for the person who would have to fix it.
+- An explicit `allow` wins over any `deny`, so one exception can be carved out
+  without rewriting the deny around it.
+- Patterns are validated at save time, where a person is present to read the
+  error, never at match time on the playback path.
+- Rules run *before* routing: a denied request never causes a node to be
+  selected or a signature to be minted.
+- Refusals are recorded with agent, address (port stripped) and matched rule.
+  A block that leaves no trace is indistinguishable from a broken node, and
+  the operator ends up debugging the wrong machine.
+
 **Next**
-- UA / region access rules.
+- Country rules once a GeoIP source exists.
+- Access-rule and sharing-finding UI pages.
+- Bind-code flow end to end against a live bot.
 
 ## 2026-09-05 — dashboard shows the library, not just counters
 **Done**

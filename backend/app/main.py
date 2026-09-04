@@ -29,6 +29,7 @@ from app.core.config import settings
 from app.core.db import Database
 from app.core.errors import ConfigError, ConflictError, NotConfigured, UpstreamError
 from app.core.store import SettingsStore
+from app.modules.access import AccessRules
 from app.modules.enforcement import EnforcementService
 from app.modules.events import EventStream, safe_stream
 from app.modules.groups import GroupService
@@ -240,6 +241,7 @@ async def _startup() -> None:
     # Rides along with the sampler: it already holds the only live view of who
     # is playing from where, so detection costs no extra Emby calls.
     app.state.sharing = SharingDetector(app.state.db)
+    app.state.access = AccessRules(app.state.db)
     app.state.usage = UsageSampler(
         app.state.db, app.state.members, app.state.emby, app.state.enforcement,
         sharing=app.state.sharing)
@@ -873,6 +875,25 @@ async def emby_video_stream(item_id: str, rest: str, request: Request) -> Redire
     Emby applies its own decision and the fail-open contract still holds.
     """
     query = dict(request.query_params)
+
+    # Access rules run before routing. They decide whether this caller may be
+    # handed a signed node URL at all; refusing here rather than after routing
+    # means a denied request never causes a node to be selected or a signature
+    # to be minted.
+    verdict = app.state.access.evaluate(
+        user_agent=request.headers.get("user-agent", ""),
+        remote_ip=request.client.host if request.client else "",
+    )
+    if not verdict["allowed"]:
+        with contextlib.suppress(Exception):
+            app.state.access.record_block(
+                username="",
+                user_agent=request.headers.get("user-agent", ""),
+                remote_ip=request.client.host if request.client else "",
+                reason=verdict["reason"], rule_id=verdict["rule_id"],
+                item_id=item_id)
+        raise HTTPException(403, "access denied by rule")
+
     # Preserve the exact incoming path: the fallback URL must point back at the
     # same Emby endpoint the client actually asked for, not a normalised guess.
     decision = await app.state.playback.route(
@@ -1280,6 +1301,56 @@ async def members_renew(user_id: str, payload: dict[str, Any] = Body(default={})
         with contextlib.suppress(Exception):
             await app.state.enforcement.enforce_now(user_id, "renewed")
     return member
+
+
+@app.get("/api/access/rules", dependencies=[Depends(_auth)])
+async def access_rules_list() -> list[dict[str, Any]]:
+    return app.state.access.list()
+
+
+@app.post("/api/access/rules", dependencies=[Depends(_auth)])
+async def access_rule_add(payload: dict[str, Any] = Body(...),  # noqa: B008
+                          user: str = Depends(_auth)) -> dict[str, Any]:
+    try:
+        created = app.state.access.add(
+            str(payload.get("kind") or ""),
+            str(payload.get("pattern") or ""),
+            str(payload.get("action") or "deny"),
+            str(payload.get("note") or ""),
+            bool(payload.get("enabled", True)))
+    except ValueError as exc:
+        # Validation happens at save time, where a person is present to read the
+        # error, rather than at match time on the playback path.
+        raise HTTPException(400, str(exc)) from None
+    app.state.members.audit(user, "access.rule.add", "",
+                            f"{created['kind']} {created['action']}")
+    return created
+
+
+@app.delete("/api/access/rules/{rule_id}", dependencies=[Depends(_auth)])
+async def access_rule_remove(rule_id: int, user: str = Depends(_auth)) -> dict[str, bool]:
+    if not app.state.access.remove(rule_id):
+        raise HTTPException(404, "rule not found")
+    app.state.members.audit(user, "access.rule.remove", str(rule_id), "")
+    return {"removed": True}
+
+
+@app.post("/api/access/rules/{rule_id}/enabled", dependencies=[Depends(_auth)])
+async def access_rule_toggle(rule_id: int, payload: dict[str, Any] = Body(...),  # noqa: B008
+                             user: str = Depends(_auth)) -> dict[str, bool]:
+    enabled = bool(payload.get("enabled", True))
+    if not app.state.access.set_enabled(rule_id, enabled):
+        raise HTTPException(404, "rule not found")
+    app.state.members.audit(user, "access.rule.toggle", str(rule_id),
+                            f"enabled={enabled}")
+    return {"enabled": enabled}
+
+
+@app.get("/api/access/blocks", dependencies=[Depends(_auth)])
+async def access_blocks(limit: int = 100) -> list[dict[str, Any]]:
+    """Refused requests. A block that leaves no trace is indistinguishable
+    from a broken node, and the operator debugs the wrong thing."""
+    return app.state.access.blocks(limit)
 
 
 @app.get("/api/sharing", dependencies=[Depends(_auth)])
