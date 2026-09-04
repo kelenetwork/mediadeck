@@ -4,6 +4,28 @@ Newest entries first. Every working session appends one entry.
 
 ---
 
+## 2026-09-05 — dispatch follows the wire, and hot titles spread
+**Done**
+- `StreamNode.bandwidth_mbps`: a node's real link ceiling, headroom already
+  deducted. `0` keeps the previous stream-count-only behaviour.
+- `NodeState.utilisation()` now takes the worse of stream-count load and
+  egress-against-ceiling. Ten streams on a 48-capacity node read as 21% while
+  five direct-play 4K clients had already filled a 1 Gbit pipe; the wire now
+  gets a vote.
+- `Scheduler.SPREAD_MARGIN` (0.15): affinity still pins a title to a node for
+  cache locality, but once the preferred node is measurably busier than the
+  quietest peer the request goes to the quiet one. Without this a popular
+  title collected every viewer on one machine while peers idled.
+- New `reason` value `affinity-spread` so the dispatch log says why.
+- `tests/test_dispatch_bandwidth.py`: saturated link reads busy, light streams
+  are not talked down, nodes without a ceiling are unchanged, hot titles move,
+  cold titles stay put under jitter, a fully saturated fleet still answers.
+
+**Next**
+- Expose `bandwidth_mbps` in the node editor UI (currently settings.json only).
+- Consider deriving the ceiling from a periodic measurement instead of a
+  hand-entered number.
+
 ## 2026-08-30 — per-user rate cap actually holds (panel MB/s + node nginx)
 **Done**
 - Panel bandwidth field is MB/s, matching the live speed column. Stored

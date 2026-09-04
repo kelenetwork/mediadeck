@@ -51,6 +51,11 @@ class StreamNode(BaseModel):
     base_url: str          # public URL clients are redirected to
     probe_url: str         # internal /load probe endpoint
     capacity: float = 100  # max concurrent streams this node can serve
+    # Real link ceiling in Mbps, with headroom already deducted. Stream count
+    # is a poor proxy for load: twenty 3 Mbit streams are lighter than five
+    # direct-play 4K ones, and the wire saturates long before any stream count
+    # does. 0 = unknown, which keeps the older stream-count-only behaviour.
+    bandwidth_mbps: float = 0
     enabled: bool = True
 
     # -- delivery (per node) -------------------------------------------------
