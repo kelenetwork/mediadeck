@@ -1092,8 +1092,7 @@ PAGES.tgbot = async () => {
         tg.register_days ? `赠送 ${tg.register_days} 天` : '不限期')}
       ${stat('☺', tg.max_users ? `上限 ${tg.max_users}` : '不限', '名额',
         tg.require_group ? `需加入 ${tg.require_group}` : '无群组要求')}
-      ${stat('🏆', tg.rankings_enabled ? `每天 ${tg.rankings_hour}:00` : '关闭', '排行推送',
-        tg.rankings_chat || '未设置目标')}
+      ${stat('⚡', '任务中心', '定时推送', '排行与到期提醒已迁至自动化')}
     </div>
     ${card('机器人对接', 'Token 仅保存在服务端，不会回传浏览器',
       `<div class="card-body">
@@ -1130,26 +1129,20 @@ PAGES.tgbot = async () => {
           <span class="muted">留空则不限制</span></div>
         <div class="toolbar"><button class="btn primary" id="tg-save2">保存</button></div>
       </div>`)}
-    ${card('通知与排行', '到期提醒发给已关联成员；排行发到指定群组',
+    ${card('通知与排行', '这两件事现在是定时任务',
       `<div class="card-body">
-        <div class="form-row"><label>到期提醒</label>
-          <input id="tg-notify" type="checkbox" ${tg.notify_expiring ? 'checked' : ''}></div>
-        <div class="form-row"><label>提前天数</label>
-          <input id="tg-days" type="number" min="1" max="30" value="${esc(tg.notify_expiring_days)}" style="width:100px"></div>
-        <div class="form-row"><label>排行推送</label>
-          <input id="tg-rank" type="checkbox" ${tg.rankings_enabled ? 'checked' : ''}></div>
-        <div class="form-row"><label>推送目标</label>
-          <input id="tg-rankchat" value="${esc(tg.rankings_chat || '')}" placeholder="@channel 或 -100xxxxxxxxx"></div>
-        <div class="form-row"><label>推送时间</label>
-          <input id="tg-rankhour" type="number" min="0" max="23" value="${esc(tg.rankings_hour)}" style="width:100px">
-          <span class="muted">点（0–23）</span></div>
-        <div class="toolbar">
-          <button class="btn" id="tg-sendrank">立即发送一次</button>
-          <button class="btn primary" id="tg-save3">保存</button>
+        <div class="muted" style="line-height:1.6">
+          <b>到期提醒</b>与<b>排行推送</b>已迁至「自动化 → 任务中心」，
+          在那里配置目标群组、时间和开关。
+          放在两个页面各有一个开关，先后保存会互相覆盖，也会让同一条消息发两遍。
+        </div>
+        <div class="toolbar" style="margin-top:12px">
+          <button class="btn" onclick="go('automation')">前往任务中心</button>
+          <button class="btn" id="tg-sendrank">立即发送一次排行</button>
           <span id="tg-rankresult" class="muted"></span>
         </div>
       </div>`)}`;
-  ['tg-save', 'tg-save2', 'tg-save3'].forEach((id) => {
+  ['tg-save', 'tg-save2'].forEach((id) => {
     if ($('#' + id)) $('#' + id).onclick = saveTelegramPage;
   });
   $('#tg-test').onclick = testTelegramPage;
@@ -1175,11 +1168,6 @@ function telegramPagePayload() {
     max_users: num('tg-max', 0),
     default_group_id: str('tg-group'),
     require_group: str('tg-reqgroup'),
-    notify_expiring: flag('tg-notify'),
-    notify_expiring_days: num('tg-days', 3),
-    rankings_enabled: flag('tg-rank'),
-    rankings_chat: str('tg-rankchat'),
-    rankings_hour: num('tg-rankhour', 21),
   };
 }
 async function saveTelegramPage() {
@@ -1196,12 +1184,25 @@ async function testTelegramPage() {
   try {
     // Save first: verification asks Telegram who the bot is, which needs the
     // credential already stored rather than sent along for inspection.
+    const payload = telegramPagePayload();
     await api('/api/settings/telegram', {
-      method: 'POST', body: JSON.stringify(telegramPagePayload()) });
+      method: 'POST', body: JSON.stringify(payload) });
     const r = await api('/api/settings/telegram/verify', { method: 'POST' });
-    el.innerHTML = r.ok
-      ? `<span class="tag ok">连接成功</span> @${esc(r.username || '')}`
-      : `<span class="tag bad">连接失败</span> ${esc(r.error || '')}`;
+    if (!r.ok) {
+      el.innerHTML = `<span class="tag bad">连接失败</span> ${esc(r.error || '')}`;
+      return;
+    }
+    el.innerHTML = `<span class="tag ok">连接成功</span> @${esc(r.username || '')}`;
+    // A successful test with the switch still off is the trap: the operator
+    // reads "连接成功" as "the bot is running" and walks away, while nothing
+    // is polling. Verification proves the credential works, so switch it on
+    // and say so rather than leaving a working bot stopped.
+    if (!payload.enabled) {
+      await api('/api/settings/telegram', {
+        method: 'POST', body: JSON.stringify({ ...payload, enabled: true }) });
+      toast('已自动启用机器人');
+      renderPage('tgbot', true);
+    }
   } catch (e) {
     el.innerHTML = `<span class="tag bad">连接失败</span> ${esc(e.message)}`;
   }
@@ -1289,3 +1290,345 @@ async function runGroupAudit() {
     st.innerHTML = `<span class="tag bad">核查失败</span> ${esc(e.message)}`;
   }
 }
+
+/* ---------- 自动化 ----------
+   Every scheduled job is a plugin, and this page is generated from what the
+   backend declares rather than hand-written per feature: a card, its form, its
+   schedule line and its last result all come from the same payload. Adding a
+   job to the panel means adding a file on the server, not editing this file. */
+
+const automation = { category: 'task', open: {}, busy: {} };
+
+const PLUGIN_CATEGORIES = [
+  { id: 'task', label: '任务' },
+  { id: 'points', label: '积分' },
+];
+
+PAGES.automation = async () => {
+  $('#view').innerHTML = pageLoading();
+  const cards = await api(`/api/plugins?category=${encodeURIComponent(automation.category)}`)
+    .catch(() => null);
+  if (!cards) { $('#view').innerHTML = pageError('无法读取任务列表'); return; }
+
+  const tabs = PLUGIN_CATEGORIES.map((c) =>
+    `<button class="btn ${c.id === automation.category ? 'primary' : ''}"
+       onclick="switchPluginCategory('${c.id}')">${esc(c.label)}</button>`).join('');
+
+  const body = automation.category === 'points'
+    ? `<div class="card"><div class="empty">
+         积分功能将在 PR-3 接入。届时签到、兑换等都会作为插件出现在这里，
+         和任务共用同一套开关、配置与运行记录。
+       </div></div>`
+    : (cards.length
+      ? `<div class="plugin-grid">${cards.map(pluginCard).join('')}</div>`
+      : '<div class="card"><div class="empty">还没有已注册的任务</div></div>');
+
+  $('#view').innerHTML = `
+    <div class="help">
+      定时任务在这里统一开关和配置。<b>「立即运行」不看开关</b>：先试一次再决定要不要常开。
+      任何一个任务出错都只影响它自己的卡片，不会影响其他任务。
+    </div>
+    <div class="toolbar" style="margin-bottom:14px">${tabs}</div>
+    ${body}`;
+
+  cards.forEach(bindPluginCard);
+};
+
+function switchPluginCategory(id) {
+  automation.category = id;
+  renderPage('automation');
+}
+
+function pluginScheduleText(c) {
+  if (c.hour !== null && c.hour !== undefined) {
+    const hour = (c.config && c.config.hour !== undefined) ? c.config.hour : c.hour;
+    return `每天 ${esc(String(hour))}:00`;
+  }
+  if (c.interval > 0) return `每 ${fmtAge(c.interval)}`;
+  return '仅手动';
+}
+
+function pluginField(pid, f, value) {
+  const id = `pl-${pid}-${f.key}`;
+  const v = value === undefined ? f.default : value;
+  let input;
+  if (f.kind === 'bool') {
+    input = `<input id="${id}" type="checkbox" ${v ? 'checked' : ''}>`;
+  } else if (f.kind === 'int') {
+    const min = f.min === undefined ? '' : ` min="${esc(f.min)}"`;
+    const max = f.max === undefined ? '' : ` max="${esc(f.max)}"`;
+    input = `<input id="${id}" type="number"${min}${max} value="${esc(v)}" style="width:110px">`;
+  } else if (f.kind === 'select') {
+    input = `<select id="${id}">${(f.options || []).map((o) =>
+      `<option value="${esc(o.value)}" ${o.value === v ? 'selected' : ''}>${esc(o.label)}</option>`
+    ).join('')}</select>`;
+  } else if (f.kind === 'text') {
+    input = `<textarea id="${id}" rows="3" style="flex:1;min-width:240px">${esc(v)}</textarea>`;
+  } else {
+    input = `<input id="${id}" value="${esc(v)}" style="flex:1;min-width:200px">`;
+  }
+  return `<div class="form-row">
+    <label>${esc(f.label)}</label>${input}
+    ${f.help ? `<span class="muted">${esc(f.help)}</span>` : ''}
+  </div>`;
+}
+
+/* A result the operator can check: when it ran, whether it worked, what it did
+   and how long it took. A job reporting nothing is indistinguishable from a job
+   that never ran, which is the failure mode that goes unnoticed for weeks. */
+function pluginLastRun(c) {
+  const last = c.last_run;
+  if (!last) return '<div class="muted">尚未运行过</div>';
+  const summary = last.summary || {};
+  const kv = Object.keys(summary).map((k) =>
+    `<span class="kv"><b>${esc(k)}</b>${esc(String(summary[k]))}</span>`).join('');
+  return `<div class="plugin-last">
+    <div>
+      ${last.ok ? '<span class="tag ok">成功</span>' : '<span class="tag bad">失败</span>'}
+      <span class="muted">${esc(fmtAgeTs(last.started_at))} ·
+        ${esc(last.trigger === 'manual' ? '手动' : '定时')} ·
+        ${esc(Math.round(Number(last.duration_ms || 0)))} ms</span>
+    </div>
+    ${kv ? `<div class="kv-row">${kv}</div>` : ''}
+  </div>`;
+}
+
+function pluginCard(c) {
+  const busy = automation.busy[c.id];
+  const open = automation.open[c.id];
+  return `<div class="card plugin-card" data-plugin="${esc(c.id)}">
+    <div class="card-head">
+      <div style="display:flex;gap:10px;align-items:flex-start">
+        <div class="ic-box">${c.icon || '⚙'}</div>
+        <div>
+          <h3>${esc(c.name)}</h3>
+          <div class="sub">${esc(pluginScheduleText(c))}</div>
+        </div>
+      </div>
+      <label class="plugin-switch">
+        <input id="pl-${esc(c.id)}-enabled" type="checkbox" ${c.enabled ? 'checked' : ''}>
+        <span class="muted">${c.enabled ? '已启用' : '已停用'}</span>
+      </label>
+    </div>
+    <div class="card-body">
+      <div class="muted" style="line-height:1.6;margin-bottom:12px">${esc(c.description)}</div>
+      ${(c.fields || []).map((f) => pluginField(c.id, f, (c.config || {})[f.key])).join('')}
+      <div class="toolbar" style="margin-top:12px">
+        <button class="btn primary" data-act="save" ${busy ? 'disabled' : ''}>保存</button>
+        <button class="btn" data-act="run" ${busy ? 'disabled' : ''}>
+          ${busy ? '运行中…' : '立即运行'}</button>
+        <button class="btn sm" data-act="history">${open ? '收起历史' : '历史'}</button>
+      </div>
+      <div style="margin-top:12px">${pluginLastRun(c)}</div>
+      <div class="plugin-history" data-history="${esc(c.id)}">
+        ${open ? '<div class="muted">读取中…</div>' : ''}
+      </div>
+    </div>
+  </div>`;
+}
+
+function pluginCardEl(pid) {
+  return document.querySelector(`.plugin-card[data-plugin="${pid}"]`);
+}
+
+function bindPluginCard(c) {
+  const el = pluginCardEl(c.id);
+  if (!el) return;
+  el.querySelector('[data-act="save"]').onclick = () => savePlugin(c);
+  el.querySelector('[data-act="run"]').onclick = () => runPlugin(c);
+  el.querySelector('[data-act="history"]').onclick = () => togglePluginHistory(c);
+  if (automation.open[c.id]) loadPluginHistory(c.id);
+}
+
+function pluginPayload(c) {
+  const config = {};
+  (c.fields || []).forEach((f) => {
+    const el = $(`#pl-${c.id}-${f.key}`);
+    if (!el) return;
+    config[f.key] = f.kind === 'bool' ? el.checked : el.value;
+  });
+  const sw = $(`#pl-${c.id}-enabled`);
+  return { enabled: sw ? sw.checked : c.enabled, config };
+}
+
+async function savePlugin(c) {
+  try {
+    await api(`/api/plugins/${encodeURIComponent(c.id)}`, {
+      method: 'POST', body: JSON.stringify(pluginPayload(c)) });
+    toast('已保存');
+    renderPage('automation');
+  } catch (e) { toast('保存失败: ' + e.message, 1); }
+}
+
+async function runPlugin(c) {
+  // Save first: running with what is on screen rather than what was last
+  // stored is what the operator means by "试一次".
+  automation.busy[c.id] = true;
+  renderPage('automation');
+  try {
+    await api(`/api/plugins/${encodeURIComponent(c.id)}`, {
+      method: 'POST', body: JSON.stringify(pluginPayload(c)) });
+    const r = await api(`/api/plugins/${encodeURIComponent(c.id)}/run`, { method: 'POST' });
+    toast(r.ok ? '运行完成' : ('运行失败: ' + (r.error || '见卡片结果')), !r.ok);
+  } catch (e) {
+    toast('运行失败: ' + e.message, 1);
+  } finally {
+    automation.busy[c.id] = false;
+    renderPage('automation');
+  }
+}
+
+function togglePluginHistory(c) {
+  automation.open[c.id] = !automation.open[c.id];
+  renderPage('automation');
+}
+
+async function loadPluginHistory(pid) {
+  const box = document.querySelector(`[data-history="${pid}"]`);
+  if (!box) return;
+  try {
+    const rows = await api(`/api/plugins/${encodeURIComponent(pid)}/history?limit=10`);
+    box.innerHTML = rows.length
+      ? `<table><thead><tr><th>时间</th><th>结果</th><th>触发</th><th>耗时</th><th>摘要</th></tr></thead>
+         <tbody>${rows.map((r) => `<tr>
+           <td>${esc(fmtAgeTs(r.started_at))}</td>
+           <td>${r.ok ? '<span class="tag ok">成功</span>' : '<span class="tag bad">失败</span>'}</td>
+           <td>${esc(r.trigger === 'manual' ? '手动' : '定时')}</td>
+           <td>${esc(Math.round(Number(r.duration_ms || 0)))} ms</td>
+           <td class="muted">${esc(JSON.stringify(r.summary || {}))}</td>
+         </tr>`).join('')}</tbody></table>`
+      : '<div class="empty">还没有运行记录</div>';
+  } catch (e) {
+    box.innerHTML = `<div class="muted">历史读取失败：${esc(e.message)}</div>`;
+  }
+}
+
+/* ---------- 安全 ----------
+   Two pages that share one principle: the panel sits on the media path, so it
+   reports far more readily than it acts. Access rules are the one place it does
+   refuse, which is why the block log is shown right next to them -- a refusal
+   that leaves no trace is indistinguishable from a broken node. */
+
+PAGES.access = async () => {
+  $('#view').innerHTML = pageLoading();
+  const [rules, blocks] = await Promise.all([
+    api('/api/access/rules').catch(() => null),
+    api('/api/access/blocks?limit=100').catch(() => []),
+  ]);
+  if (!rules) { $('#view').innerHTML = pageError('无法读取访问规则'); return; }
+
+  const dayAgo = (Date.now() / 1000) - 86400;
+  const todayBlocks = blocks.filter((b) => Number(b.blocked_at || 0) >= dayAgo).length;
+  const kindLabel = (k) => (k === 'network' ? '网段' : '客户端');
+
+  $('#view').innerHTML = `
+    <div class="help">
+      规则只在播放请求上生效。<b>出错一律放行</b>：面板挡在播放链路上，
+      写错一条正则不能让所有人看不了片。被拒的请求都会记录在下面。
+    </div>
+    <div class="stat-grid">
+      ${stat('🛡', rules.length, '规则数', `${rules.filter((r) => r.enabled).length} 条已启用`)}
+      ${stat('⛔', todayBlocks, '今日拦截', `累计 ${blocks.length} 条记录`)}
+    </div>
+    ${card('新增规则', '客户端按 User-Agent 正则匹配；网段填单个地址或 CIDR',
+      `<div class="card-body">
+        <div class="form-row"><label>类型</label>
+          <select id="ac-kind">
+            <option value="client">客户端（User-Agent）</option>
+            <option value="network">网段（IP / CIDR）</option>
+          </select></div>
+        <div class="form-row"><label>内容</label>
+          <input id="ac-pattern" placeholder="例如 curl|wget 或 203.0.113.0/24"></div>
+        <div class="form-row"><label>动作</label>
+          <select id="ac-action">
+            <option value="deny">拒绝</option>
+            <option value="allow">放行</option>
+          </select>
+          <span class="muted">放行规则优先于拒绝，用来给例外开口子</span></div>
+        <div class="form-row"><label>备注</label>
+          <input id="ac-note" placeholder="写清楚为什么加这条，几个月后你会需要"></div>
+        <div class="toolbar"><button class="btn primary" id="ac-add">添加规则</button></div>
+      </div>`)}
+    ${tableCard('规则列表', `${rules.length} 条`,
+      ['类型', '内容', '动作', '备注', '启用', ''],
+      rules.map((r) => `<tr>
+        <td><span class="tag idle">${esc(kindLabel(r.kind))}</span></td>
+        <td><code>${esc(r.pattern)}</code></td>
+        <td>${r.action === 'deny'
+          ? '<span class="tag bad">拒绝</span>' : '<span class="tag ok">放行</span>'}</td>
+        <td class="muted">${esc(r.note || '-')}</td>
+        <td><input type="checkbox" ${r.enabled ? 'checked' : ''}
+          onchange="toggleAccessRule(${r.id}, this.checked)"></td>
+        <td class="row-actions">
+          <button class="btn sm danger" onclick="deleteAccessRule(${r.id})">删除</button>
+        </td></tr>`).join(''))}
+    ${tableCard('拦截记录', '最近 100 条', ['时间', '用户', '客户端', '地址', '命中规则'],
+      blocks.map((b) => `<tr>
+        <td>${esc(fmtAgeTs(b.blocked_at))}</td>
+        <td>${esc(b.username || '-')}</td>
+        <td class="muted" title="${esc(b.user_agent || '')}">${esc((b.user_agent || '-').slice(0, 60))}</td>
+        <td>${esc(b.remote_ip || '-')}</td>
+        <td class="muted">${esc(b.reason || '')}${b.rule_id ? ` (#${esc(b.rule_id)})` : ''}</td>
+      </tr>`).join(''))}`;
+  $('#ac-add').onclick = addAccessRule;
+};
+
+async function addAccessRule() {
+  const pattern = $('#ac-pattern').value.trim();
+  if (!pattern) { toast('请填写规则内容', 1); return; }
+  try {
+    await api('/api/access/rules', { method: 'POST', body: JSON.stringify({
+      kind: $('#ac-kind').value, pattern, action: $('#ac-action').value,
+      note: $('#ac-note').value.trim(), enabled: true }) });
+    toast('规则已添加');
+    renderPage('access', true);
+  } catch (e) {
+    // A bad regex or netmask comes back as a 400 with the reason; showing it
+    // verbatim is the difference between fixing it and guessing.
+    toast('添加失败: ' + e.message, 1);
+  }
+}
+
+async function toggleAccessRule(id, enabled) {
+  try {
+    await api(`/api/access/rules/${id}/enabled`, {
+      method: 'POST', body: JSON.stringify({ enabled }) });
+    toast(enabled ? '规则已启用' : '规则已停用');
+    renderPage('access');
+  } catch (e) { toast('操作失败: ' + e.message, 1); }
+}
+
+async function deleteAccessRule(id) {
+  if (!confirm('删除这条规则？')) return;
+  try {
+    await api(`/api/access/rules/${id}`, { method: 'DELETE' });
+    toast('规则已删除');
+    renderPage('access', true);
+  } catch (e) { toast('删除失败: ' + e.message, 1); }
+}
+
+PAGES.sharing = async () => {
+  $('#view').innerHTML = pageLoading();
+  const data = await api('/api/sharing?limit=50').catch(() => null);
+  if (!data) { $('#view').innerHTML = pageError('无法读取共享检测结果'); return; }
+  const st = data.status || {};
+  const items = data.items || [];
+  $('#view').innerHTML = `
+    <div class="help">
+      同一账号同时在多个网络播放时会记在这里。<b>只记录不处理</b>：
+      一家人有电视和手机，手机从 Wi-Fi 切到流量也会算成两个网络，
+      按这个自动封号会误伤付费用户。判断留给人。
+    </div>
+    <div class="stat-grid">
+      ${stat('👥', st.tracked_accounts || 0, '追踪账号', '当前有播放活动的账号')}
+      ${stat('⚠', st.multi_network_now || 0, '多地播放', '此刻同时在多个网络')}
+      ${stat('☰', items.length, '历史发现', `网络需持续 ${fmtAge(st.min_network_seconds || 0)}才计入`)}
+    </div>
+    ${tableCard('发现记录', '最近 50 条', ['时间', '用户', '网络数', '网络列表'],
+      items.map((it) => `<tr>
+        <td>${esc(fmtAgeTs(it.detected_at))}</td>
+        <td>${esc(it.username || it.emby_user_id || '-')}</td>
+        <td><span class="tag warn">${esc(it.network_count)}</span></td>
+        <td class="muted">${(it.networks || []).map((n) => esc(n)).join(' · ')}</td>
+      </tr>`).join(''))}`;
+};

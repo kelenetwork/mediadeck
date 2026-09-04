@@ -19,7 +19,9 @@ Four properties are load-bearing and each is pinned from both sides:
 from __future__ import annotations
 
 import asyncio
+import re
 import time
+from pathlib import Path as FilePath
 from typing import Any
 
 import pytest
@@ -863,3 +865,65 @@ def test_history_is_empty_before_anything_has_run() -> None:
     with TestClient(app) as client:
         assert client.get("/api/plugins/viewing_report/history",
                           auth=ADMIN).json() == []
+
+
+# ---------------------------------------------------------------------------
+# front end wiring
+# ---------------------------------------------------------------------------
+# The nav is a hand-maintained list and the pages are a hand-maintained map.
+# When they drift, the entry still renders and clicking it says 页面不存在 --
+# which looks like a broken deployment rather than a missing line of code.
+_STATIC = FilePath(__file__).resolve().parents[1] / "app" / "static"
+
+
+def _panel_source() -> str:
+    return ((_STATIC / "app.js").read_text(encoding="utf-8")
+            + (_STATIC / "ops.js").read_text(encoding="utf-8"))
+
+
+def _nav_ids() -> list[str]:
+    app_js = (_STATIC / "app.js").read_text(encoding="utf-8")
+    nav = app_js.split("const NAV = [", 1)[1].split("\n];", 1)[0]
+    # Capture to the closing quote, not a character class: a class that stops
+    # early matches a *prefix* of the id, so a renamed page would still find
+    # the old handler and the check would pass while the nav is broken.
+    return re.findall(r"\{\s*id:\s*'([^']+)'", nav)
+
+
+def test_every_nav_entry_has_a_page_that_renders_it() -> None:
+    source = _panel_source()
+    missing = [nid for nid in _nav_ids() if f"PAGES.{nid} =" not in source]
+    assert not missing, f"nav entries without a PAGES handler: {missing}"
+
+
+def test_the_new_sections_are_actually_in_the_nav() -> None:
+    ids = _nav_ids()
+    for expected in ("automation", "access", "sharing"):
+        assert expected in ids, expected
+
+
+def test_only_one_telegram_form_owns_the_credential_field() -> None:
+    """Two forms saving the same settings overwrite each other's values.
+
+    The settings page used to carry a second copy of the bot form; whichever
+    page was saved last won, silently reverting the other.
+    """
+    app_js = (_STATIC / "app.js").read_text(encoding="utf-8")
+    assert "id=\"tg-token\"" not in app_js
+    assert "telegramPayload" not in app_js
+    ops_js = (_STATIC / "ops.js").read_text(encoding="utf-8")
+    assert ops_js.count("id=\"tg-token\"") == 1
+
+
+def test_the_bot_is_switched_on_after_a_successful_test() -> None:
+    """Owner hit 测试连接, saw 连接成功, and assumed the bot was running."""
+    ops_js = (_STATIC / "ops.js").read_text(encoding="utf-8")
+    verify = ops_js.split("async function testTelegramPage", 1)[1].split("\n}", 1)[0]
+    assert "enabled: true" in verify
+    assert "已自动启用机器人" in verify
+
+
+def test_the_migrated_scheduling_fields_are_gone_from_the_bot_page() -> None:
+    ops_js = (_STATIC / "ops.js").read_text(encoding="utf-8")
+    for gone in ("tg-rankchat", "tg-rankhour", "tg-rank\"", "tg-notify", "tg-days"):
+        assert gone not in ops_js, gone
