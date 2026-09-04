@@ -48,8 +48,33 @@ Newest entries first. Every working session appends one entry.
 - Telegram column shows who can actually be reached, with per-member
   bind-code and unbind buttons.
 
+**Also in this branch: shared-account detection**
+- `SharingDetector` rides along with the usage sampler, which already holds the
+  only live view of who is playing from where, so detection costs no extra
+  Emby calls.
+- The signal is *distinct networks playing simultaneously*, not session count.
+  Finding concurrent sessions is easy; the value is in not crying wolf, because
+  an operator who stops reading alerts is worse off than one with none:
+  - sessions from one address are one place, however many devices
+  - addresses inside a /24 (or /48 for v6) are one place too, so a household
+    behind NAT or a dual-stack router is not split into several
+  - a network must hold playback for 90s before it counts, so a wifi-to-mobile
+    handover that briefly overlaps the old session does not register
+  - a network that stops playing is forgotten, so moving house does not
+    accumulate places forever
+- One finding per account per hour. Repeating the same alert every 15s tick
+  would bury the real ones.
+- Findings are recorded for a person to judge. Nothing is suspended
+  automatically: the cost of being wrong is locking out a paying member over a
+  VPN reconnect. A test asserts the class exposes no suspend/block/kick path.
+- Fixed while testing: `_last_reported` defaulted to `0.0`, which conflates
+  "never reported" with "reported at the epoch". It only worked because a real
+  clock is a large number.
+- Also fixed: `usage.py` used `contextlib.suppress` without importing it. The
+  module imported fine; it would only have raised the first time detection
+  actually fired.
+
 **Next**
-- Shared-account detection: same account playing from several places at once.
 - UA / region access rules.
 
 ## 2026-09-05 — dashboard shows the library, not just counters

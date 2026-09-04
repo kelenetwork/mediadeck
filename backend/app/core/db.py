@@ -125,6 +125,21 @@ CREATE TABLE IF NOT EXISTS devices (
 CREATE INDEX IF NOT EXISTS idx_devices_user ON devices(emby_user_id);
 CREATE INDEX IF NOT EXISTS idx_devices_seen ON devices(last_seen_at);
 
+-- Account-sharing findings. Recorded for a person to judge, never acted on
+-- automatically: the cost of being wrong is locking out a paying member over a
+-- VPN reconnect, and that call is not the panel's to make.
+CREATE TABLE IF NOT EXISTS sharing_findings (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    emby_user_id  TEXT NOT NULL,
+    username      TEXT NOT NULL DEFAULT '',
+    networks      TEXT NOT NULL DEFAULT '',
+    network_count INTEGER NOT NULL DEFAULT 0,
+    detected_at   INTEGER NOT NULL,
+    reviewed      INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_sharing_detected ON sharing_findings(detected_at);
+CREATE INDEX IF NOT EXISTS idx_sharing_user ON sharing_findings(emby_user_id);
+
 -- Rolled up per user per day. Sampling writes here continuously, so it is kept
 -- narrow and indexed for the two questions actually asked: one user's history,
 -- and one day across all users.

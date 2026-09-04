@@ -45,6 +45,7 @@ from app.modules.provisioning import (
 )
 from app.modules.scheduler import Scheduler
 from app.modules.settings import SettingsService
+from app.modules.sharing import SharingDetector
 from app.modules.signing import user_tag
 from app.modules.stats import StatsService
 from app.modules.storage import MockStorage, StorageManager
@@ -236,8 +237,12 @@ async def _startup() -> None:
     app.state.enforcement = EnforcementService(
         app.state.db, app.state.members, app.state.emby)
     app.state.stats = StatsService(app.state.db)
+    # Rides along with the sampler: it already holds the only live view of who
+    # is playing from where, so detection costs no extra Emby calls.
+    app.state.sharing = SharingDetector(app.state.db)
     app.state.usage = UsageSampler(
-        app.state.db, app.state.members, app.state.emby, app.state.enforcement)
+        app.state.db, app.state.members, app.state.emby, app.state.enforcement,
+        sharing=app.state.sharing)
 
     image_cfg = app.state.settings_service.image_cache_config()
     app.state.images = ImageCache(
@@ -1275,6 +1280,19 @@ async def members_renew(user_id: str, payload: dict[str, Any] = Body(default={})
         with contextlib.suppress(Exception):
             await app.state.enforcement.enforce_now(user_id, "renewed")
     return member
+
+
+@app.get("/api/sharing", dependencies=[Depends(_auth)])
+async def sharing_findings(limit: int = 50) -> dict[str, Any]:
+    """Accounts seen playing from more than one network at once.
+
+    Reported, never acted on: the cost of being wrong is locking out a paying
+    member over a VPN reconnect, so the judgement stays with a person.
+    """
+    return {
+        "items": app.state.sharing.recent(limit),
+        "status": app.state.sharing.status(),
+    }
 
 
 @app.post("/api/members/bulk", dependencies=[Depends(_auth)])

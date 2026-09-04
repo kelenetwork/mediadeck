@@ -32,6 +32,7 @@ readers, because writes go through the shared SQLite connection lock.
 """
 from __future__ import annotations
 
+import contextlib
 import time
 from datetime import UTC, datetime
 from typing import Any
@@ -86,11 +87,15 @@ class UsageSampler:
     """Stateful sampler. One instance, ticked on a timer."""
 
     def __init__(self, db: Database, members: MemberService, emby: Any,
-                 enforcement: Any = None) -> None:
+                 enforcement: Any = None, sharing: Any = None) -> None:
         self._db = db
         self._members = members
         self._emby = emby
         self._enforcement = enforcement
+        # Optional: the sampler already holds the only live view of who is
+        # playing from where, so sharing detection rides along rather than
+        # polling Emby a second time for the same answer.
+        self._sharing = sharing
         # session id -> tracking state, held in memory only: losing it on
         # restart costs at most one sample interval of accuracy.
         self._live: dict[str, dict[str, Any]] = {}
@@ -205,6 +210,20 @@ class UsageSampler:
         if billed_users:
             self._commit(billed_users, now)
 
+        sharing_found = 0
+        if self._sharing is not None:
+            # Only sessions actually playing count: an idle client parked on a
+            # second network is not a second viewer. Detection must never be
+            # able to abort a billing tick, so failures are swallowed here.
+            with contextlib.suppress(Exception):
+                findings = self._sharing.observe(
+                    [s for s in self._live.values() if s.get("seconds", 0) >= 0], now)
+                for finding in findings:
+                    member = self._members.get(finding["user_id"])
+                    self._sharing.record(
+                        finding, str((member or {}).get("username") or ""))
+                sharing_found = len(findings)
+
         self._last_tick = now
         result = {
             "ok": True,
@@ -219,6 +238,8 @@ class UsageSampler:
             result["enforced"] = await self._enforce_exhausted(list(billed_users))
         if self._pending_kicks and self._enforcement:
             result["device_kicks"] = await self._kick_refused_devices()
+        if self._sharing is not None:
+            result["sharing_findings"] = sharing_found
         return result
 
     # -- persistence ---------------------------------------------------------
