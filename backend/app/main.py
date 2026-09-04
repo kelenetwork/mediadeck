@@ -52,6 +52,7 @@ from app.modules.provisioning import (
     install_script,
 )
 from app.modules.registration import RegistrationService
+from app.modules.requests import RequestError, RequestService, parse_status
 from app.modules.scheduler import Scheduler
 from app.modules.settings import SettingsService
 from app.modules.sharing import SharingDetector
@@ -61,6 +62,7 @@ from app.modules.stats import StatsService
 from app.modules.storage import MockStorage, StorageManager
 from app.modules.tasks import MockTasks, TasksReader
 from app.modules.telegram import TelegramBot
+from app.modules.tmdb import TmdbClient
 from app.modules.updater import MockUpdater, Updater
 from app.modules.usage import UsageSampler
 
@@ -253,6 +255,12 @@ async def _startup() -> None:
     app.state.shop = ShopService(app.state.db, app.state.members,
                                  app.state.points)
     app.state.shop.seed_defaults()
+    # Requests need a group to promote into (/prouser) and one to charge the
+    # monthly allowance against, so they are built after groups and members.
+    app.state.tmdb = TmdbClient(
+        lambda: app.state.settings_service.integration_config())
+    app.state.requests = RequestService(
+        app.state.db, app.state.members, app.state.groups, app.state.tmdb)
     # Rides along with the sampler: it already holds the only live view of who
     # is playing from where, so detection costs no extra Emby calls.
     app.state.sharing = SharingDetector(app.state.db)
@@ -342,7 +350,9 @@ async def _startup() -> None:
         app.state.settings_service.telegram_config, app.state.members,
         emby=app.state.emby, stats=app.state.stats, db=app.state.db,
         registration=app.state.registration, points=app.state.points,
-        shop=app.state.shop, scheduler=app.state.scheduler)
+        shop=app.state.shop, scheduler=app.state.scheduler,
+        requests=app.state.requests, tmdb=app.state.tmdb,
+        groups=app.state.groups)
     app.state.telegram.start()
 
     # ---- plugins ---------------------------------------------------------
@@ -361,6 +371,7 @@ async def _startup() -> None:
         points=app.state.points,
         shop=app.state.shop,
         scheduler=app.state.scheduler,
+        requests=app.state.requests,
     )
     # Carry the old loop's settings onto the new cards before the scheduler
     # starts, so an operator who had the ranking post switched on keeps it,
@@ -2095,6 +2106,68 @@ async def shop_item_delete(item_id: int,
 async def shop_orders(user_id: str | None = None,
                       limit: int = 50) -> list[dict[str, Any]]:
     return app.state.shop.orders(user_id=user_id, limit=limit)
+
+
+# ---- media requests ---------------------------------------------------------
+@app.get("/api/requests", dependencies=[Depends(_auth)])
+async def requests_list(status: str | None = None,
+                        limit: int = 100) -> list[dict[str, Any]]:
+    return app.state.requests.list(status=parse_status(status), limit=limit)
+
+
+@app.get("/api/requests/stats", dependencies=[Depends(_auth)])
+async def requests_stats() -> dict[str, Any]:
+    return app.state.requests.stats()
+
+
+@app.post("/api/requests/{request_id}/claim", dependencies=[Depends(_auth)])
+async def requests_claim(request_id: int, payload: dict[str, Any] = Body(default=None),  # noqa: B008
+                         user: str = Depends(_auth)) -> dict[str, Any]:
+    """Take a request from the panel.
+
+    A lost race is a 200 with ok=false, not an error: somebody else claiming
+    first is a normal outcome the operator needs to *read*, and an HTTP error
+    would look like the panel is broken.
+    """
+    holder = str((payload or {}).get("user_id") or user)
+    try:
+        result = app.state.requests.claim(request_id, holder)
+    except RequestError as exc:
+        raise HTTPException(404, str(exc)) from None
+    if result.get("ok"):
+        await _notify_request_claimed(request_id, holder)
+    return result
+
+
+@app.post("/api/requests/{request_id}/resolve", dependencies=[Depends(_auth)])
+async def requests_resolve(request_id: int, payload: dict[str, Any] = Body(...),  # noqa: B008
+                           user: str = Depends(_auth)) -> dict[str, Any]:
+    request = app.state.requests.get(request_id)
+    if not request:
+        raise HTTPException(404, "unknown request")
+    holder = str(payload.get("user_id") or request.get("claimed_by") or user)
+    done = bool(payload.get("done"))
+    note = str(payload.get("note") or "")
+    try:
+        # Panel operators are already authenticated as admins, so they may
+        # close a request an uploader is sitting on.
+        result = app.state.requests.resolve(request_id, holder, done=done,
+                                            note=note, is_admin=True)
+    except RequestError as exc:
+        raise HTTPException(400, str(exc)) from None
+    await _notify_request_resolved(result["request"])
+    return result
+
+
+async def _notify_request_claimed(request_id: int, holder: str) -> None:
+    """Best-effort: a Telegram outage must not fail the operator's action."""
+    with contextlib.suppress(Exception):
+        await app.state.telegram.announce_request_claimed(request_id, holder)
+
+
+async def _notify_request_resolved(request: dict[str, Any]) -> None:
+    with contextlib.suppress(Exception):
+        await app.state.telegram.notify_request_resolved(request)
 
 
 @app.get("/api/settings/membership", dependencies=[Depends(_auth)])

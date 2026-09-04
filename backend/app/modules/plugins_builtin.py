@@ -58,6 +58,8 @@ class PluginContext:
     # Node dispatcher, so a member can be shown where they will be served
     # from and how busy it is.
     scheduler: Any = None
+    # Media requests, for the digest card that nudges uploaders.
+    requests: Any = None
     # Set by register_builtin. A points plugin needs its own live config at
     # the moment a member taps a button, which is not the config that was
     # passed to the last scheduled run.

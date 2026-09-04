@@ -37,6 +37,9 @@ from typing import Any
 
 import httpx
 
+from app.modules.requests import RequestError
+from app.modules.tmdb import parse_link, poster_url
+
 API_ROOT = "https://api.telegram.org"
 
 # Telegram closes an idle long poll itself; this only has to be shorter than
@@ -52,6 +55,15 @@ USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{2,19}$")
 PENDING_TTL = 600.0
 
 REQUEST_KINDS = ("bind", "rebind")
+
+# Status marks for the member's own request list.
+REQUEST_STATUS_ICONS = {
+    "open": "🕓", "claimed": "🔧", "done": "✅", "rejected": "❌",
+}
+
+# Callbacks whose handler sends its own answerCallbackQuery, because it has
+# something to say. Everything else is acked immediately.
+SELF_ANSWERING_CALLBACKS = ("req_claim:", "req_done:", "req_fail:")
 
 
 def generate_password(length: int = 12) -> str:
@@ -72,6 +84,12 @@ def _fmt_expiry(expires_at: int | None) -> str:
     return f"{max(1, left // 3600)} 小时内到期"
 
 
+def _as_request_id(data: str) -> int:
+    """Trailing id of a ``req_*:<id>`` callback. 0 when malformed."""
+    _, _, tail = str(data or "").partition(":")
+    return int(tail) if tail.isdigit() else 0
+
+
 def _fmt_bytes(n: int | None) -> str:
     size = float(n or 0)
     for unit in ("B", "KB", "MB", "GB", "TB"):
@@ -88,7 +106,8 @@ class TelegramBot:
                  stats: Any = None, db: Any = None,
                  registration: Any = None, points: Any = None,
                  shop: Any = None, plugins: Any = None,
-                 scheduler: Any = None) -> None:
+                 scheduler: Any = None, requests: Any = None,
+                 tmdb: Any = None, groups: Any = None) -> None:
         self._config = config_provider
         self._members = members
         self._emby = emby
@@ -102,6 +121,9 @@ class TelegramBot:
         # keyboard, so it is read at render time rather than captured here.
         self._plugins = plugins
         self._scheduler = scheduler
+        self._requests = requests
+        self._tmdb = tmdb
+        self._groups = groups
         self._offset = 0
         self._task: asyncio.Task | None = None
         self._last_error = ""
@@ -185,6 +207,42 @@ class TelegramBot:
         await self._call("answerCallbackQuery",
                          {"callback_query_id": callback_id, "text": text})
 
+    async def send_message(self, chat_id: str | int, text: str,
+                           keyboard: list[list[dict[str, str]]] | None = None
+                           ) -> int | None:
+        """Like send(), but returns the message id.
+
+        The request fan-out needs it: when one uploader claims, every other
+        uploader's message has to be edited, and without its id there is no
+        way to reach it.
+        """
+        payload: dict[str, Any] = {
+            "chat_id": chat_id, "text": text, "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+        if keyboard:
+            payload["reply_markup"] = {"inline_keyboard": keyboard}
+        result = await self._call("sendMessage", payload)
+        if isinstance(result, dict):
+            return result.get("message_id")
+        return None
+
+    async def send_photo(self, chat_id: str | int, photo: str, caption: str,
+                         keyboard: list[list[dict[str, str]]] | None = None
+                         ) -> bool:
+        """Poster + caption. Falls back to text if the upload is refused:
+        a member who asked for a film should get the confirmation either way.
+        """
+        payload: dict[str, Any] = {
+            "chat_id": chat_id, "photo": photo, "caption": caption,
+            "parse_mode": "HTML",
+        }
+        if keyboard:
+            payload["reply_markup"] = {"inline_keyboard": keyboard}
+        if await self._call("sendPhoto", payload) is not None:
+            return True
+        return await self.send(chat_id, caption, keyboard)
+
     async def _edit(self, chat_id: str | int, message_id: int, text: str,
                     keyboard: list[list[dict[str, str]]] | None = None) -> None:
         payload: dict[str, Any] = {
@@ -262,8 +320,9 @@ class TelegramBot:
             points_row.append({"text": "💸 转账", "callback_data": "transfer"})
         if points_row:
             rows.append(points_row)
-        rows.append([{"text": "🏆 排行", "callback_data": "top"},
-                     {"text": "🔄 刷新", "callback_data": "home"}])
+        rows.append([{"text": "🎬 求片", "callback_data": "req_new"},
+                     {"text": "🏆 排行", "callback_data": "top"}])
+        rows.append([{"text": "🔄 刷新", "callback_data": "home"}])
         return rows
 
     @staticmethod
@@ -275,7 +334,8 @@ class TelegramBot:
             [{"text": "📡 线路", "callback_data": "me_nodes"},
              {"text": "📺 设备", "callback_data": "devices"}],
             [{"text": "📊 观看统计", "callback_data": "usage"},
-             {"text": "🔑 重置密码", "callback_data": "resetpw"}],
+             {"text": "📋 我的求片", "callback_data": "my_requests"}],
+            [{"text": "🔑 重置密码", "callback_data": "resetpw"}],
             [{"text": "◀ 返回", "callback_data": "home"}],
         ]
 
@@ -978,6 +1038,328 @@ class TelegramBot:
             lines.append("暂时还没有排行数据。")
         return "\n".join(lines)
 
+    # -- media requests -------------------------------------------------------
+
+    def _requests_ready(self) -> bool:
+        return self._requests is not None
+
+    @staticmethod
+    def _remaining_text(left: int | None) -> str:
+        return "不限" if left is None else f"{left} 次"
+
+    async def _request_start(self, chat_id: Any, message_id: int,
+                             member: dict[str, Any]) -> None:
+        """Show the allowance, then wait for a link.
+
+        The remaining count is shown *before* asking rather than after they
+        have gone and found a link: being told the quota is spent only once
+        the work is done is the annoying version of this feature.
+        """
+        if not self._requests_ready():
+            await self._edit(chat_id, message_id, "求片功能暂未开启。",
+                             self.member_menu())
+            return
+        user_id = str(member.get("emby_user_id"))
+        left = self._requests.remaining(user_id)
+        if left is not None and left <= 0:
+            await self._edit(
+                chat_id, message_id,
+                "🎬 <b>求片</b>\n\n本月的求片次数已经用完了，下个月 1 号恢复。",
+                self.member_menu())
+            return
+        self._pending[str(chat_id)] = ("request_link", time.time() + PENDING_TTL, {})
+        await self._edit(
+            chat_id, message_id,
+            "🎬 <b>求片</b>\n\n"
+            f"本月还可以求 <b>{self._remaining_text(left)}</b>。\n\n"
+            "请发送 <b>TMDB 链接或编号</b>，例如：\n"
+            "<code>https://www.themoviedb.org/movie/550</code>\n"
+            "<code>550</code>\n\n"
+            "<i>在 themoviedb.org 搜到片子后，直接复制地址栏链接即可。</i>")
+
+    async def _request_pick_title(self, chat_id: Any, member: dict[str, Any],
+                                  text: str) -> None:
+        """Resolve what they sent and ask them to confirm the actual title.
+
+        The confirmation exists because a wrong id is invisible otherwise: the
+        member would find out an uploader spent an evening on the wrong film.
+        """
+        parsed = parse_link(text) if parse_link else None
+        if not parsed:
+            self._pending.pop(str(chat_id), None)
+            await self.send(
+                chat_id,
+                "❌ 没能识别这个链接。\n\n"
+                "请发送 TMDB 的链接或纯数字编号，例如：\n"
+                "<code>https://www.themoviedb.org/movie/550</code>\n"
+                "<code>550</code>",
+                self.member_menu())
+            return
+
+        media_type, tmdb_id = parsed
+        meta = None
+        if self._tmdb is not None:
+            media_type, meta = await self._tmdb.resolve(media_type, tmdb_id)
+
+        extra = {"media_type": media_type, "tmdb_id": tmdb_id}
+        self._pending[str(chat_id)] = (
+            "request_confirm", time.time() + PENDING_TTL, extra)
+        keyboard = [[{"text": "✅ 确认求片", "callback_data": "req_ok"},
+                     {"text": "✖ 取消", "callback_data": "home"}]]
+
+        if meta:
+            year = meta.get("year")
+            caption = (
+                "🎬 <b>确认求片</b>\n\n"
+                f"<b>{meta.get('title') or tmdb_id}</b>"
+                f"{f' ({year})' if year else ''}\n"
+                f"类型：{'剧集' if media_type == 'tv' else '电影'}\n"
+                f"TMDB：<code>{tmdb_id}</code>\n\n"
+                "确认要求这部片子吗？")
+            poster = poster_url(str(meta.get("poster_path") or ""))
+            if poster:
+                await self.send_photo(chat_id, poster, caption, keyboard)
+                return
+            await self.send(chat_id, caption, keyboard)
+            return
+
+        # No key, or TMDB had no answer. The id is still valid, so the request
+        # proceeds under a placeholder rather than being refused.
+        await self.send(
+            chat_id,
+            "🎬 <b>确认求片</b>\n\n"
+            f"TMDB 编号：<code>{tmdb_id}</code>\n"
+            f"类型：{'剧集' if media_type == 'tv' else '电影'}\n\n"
+            "<i>暂时查不到片名，上片员会按编号处理。</i>\n\n"
+            "确认要求这部片子吗？",
+            keyboard)
+
+    async def _request_submit(self, chat_id: Any, message_id: int,
+                              member: dict[str, Any]) -> None:
+        waiting = self._pending.pop(str(chat_id), None)
+        if not waiting or waiting[0] != "request_confirm":
+            await self._edit(chat_id, message_id, "这条求片会话已经过期了，请重新开始。",
+                             self.member_menu())
+            return
+        extra = waiting[2]
+        user_id = str(member.get("emby_user_id"))
+        try:
+            request = await self._requests.create(
+                user_id, extra.get("media_type", "movie"),
+                int(extra.get("tmdb_id") or 0))
+        except RequestError as exc:
+            await self.send(chat_id, f"❌ {exc}", self.member_menu())
+            return
+
+        left = self._requests.remaining(user_id)
+        await self.send(
+            chat_id,
+            "✅ <b>已提交</b>\n\n"
+            f"编号 <b>#{request['id']}</b> · {request['display_title']}\n"
+            f"本月还可以求 {self._remaining_text(left)}。\n\n"
+            "上片员处理后会通知你。",
+            self.member_menu())
+        await self.announce_request(request)
+
+    async def _my_requests(self, chat_id: Any, message_id: int,
+                           member: dict[str, Any]) -> None:
+        if not self._requests_ready():
+            await self._edit(chat_id, message_id, "求片功能暂未开启。",
+                             self.info_menu())
+            return
+        user_id = str(member.get("emby_user_id"))
+        rows = self._requests.for_user(user_id, limit=5)
+        left = self._requests.remaining(user_id)
+        if not rows:
+            body = ("📋 <b>我的求片</b>\n\n还没有求过片。\n\n"
+                    f"本月可求 {self._remaining_text(left)}。")
+        else:
+            lines = ["📋 <b>我的求片</b>\n"]
+            for row in rows:
+                mark = REQUEST_STATUS_ICONS.get(str(row.get("status")), "·")
+                lines.append(
+                    f"{mark} #{row['id']} {row['display_title']} · "
+                    f"{row['status_label']}")
+                note = str(row.get("result_note") or "")
+                if note and row.get("status") == "rejected":
+                    lines.append(f"    <i>{note}</i>")
+            lines.append(f"\n本月还可以求 {self._remaining_text(left)}。")
+            body = "\n".join(lines)
+        await self._edit(chat_id, message_id, body, self.info_menu())
+
+    # -- uploader fan-out ----------------------------------------------------
+
+    async def announce_request(self, request: dict[str, Any]) -> int:
+        """Tell every reachable uploader, and remember which message is whose.
+
+        One message each rather than one group post: the claim button has to
+        be taken back from the people who did not win, and that is only
+        possible per chat.
+        """
+        if not self._requests_ready() or not self.enabled:
+            return 0
+        request_id = int(request.get("id") or 0)
+        keyboard = [[{"text": "✋ 接单",
+                      "callback_data": f"req_claim:{request_id}"}]]
+        body = (
+            f"🎬 <b>新求片 #{request_id}</b>\n\n"
+            f"{request.get('display_title') or ''}\n"
+            f"类型：{request.get('media_label') or '-'}\n"
+            f"TMDB：<code>{request.get('tmdb_id')}</code>\n"
+            f"求片人：{request.get('username') or '-'}")
+        note = str(request.get("note") or "")
+        if note:
+            body += f"\n备注：{note}"
+
+        sent = 0
+        for uploader in self._requests.uploaders():
+            chat_id = str(uploader.get("tg_user_id") or "")
+            if not chat_id:
+                continue
+            message_id = await self.send_message(chat_id, body, keyboard)
+            if message_id is None:
+                continue
+            self._requests.record_notice(request_id, chat_id, int(message_id))
+            sent += 1
+        return sent
+
+    async def _request_claim(self, chat_id: Any, message_id: int,
+                             callback_id: str, member: dict[str, Any],
+                             request_id: int) -> None:
+        """One uploader takes the job; everyone else loses the button."""
+        if not self._requests_ready():
+            return
+        if not member:
+            await self._answer_callback(callback_id, "这个 Telegram 还没有账号")
+            return
+        roles = member.get("roles") or []
+        if "uploader" not in roles and "admin" not in roles:
+            await self._answer_callback(callback_id, "你不是上片员")
+            return
+
+        user_id = str(member.get("emby_user_id"))
+        try:
+            result = self._requests.claim(request_id, user_id)
+        except RequestError as exc:
+            await self._answer_callback(callback_id, str(exc))
+            return
+
+        if not result.get("ok"):
+            holder = result.get("claimed_by_name") or "其他上片员"
+            await self._answer_callback(callback_id, f"已被 {holder} 接单")
+            await self._retract_notices(request_id, holder,
+                                        skip_chat=str(chat_id))
+            return
+
+        await self._answer_callback(callback_id, "接单成功")
+        request = result["request"]
+        await self._edit(
+            chat_id, message_id,
+            f"✋ <b>已接单 #{request_id}</b>\n\n"
+            f"{request.get('display_title') or ''}\n"
+            f"TMDB：<code>{request.get('tmdb_id')}</code>\n"
+            f"求片人：{request.get('username') or '-'}\n\n"
+            "处理完成后点下方按钮。",
+            [[{"text": "✅ 已处理", "callback_data": f"req_done:{request_id}"},
+              {"text": "❌ 无法处理", "callback_data": f"req_fail:{request_id}"}]])
+        await self._retract_notices(
+            request_id, str(member.get("username") or "上片员"),
+            skip_chat=str(chat_id))
+
+    async def _retract_notices(self, request_id: int, holder: str,
+                               skip_chat: str = "") -> int:
+        """Strip the claim button from every other uploader's message.
+
+        Leaving a live button on a job that is gone is how two people end up
+        downloading the same title.
+        """
+        if not self._requests_ready():
+            return 0
+        edited = 0
+        for notice in self._requests.notices(request_id):
+            chat_id = str(notice.get("tg_user_id") or "")
+            if not chat_id or chat_id == str(skip_chat):
+                continue
+            await self._edit(
+                chat_id, int(notice.get("message_id") or 0),
+                f"🎬 <b>求片 #{request_id}</b>\n\n已由 {holder} 接单。")
+            edited += 1
+        return edited
+
+    async def announce_request_claimed(self, request_id: int,
+                                       holder_id: str) -> int:
+        """Panel-side claim: take the button back from every uploader chat."""
+        if not self._requests_ready():
+            return 0
+        holder = self._members.get(str(holder_id)) or {}
+        name = str(holder.get("username") or "管理员")
+        return await self._retract_notices(request_id, name)
+
+    async def _request_resolve(self, chat_id: Any, message_id: int,
+                               callback_id: str, member: dict[str, Any],
+                               request_id: int, done: bool) -> None:
+        if not self._requests_ready():
+            return
+        if not done:
+            await self._answer_callback(callback_id)
+            # A refusal without a reason is worse than no answer: the member
+            # cannot tell whether to ask again differently.
+            self._pending[str(chat_id)] = (
+                "request_reason", time.time() + PENDING_TTL,
+                {"request_id": request_id})
+            await self._edit(
+                chat_id, message_id,
+                f"❌ <b>无法处理 #{request_id}</b>\n\n请发送一句原因，会转达给求片人。")
+            return
+        try:
+            result = self._requests.resolve(
+                request_id, str(member.get("emby_user_id")), done=True)
+        except RequestError as exc:
+            await self._answer_callback(callback_id, str(exc))
+            return
+        await self._answer_callback(callback_id, "已标记完成")
+        request = result["request"]
+        await self._edit(
+            chat_id, message_id,
+            f"✅ <b>已完成 #{request_id}</b>\n\n{request.get('display_title') or ''}")
+        await self.notify_request_resolved(request)
+
+    async def _request_reason(self, chat_id: Any, member: dict[str, Any],
+                              extra: dict[str, Any], text: str) -> None:
+        self._pending.pop(str(chat_id), None)
+        request_id = int(extra.get("request_id") or 0)
+        try:
+            result = self._requests.resolve(
+                request_id, str(member.get("emby_user_id")), done=False,
+                note=text)
+        except RequestError as exc:
+            await self.send(chat_id, f"❌ {exc}", self.member_menu())
+            return
+        request = result["request"]
+        await self.send(
+            chat_id,
+            f"已标记 #{request_id} 为无法处理，原因已转达求片人。",
+            self.member_menu())
+        await self.notify_request_resolved(request)
+
+    async def notify_request_resolved(self, request: dict[str, Any]) -> bool:
+        """Tell the member what happened to the title they asked for."""
+        chat_id = str(request.get("tg_user_id") or "")
+        if not chat_id or not self.enabled:
+            return False
+        title = request.get("display_title") or f"#{request.get('tmdb_id')}"
+        if str(request.get("status")) == "done":
+            body = (f"✅ <b>求片已处理</b>\n\n你求的《{title}》已经处理好了，"
+                    "请耐心等待入库。")
+            note = str(request.get("result_note") or "")
+            if note:
+                body += f"\n\n<i>{note}</i>"
+        else:
+            reason = str(request.get("result_note") or "暂时无法处理")
+            body = (f"❌ <b>求片无法处理</b>\n\n你求的《{title}》暂时没能处理。\n\n"
+                    f"原因：{reason}")
+        return await self.send(chat_id, body)
+
     # -- update handling ------------------------------------------------------
 
     async def _handle_message(self, message: dict[str, Any]) -> None:
@@ -1014,6 +1396,18 @@ class TelegramBot:
                 else:
                     await self._transfer_pick_amount(chat_id, member, extra, text)
                 return
+            if kind in ("request_link", "request_reason"):
+                member = self._member_for_chat(tg_user_id)
+                if not member:
+                    self._pending.pop(str(chat_id), None)
+                    await self.send(chat_id, "这个 Telegram 还没有账号。",
+                                    self.guest_menu())
+                    return
+                if kind == "request_link":
+                    await self._request_pick_title(chat_id, member, text)
+                else:
+                    await self._request_reason(chat_id, member, extra, text)
+                return
             if kind == "claim":
                 self._pending.pop(str(chat_id), None)
                 created = self._create_request(
@@ -1037,8 +1431,15 @@ class TelegramBot:
         from_user = callback.get("from") or {}
         tg_user_id = str(from_user.get("id") or "")
         tg_name = from_user.get("first_name") or "朋友"
-        await self._answer_callback(str(callback.get("id") or ""))
+        callback_id = str(callback.get("id") or "")
+        # A callback query may only be answered once, and the claim handlers
+        # answer with text ("已被 X 接单") -- acking here first would swallow
+        # that alert and the loser would be told nothing at all.
+        if not data.startswith(SELF_ANSWERING_CALLBACKS):
+            await self._answer_callback(callback_id)
         if not chat_id or not message_id:
+            if callback_id and data.startswith(SELF_ANSWERING_CALLBACKS):
+                await self._answer_callback(callback_id)
             return
 
         # Re-read binding state on every tap: the member could have been
@@ -1138,6 +1539,25 @@ class TelegramBot:
             return
         if data == "orders":
             await self._orders_view(chat_id, message_id, member)
+            return
+        if data == "req_new":
+            await self._request_start(chat_id, message_id, member)
+            return
+        if data == "req_ok":
+            await self._request_submit(chat_id, message_id, member)
+            return
+        if data == "my_requests":
+            await self._my_requests(chat_id, message_id, member)
+            return
+        if data.startswith("req_claim:"):
+            await self._request_claim(
+                chat_id, message_id, callback_id, member,
+                _as_request_id(data))
+            return
+        if data.startswith(("req_done:", "req_fail:")):
+            await self._request_resolve(
+                chat_id, message_id, callback_id, member,
+                _as_request_id(data), done=data.startswith("req_done:"))
             return
         if data == "expiry":
             expires = member.get("expires_at")

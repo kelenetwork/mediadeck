@@ -141,10 +141,19 @@ class TmdbClient:
         if not self.configured:
             return None
 
-        payload = await self._fetch(media_type, tmdb_id, language)
+        # Guarded here as well as inside _fetch: "lookup never raises" is a
+        # promise to the request flow, and it has to hold for every way the
+        # fetch can fail, not only the ones httpx names.
+        try:
+            payload = await self._fetch(media_type, tmdb_id, language)
+        except Exception:  # noqa: BLE001 - upstream failure is not the member's
+            return None
         if payload is None:
             return None
-        parsed = self._parse(media_type, payload)
+        try:
+            parsed = self._parse(media_type, payload)
+        except Exception:  # noqa: BLE001 - an odd payload is a miss, not a crash
+            return None
         self._cache.set(cache_key, dict(parsed))
         return parsed
 
