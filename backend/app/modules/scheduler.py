@@ -54,11 +54,28 @@ class NodeState:
     def utilisation(self) -> float:
         """Fraction of this node's capacity currently in use (0.0 - 1.0+).
 
-        Absolute, not relative: 0.8 means "80% full" on a 20-stream node and
-        on a 500-stream node alike, so one threshold works for a mixed fleet.
+        Takes the worse of two independent pressures:
+
+        - stream count against the node's configured capacity
+        - measured egress against the node's real link ceiling
+
+        Stream count on its own misreads a busy node. A 1 Gbit box showing 10
+        streams looks 20% loaded against a capacity of 48, while five
+        direct-play 4K clients on that same box have already filled the pipe.
+        Whichever limit sits closer to its ceiling is the one that decides,
+        so a node is never handed work its wire cannot carry.
+
+        Absolute, not relative: 0.8 means "80% full" on a small node and on a
+        large one alike, so one threshold works for a mixed fleet. Nodes with
+        no declared ceiling keep the stream-count-only behaviour.
         """
         capacity = max(self.node.capacity, 1.0)
-        return self.active_streams / capacity
+        stream_load = self.active_streams / capacity
+
+        ceiling = float(getattr(self.node, "bandwidth_mbps", 0) or 0)
+        if ceiling <= 0:
+            return stream_load
+        return max(stream_load, self.egress_mbps / ceiling)
 
     def available(self) -> bool:
         return (
@@ -72,6 +89,13 @@ class NodeState:
 class Scheduler:
     HISTORY_MAX = 720      # probe snapshots kept per node (~3h at 15s interval)
     DISPATCH_MAX = 1000    # recent dispatch decisions kept
+    # How much busier the affinity-preferred node may be before a request goes
+    # to the quietest peer instead. Affinity hashes a path to a fixed node, so
+    # without this every viewer of a hot title lands on one machine while the
+    # others idle. Small enough that popularity spreads promptly; large enough
+    # that ordinary probe jitter does not bounce a cold title between nodes and
+    # throw away its cache locality.
+    SPREAD_MARGIN = 0.15
 
     def __init__(
         self,
@@ -193,14 +217,24 @@ class Scheduler:
         if candidates:
             if self._policy == "affinity" and context:
                 ordered = self._affinity_order(context, candidates)
+                lightest = min(candidates, key=lambda s: (s.utilisation(), s.egress_mbps))
+                preferred = None
                 for state in ordered:
                     if state.utilisation() <= self._load_threshold:
-                        chosen, reason = state, "affinity"
+                        preferred = state
                         break
-                if chosen is None:
+
+                if preferred is None:
                     # Every preferred node is over threshold: availability wins.
-                    chosen = min(candidates, key=lambda s: (s.utilisation(), s.egress_mbps))
-                    reason = "affinity-overflow"
+                    chosen, reason = lightest, "affinity-overflow"
+                elif preferred.utilisation() - lightest.utilisation() > self.SPREAD_MARGIN:
+                    # Affinity keeps a title on one node for cache locality,
+                    # but a popular title would otherwise pin every viewer to
+                    # that same node while peers sit idle. Step aside once the
+                    # preferred node is measurably busier than the quietest.
+                    chosen, reason = lightest, "affinity-spread"
+                else:
+                    chosen, reason = preferred, "affinity"
             else:
                 chosen = min(candidates, key=lambda s: (s.utilisation(), s.egress_mbps))
                 reason = "least-load"
