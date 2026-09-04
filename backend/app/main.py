@@ -321,27 +321,43 @@ async def _startup() -> None:
     # the panel, while polling reaches out instead and leaves the panel
     # reachable only from where it already was.
     app.state.telegram = TelegramBot(
-        app.state.settings_service.telegram_config, app.state.members)
+        app.state.settings_service.telegram_config, app.state.members,
+        emby=app.state.emby, stats=app.state.stats, db=app.state.db)
     app.state.telegram.start()
 
     async def telegram_notify_loop() -> None:
-        """Daily expiry reminders to members who linked a chat.
+        """Daily expiry reminders, and the daily ranking post.
 
-        Keyed by day rather than by an interval so a restart cannot produce a
-        second round of the same reminder a few hours after the first.
+        Both are keyed by day rather than by an interval, so a restart cannot
+        produce a second round of the same message a few hours after the first.
+        The two are tracked separately: they fire at different hours, and a
+        restart between them must not cancel whichever has not gone out yet.
         """
-        sent_on = ""
+        reminded_on = ""
+        ranked_on = ""
         while True:
             await asyncio.sleep(300)
             with contextlib.suppress(Exception):
                 cfg = app.state.settings_service.telegram_config()
+                if not cfg["enabled"]:
+                    continue
                 today = time.strftime("%Y-%m-%d")
-                if (cfg["enabled"] and cfg["notify_expiring"]
-                        and sent_on != today and time.localtime().tm_hour >= 10):
+                hour = time.localtime().tm_hour
+
+                # Not before 10:00: a reminder that arrives at 04:00 wakes
+                # someone up to tell them about a renewal days away.
+                if (cfg["notify_expiring"] and reminded_on != today
+                        and hour >= 10):
                     due = app.state.members.expiring_within(
                         cfg["notify_expiring_days"])
                     await app.state.telegram.notify_expiring(due)
-                    sent_on = today
+                    reminded_on = today
+
+                if (cfg["rankings_enabled"] and cfg["rankings_chat"]
+                        and ranked_on != today and hour >= cfg["rankings_hour"]):
+                    await app.state.telegram.broadcast_rankings(
+                        cfg["rankings_chat"], days=1)
+                    ranked_on = today
 
     app.state.telegram_task = asyncio.create_task(telegram_notify_loop())
 
@@ -1688,21 +1704,60 @@ async def telegram_verify() -> dict[str, Any]:
     return await app.state.telegram.verify()
 
 
-@app.post("/api/members/{user_id}/telegram/bind-code", dependencies=[Depends(_auth)])
-async def telegram_bind_code(user_id: str, user: str = Depends(_auth)) -> dict[str, Any]:
-    """Issue a one-time code the member types into the bot.
+@app.get("/api/telegram/requests", dependencies=[Depends(_auth)])
+async def telegram_requests() -> list[dict[str, Any]]:
+    """Claim and rebind requests awaiting a decision.
 
-    The bot never asks for an Emby password: a chat transcript is not a safe
-    place to type one, and a code that expires limits the damage if it is
-    pasted into the wrong window.
+    Registration never appears here: the chat itself proves who is asking, so
+    a brand-new account needs no review. These two do, because both are
+    attempts to take control of an account the requester cannot otherwise
+    prove they own.
     """
-    member = app.state.members.get(user_id)
-    if not member:
-        raise HTTPException(404, "member not found")
-    code, ttl = app.state.telegram.codes.issue(user_id, member.get("username") or "")
-    app.state.members.audit(user, "member.telegram.code", user_id, "bind code issued")
-    return {"code": code, "expires_in": ttl,
-            "username": member.get("username") or ""}
+    return app.state.telegram.pending_requests()
+
+
+@app.post("/api/telegram/requests/{request_id}/review", dependencies=[Depends(_auth)])
+async def telegram_request_review(request_id: int,
+                                  payload: dict[str, Any] = Body(default={}),  # noqa: B008
+                                  user: str = Depends(_auth)) -> dict[str, Any]:
+    approve = bool(payload.get("approve", False))
+    try:
+        result = app.state.telegram.review_request(request_id, approve, reviewer=user)
+    except KeyError:
+        raise HTTPException(404, "request not found") from None
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
+    # Tell the requester either way: silence reads as the operator ignoring
+    # them, and they open a second request.
+    with contextlib.suppress(Exception):
+        await app.state.telegram.send(
+            result["tg_user_id"],
+            "✅ 申请已通过，账号已关联到这个 Telegram。" if approve
+            else "❌ 申请未通过，如有疑问请联系管理员。")
+    return result
+
+
+@app.post("/api/telegram/group-audit", dependencies=[Depends(_auth)])
+async def telegram_group_audit() -> dict[str, Any]:
+    """Which linked members have left the required group.
+
+    Reported, never enforced: leaving a chat is not the same as stopping
+    paying, and suspending on that basis is a person's call.
+    """
+    return await app.state.telegram.audit_group_membership()
+
+
+@app.post("/api/telegram/rankings/send", dependencies=[Depends(_auth)])
+async def telegram_send_rankings(payload: dict[str, Any] = Body(default={}),  # noqa: B008
+                                 user: str = Depends(_auth)) -> dict[str, bool]:
+    cfg = app.state.settings_service.telegram_config()
+    chat = str(payload.get("chat_id") or cfg.get("rankings_chat") or "").strip()
+    if not chat:
+        raise HTTPException(400, "未配置排行榜推送目标")
+    days = int(payload.get("days") or 1)
+    ok = await app.state.telegram.broadcast_rankings(chat, days)
+    app.state.members.audit(user, "telegram.rankings", "", f"days={days} ok={ok}")
+    return {"sent": ok}
 
 
 @app.post("/api/members/{user_id}/telegram/unbind", dependencies=[Depends(_auth)])

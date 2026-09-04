@@ -518,6 +518,32 @@ class MemberService:
             "SELECT * FROM members WHERE tg_user_id=?", (tg_user_id,))
         return self._decorate(row) if row else None
 
+    def find_by_username(self, username: str) -> dict[str, Any] | None:
+        """Look a member up by their Emby login name.
+
+        Case-insensitive: someone claiming an old account types the name from
+        memory, and rejecting them over capitalisation would send a real owner
+        to the operator for nothing.
+        """
+        username = str(username or "").strip()
+        if not username:
+            return None
+        row = self._db.one(
+            "SELECT * FROM members WHERE username=? COLLATE NOCASE", (username,))
+        return self._decorate(row) if row else None
+
+    def linked_telegram(self) -> list[dict[str, Any]]:
+        """Every member with a linked chat, unpaginated.
+
+        Deliberately not ``list()``: that caps at 500 rows, so a group audit
+        built on it would quietly skip everyone past the cap and still report
+        "all present". An audit that under-reports is worse than none, because
+        it is believed.
+        """
+        rows = self._db.query(
+            "SELECT * FROM members WHERE tg_user_id <> '' ORDER BY username")
+        return [self._decorate(r) for r in rows]
+
     def bind_telegram(self, user_id: str, tg_user_id: str,
                       tg_username: str = "", actor: str = "operator") -> dict[str, Any]:
         """Link a chat to a member.

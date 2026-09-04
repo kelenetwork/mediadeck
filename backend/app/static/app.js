@@ -16,6 +16,11 @@ const NAV = [
     { id: 'stats', icon: '📈', label: '运营统计', sub: '流量、时长与热门内容' },
     { id: 'audit', icon: '☰', label: '审计日志', sub: '操作记录与变更追踪' },
   ]},
+  { group: 'Telegram', items: [
+    { id: 'tgbot', icon: '✈', label: '机器人', sub: '注册开关、名额与运行状态' },
+    { id: 'tgrequests', icon: '⇋', label: '关联审批', sub: '认领与换绑申请' },
+    { id: 'tggroup', icon: '⚑', label: '群组核查', sub: '已关联成员的群成员状态' },
+  ]},
   { group: '工作台', items: [
     { id: 'library', icon: '▤', label: '媒体库', sub: '媒体库分布与条目统计' },
     { id: 'imports', icon: '⇪', label: '网盘上片', sub: '网盘链接与云盘目录导入' },

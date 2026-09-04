@@ -97,10 +97,41 @@ Newest entries first. Every working session appends one entry.
   A block that leaves no trace is indistinguishable from a broken node, and
   the operator ends up debugging the wrong machine.
 
+**Reworked before release: the bot registers, it does not hand out codes**
+- Registration creates the Emby account from the chat directly. There is no
+  code to copy, because the chat already proves who is asking: the Telegram id
+  *is* the identity and is recorded as owner at creation time. Passwords are
+  generated and shown once, never typed into a transcript.
+- That leaves exactly two cases a requester cannot self-prove, and both go to
+  an approval queue instead: claiming an account that predates the bot, and
+  moving an account to a different Telegram id.
+- Every gate is re-checked at creation, not only when the conversation began:
+  a slot can fill or registration can close while someone is still typing a
+  username. A test covers exactly that race.
+- Group requirement for registration, with the lookup failing *open*: Telegram
+  being unreachable, or the bot not being an admin of the group, must not
+  silently close registration for everyone.
+- Group audit reports who has left, and never acts. Leaving a chat is not the
+  same as ceasing to pay.
+- Daily rankings (top viewers by hours, top titles by plays) both in-bot and
+  as a scheduled post to a group.
+- Telegram now has its own nav section — bot settings, approval queue, group
+  audit — because scattering them through "settings" and "members" made each
+  one hard to find.
+
+**Two bugs caught in the pre-release review**
+- The scheduled ranking post had settings and an endpoint but was never wired
+  into the background loop: turning it on did nothing. Expiry reminders and
+  rankings now track their own send-day separately, so a restart between the
+  two cannot cancel whichever has not gone out.
+- `audit_group_membership` walked `members.list()`, which caps at 500 rows. A
+  larger install would have skipped everyone past the cap and still reported
+  "all present". Added `linked_telegram()`, unpaginated. An audit that
+  under-reports is worse than none, because it is believed.
+
 **Next**
 - Country rules once a GeoIP source exists.
 - Access-rule and sharing-finding UI pages.
-- Bind-code flow end to end against a live bot.
 
 ## 2026-09-05 — dashboard shows the library, not just counters
 **Done**

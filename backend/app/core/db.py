@@ -167,6 +167,24 @@ CREATE TABLE IF NOT EXISTS access_blocks (
 );
 CREATE INDEX IF NOT EXISTS idx_blocks_time ON access_blocks(blocked_at);
 
+-- Claim and rebind requests from the bot. Registration does not come through
+-- here: the chat already proves who is asking, so a new account needs no
+-- review. These two do -- both are attempts to take control of an account the
+-- requester cannot otherwise prove they own.
+CREATE TABLE IF NOT EXISTS tg_requests (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind            TEXT NOT NULL DEFAULT 'bind',
+    tg_user_id      TEXT NOT NULL,
+    tg_username     TEXT NOT NULL DEFAULT '',
+    wanted_username TEXT NOT NULL DEFAULT '',
+    status          TEXT NOT NULL DEFAULT 'pending',
+    note            TEXT NOT NULL DEFAULT '',
+    created_at      INTEGER NOT NULL,
+    reviewed_at     INTEGER,
+    reviewed_by     TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_tgreq_status ON tg_requests(status, created_at);
+
 -- Rolled up per user per day. Sampling writes here continuously, so it is kept
 -- narrow and indexed for the two questions actually asked: one user's history,
 -- and one day across all users.
