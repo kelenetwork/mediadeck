@@ -75,10 +75,24 @@ def test_registration_cannot_be_opened_on_a_stopped_bot() -> None:
     """Advertising a door nobody can walk through would just confuse members."""
     with TestClient(app) as client:
         client.post("/api/settings/telegram", auth=ADMIN,
-                    json={"bot_token": "", "enabled": False})
+                    json={"bot_token": "", "enabled": False,
+                          "allow_admin_grant": False, "allow_invite": False,
+                          "allow_redeem": False})
         r = client.post("/api/settings/telegram", auth=ADMIN,
-                        json={"enabled": False, "registration_enabled": True})
+                        json={"enabled": False, "allow_invite": True})
         assert r.status_code >= 400
+
+
+def test_the_old_single_registration_switch_is_gone() -> None:
+    """One switch could only be open to everyone or closed to everyone.
+
+    It is replaced by three channel switches; leaving the old key in the
+    payload would let a stale UI reopen a door the operator shut.
+    """
+    with TestClient(app) as client:
+        cfg = client.get("/api/settings/telegram", auth=ADMIN).json()
+        assert "registration_enabled" not in cfg
+        assert {"allow_admin_grant", "allow_invite", "allow_redeem"} <= set(cfg)
 
 
 def test_settings_bounds_are_enforced() -> None:
@@ -169,7 +183,8 @@ class _FakeMembers:
 
 def _bot(members=None, emby=None, cfg=None, db=None) -> TelegramBot:
     base = {"enabled": True, "bot_token": FAKE_CRED,
-            "registration_enabled": True, "register_days": 30,
+            "allow_admin_grant": True, "allow_invite": True,
+            "allow_redeem": True, "register_days": 30,
             "max_users": 0, "require_group": "", "default_group_id": "",
             "emby_public_url": "https://emby.example"}
     base.update(cfg or {})
@@ -263,11 +278,24 @@ def test_a_taken_username_fails_without_creating_a_member() -> None:
 
 
 def test_registration_closed_is_refused() -> None:
+    """Every channel shut is a shut door, and it has to say so."""
     emby = _FakeEmby()
-    bot = _bot(_FakeMembers(), emby, cfg={"registration_enabled": False})
+    bot = _bot(_FakeMembers(), emby,
+               cfg={"allow_admin_grant": False, "allow_invite": False,
+                    "allow_redeem": False})
     asyncio.run(bot._start_registration(1, "42"))
     assert emby.created == []
     assert any("暂停注册" in m for m in bot.sent)  # type: ignore[attr-defined]
+
+
+def test_one_open_channel_keeps_registration_reachable() -> None:
+    """The inverse: shutting two channels must not close the third."""
+    emby = _FakeEmby()
+    bot = _bot(_FakeMembers(), emby,
+               cfg={"allow_admin_grant": False, "allow_invite": False,
+                    "allow_redeem": True})
+    asyncio.run(bot._start_registration(1, "42"))
+    assert not any("暂停注册" in m for m in bot.sent)  # type: ignore[attr-defined]
 
 
 def test_a_full_slot_cap_blocks_registration() -> None:
