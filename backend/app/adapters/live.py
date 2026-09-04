@@ -421,16 +421,71 @@ class LiveEmby:
                 item = session.get("NowPlayingItem")
                 if not item:
                     continue
+                play_state = session.get("PlayState") or {}
+                # Position and runtime travel together or not at all: a percentage
+                # derived from a missing runtime would render a full bar for a
+                # session that just started.
+                runtime = item.get("RunTimeTicks") or 0
+                position = play_state.get("PositionTicks") or 0
+                percent = round(position * 100 / runtime, 1) if runtime > 0 else None
                 out.append({
                     "Id": session.get("Id"),
                     "UserId": session.get("UserId"),
                     "UserName": session.get("UserName"),
                     "Client": session.get("Client"),
                     "DeviceName": session.get("DeviceName"),
-                    "PlayMethod": (session.get("PlayState") or {}).get("PlayMethod"),
+                    "PlayMethod": play_state.get("PlayMethod"),
                     "Item": item.get("Name"),
                     "SeriesName": item.get("SeriesName"),
-                    "Paused": bool((session.get("PlayState") or {}).get("IsPaused")),
+                    "Paused": bool(play_state.get("IsPaused")),
+                    # Artwork and progress. ItemId is what lets the panel address
+                    # the cached-image route; without it the UI can only print
+                    # a title where the poster should be.
+                    "ItemId": item.get("Id"),
+                    "ItemType": item.get("Type"),
+                    "ProductionYear": item.get("ProductionYear"),
+                    "Genres": (item.get("Genres") or [])[:2],
+                    "Overview": item.get("Overview") or "",
+                    "RunTimeTicks": runtime,
+                    "PositionTicks": position,
+                    "ProgressPercent": percent,
+                })
+            return out
+
+    async def latest_items(self, limit: int = 12) -> list[dict[str, Any]]:
+        """Most recently added movies and series, for the dashboard wall.
+
+        Deliberately asks for whole titles rather than episodes: a series that
+        just gained twelve episodes would otherwise fill the entire wall with
+        one show's artwork and bury everything else added that day.
+        """
+        base, headers, timeout, verify = self._conn()
+        params = {
+            "Recursive": "true",
+            "Limit": str(max(1, min(limit, 60))),
+            "SortBy": "DateCreated",
+            "SortOrder": "Descending",
+            "IncludeItemTypes": "Movie,Series",
+            "Fields": "ProductionYear,DateCreated",
+            "ImageTypeLimit": "1",
+            "EnableImageTypes": "Primary",
+        }
+        async with self._client(timeout, verify) as client:
+            r = self._check(
+                await client.get(f"{base}/emby/Items", headers=headers, params=params))
+            r.raise_for_status()
+            out = []
+            for item in (r.json().get("Items") or []):
+                # An entry with no Primary tag has no artwork to show; keeping it
+                # would punch a grey hole in an otherwise dense grid.
+                if not (item.get("ImageTags") or {}).get("Primary"):
+                    continue
+                out.append({
+                    "Id": item.get("Id"),
+                    "Name": item.get("Name"),
+                    "Type": item.get("Type"),
+                    "ProductionYear": item.get("ProductionYear"),
+                    "DateCreated": item.get("DateCreated"),
                 })
             return out
 

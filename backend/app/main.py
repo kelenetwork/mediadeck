@@ -891,6 +891,23 @@ async def emby_libraries() -> list[dict[str, Any]]:
     )
 
 
+@app.get("/api/emby/latest", dependencies=[Depends(_auth)])
+async def emby_latest(limit: int = 12) -> list[dict[str, Any]]:
+    """Recently added titles for the dashboard poster wall.
+
+    Cached for a minute: the dashboard auto-refreshes every 30s, and "what was
+    added today" does not change between two consecutive renders. The artwork
+    itself is served by the cached-image route, so a warm wall costs Emby
+    nothing beyond this one list query.
+    """
+    limit = max(1, min(limit, 24))
+    return await app.state.cache.resolve(
+        f"emby:latest:{limit}",
+        lambda: app.state.emby.latest_items(limit),
+        ttl=60,
+    )
+
+
 async def _sessions_with_speed() -> list[dict[str, Any]]:
     """Active sessions annotated with live bandwidth.
 

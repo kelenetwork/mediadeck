@@ -4,6 +4,32 @@ Newest entries first. Every working session appends one entry.
 
 ---
 
+## 2026-09-05 — dashboard shows the library, not just counters
+**Done**
+- Dashboard renders a poster wall of recent additions, plus playback cards
+  carrying artwork, viewer and progress. The panel managed a media library
+  while showing none of it; a row of counters gave no sense of what was
+  actually arriving or being watched.
+- New `GET /api/emby/latest`. Asks Emby for whole titles only (`Movie,Series`):
+  a show that just gained twelve episodes would otherwise fill the wall with
+  one series and bury everything else added that day. Limit is clamped to 24
+  server-side and the result cached 60s, so the 30s auto-refresh does not
+  re-query on every render.
+- Sessions now carry `ItemId`, `ItemType`, `ProductionYear`, `Genres`,
+  `Overview`, `RunTimeTicks`, `PositionTicks`, `ProgressPercent`. Without
+  `ItemId` a card can only print a title where the poster belongs.
+- `ProgressPercent` is `None` when runtime is unknown, never `0.0`. A live
+  channel reports no runtime, and an empty bar is indistinguishable from a
+  session that just started, so the UI omits the bar instead of lying.
+- Artwork is addressed through the existing cached-image route, never Emby
+  directly. A warm wall costs Emby one list query and nothing more; the
+  metadata DB just moved off spinning disks and should not be hit per tile.
+- Entries with no Primary image tag are dropped from the wall rather than
+  rendered as grey holes in the grid.
+
+**Next**
+- User-management pages: the next feature focus.
+
 ## 2026-09-05 — dark console theme, and room for artwork
 **Done**
 - Panel is dark by default. It runs on a second monitor for hours next to a
@@ -27,9 +53,9 @@ Newest entries first. Every working session appends one entry.
   still defined, 20 added, none dropped.
 
 **Next**
-- Wire the dashboard to `.poster-grid` and `.play-card` (needs a panel-side
-  image cache; the metadata DB just moved off spinning disks and should not be
-  hit for every tile on every load).
+- Wire the dashboard to `.poster-grid` and `.play-card` — done in the entry
+  above; the existing image cache turned out to already cover the load
+  concern that was blocking it.
 - Then the user-management pages, which are the next feature focus.
 
 ## 2026-09-05 — dispatch follows the wire, and hot titles spread
