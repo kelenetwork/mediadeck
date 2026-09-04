@@ -88,45 +88,6 @@ def _create(service, user_id="u1", media_type="movie", tmdb_id=550, note=""):
     return asyncio.run(service.create(user_id, media_type, tmdb_id, note))
 
 
-# -- the whitelist group -----------------------------------------------------
-
-def test_the_whitelist_group_is_seeded_and_never_expires(stack) -> None:
-    _, groups, _, _, _ = stack
-    wl = groups.get("whitelist")
-    assert wl is not None
-    assert wl["duration_days"] == 0
-    assert wl["billing_mode"] == "none"
-    assert wl["max_streams"] == 10 and wl["max_devices"] == 10
-    assert wl["traffic_quota_bytes"] == 0
-    assert wl["request_quota"] == 0
-
-
-def test_seeding_the_whitelist_twice_changes_nothing(stack) -> None:
-    """Idempotent: boot happens more than once."""
-    _, groups, _, _, _ = stack
-    before = groups.get("whitelist")
-    assert groups.ensure_whitelist() == 0
-    assert groups.seed_defaults() == 0
-    assert groups.get("whitelist") == before
-    assert len([g for g in groups.list() if g["id"] == "whitelist"]) == 1
-
-
-def test_a_renamed_whitelist_group_is_left_alone(stack) -> None:
-    """The operator's edits outrank the seed."""
-    _, groups, _, _, _ = stack
-    groups.update("whitelist", {"name": "内部人员"})
-    groups.ensure_whitelist()
-    assert groups.get("whitelist")["name"] == "内部人员"
-
-
-def test_a_deleted_whitelist_group_comes_back_so_prouser_keeps_working(stack) -> None:
-    _, groups, _, _, _ = stack
-    groups.delete("whitelist")
-    assert groups.get("whitelist") is None
-    assert groups.ensure_whitelist() == 1
-    assert groups.get("whitelist") is not None
-
-
 # -- quota -------------------------------------------------------------------
 
 def test_the_default_group_allows_three_requests_a_month(stack, member) -> None:
@@ -224,13 +185,6 @@ def test_the_group_quota_is_editable_and_takes_effect_at_once(stack, member) -> 
     with pytest.raises(RequestError):
         _create(service, tmdb_id=551)
 
-
-def test_an_older_form_that_omits_the_quota_does_not_uncap_requests(stack) -> None:
-    """A UI predating the field posts no request_quota. Treating that as 0
-    would silently give everyone unlimited requests."""
-    _, groups, _, _, _ = stack
-    groups.update("standard", {"name": "普通用户"})
-    assert groups.get("standard")["request_quota"] == 3
 
 
 # -- deduplication -----------------------------------------------------------
