@@ -6,45 +6,51 @@
 const state = { page: 'dashboard', timer: null };
 const $ = (s) => document.querySelector(s);
 
+/* Grouped by what the operator is doing, not by which subsystem implements it.
+   Approvals and invites used to sit under "Telegram" because the bot delivers
+   them, and requests under "operations" because they are a business feature --
+   which meant finding either one required knowing the implementation first.
+   Everything about *who may watch* is now in one place, everything about
+   *what there is to watch* in another. */
 const NAV = [
   { group: '概览', items: [
     { id: 'dashboard', icon: '▦', label: '仪表盘', sub: '集中查看系统运行、播放使用和待处理事项' },
-  ]},
-  { group: '运营', items: [
-    { id: 'members', icon: '☺', label: '用户管理', sub: '用户组、角色、流量与设备' },
-    { id: 'groups', icon: '▣', label: '用户组', sub: '计费模式与默认限制' },
-    { id: 'redeem', icon: '🎟', label: '卡密管理', sub: '生成、发放与作废注册卡密' },
-    { id: 'shop', icon: '🎁', label: '兑换商城', sub: '积分商品、限购与兑换记录' },
-    { id: 'requests', icon: '🎬', label: '求片', sub: '成员求片、上片员接单与处理结果' },
     { id: 'stats', icon: '📈', label: '运营统计', sub: '流量、时长与热门内容' },
-    { id: 'audit', icon: '☰', label: '审计日志', sub: '操作记录与变更追踪' },
   ]},
-  { group: 'Telegram', items: [
-    { id: 'tgbot', icon: '✈', label: '机器人', sub: '注册通道、名额与运行状态' },
+  { group: '成员', items: [
+    { id: 'members', icon: '☺', label: '用户管理', sub: '账号、套餐、邀请关系与积分' },
+    { id: 'groups', icon: '▣', label: '套餐与用户组', sub: '时长、流量、并发与求片次数' },
     { id: 'invites', icon: '🎫', label: '邀请与授权', sub: '预授权名单、邀请名额与邀请树' },
-    { id: 'tgrequests', icon: '⇋', label: '关联审批', sub: '认领与换绑申请' },
+    { id: 'redeem', icon: '🎟', label: '卡密管理', sub: '生成、发放与作废注册卡密' },
+    { id: 'tgrequests', icon: '⇋', label: '关联审批', sub: '认领旧账号与换绑申请' },
+  ]},
+  { group: '内容', items: [
+    { id: 'library', icon: '▤', label: '媒体库', sub: '媒体库分布与条目统计' },
+    { id: 'requests', icon: '🎬', label: '求片', sub: '成员求片、上片员接单与处理结果' },
+    { id: 'imports', icon: '⇪', label: '网盘上片', sub: '网盘链接与云盘目录导入' },
+  ]},
+  { group: '互动', items: [
+    { id: 'tgbot', icon: '✈', label: '机器人', sub: '注册通道、名额与运行状态' },
+    { id: 'shop', icon: '🎁', label: '兑换商城', sub: '积分商品、限购与兑换记录' },
     { id: 'tggroup', icon: '⚑', label: '群组核查', sub: '已关联成员的群成员状态' },
   ]},
   { group: '自动化', items: [
-    { id: 'automation', icon: '⚡', label: '任务中心', sub: '定时任务的开关、配置与运行结果' },
+    { id: 'automation', icon: '⚡', label: '任务中心', sub: '任务与玩法插件的开关、配置与运行结果' },
+    { id: 'tasks', icon: '⏱', label: '调度中心', sub: '主机定时任务运行状态与失败追踪' },
   ]},
-  { group: '安全', items: [
-    { id: 'access', icon: '🛡', label: '访问拦截', sub: '客户端与网段规则，以及被拒记录' },
-    { id: 'sharing', icon: '👥', label: '共享检测', sub: '同时多地播放的账号，只记录不处理' },
-  ]},
-  { group: '工作台', items: [
-    { id: 'library', icon: '▤', label: '媒体库', sub: '媒体库分布与条目统计' },
-    { id: 'imports', icon: '⇪', label: '网盘上片', sub: '网盘链接与云盘目录导入' },
-  ]},
-  { group: '资源服务', items: [
+  { group: '资源', items: [
     { id: 'nodes', icon: '⛁', label: '节点管理', sub: '推流节点负载与调度' },
     { id: 'pipeline', icon: '⇄', label: '管线状态', sub: '整理、上传队列与配额' },
     { id: 'storage', icon: '☁', label: '存储管理', sub: '云盘账号与挂载点' },
     { id: 'mounts', icon: '⛃', label: '挂载管理', sub: '存储挂载健康与缓存占用' },
-    { id: 'tasks', icon: '⏱', label: '调度中心', sub: '定时任务运行状态与失败追踪' },
   ]},
-  { group: '系统管理', items: [
-    { id: 'settings', icon: '⚙', label: '系统设置', sub: '对接 Emby、调度策略与节点配置' },
+  { group: '安全', items: [
+    { id: 'access', icon: '🛡', label: '访问拦截', sub: '客户端与网段规则，以及被拒记录' },
+    { id: 'sharing', icon: '👥', label: '共享检测', sub: '同时多地播放的账号，只记录不处理' },
+    { id: 'audit', icon: '☰', label: '审计日志', sub: '操作记录与变更追踪' },
+  ]},
+  { group: '系统', items: [
+    { id: 'settings', icon: '⚙', label: '系统设置', sub: '对接 Emby、TMDB、调度策略与节点配置' },
     { id: 'update', icon: '⟳', label: '版本更新', sub: '检查并应用新版本' },
   ]},
 ];
@@ -314,6 +320,10 @@ async function renderPage(page, manual, live) {
 
 /* ---------------- pages ---------------- */
 PAGES.dashboard = async () => {
+  // Every page paints a placeholder before awaiting. Without it a slow first
+  // request leaves the previous page's content on screen, which reads as a
+  // click that did nothing.
+  $('#view').innerHTML = pageLoading();
   const [sessions, pipe, nodes, libs, overview, latest] = await Promise.all([
     api('/api/emby/sessions').catch(() => []),
     api('/api/pipeline').catch(() => ({ available: false })),
@@ -387,6 +397,7 @@ PAGES.dashboard = async () => {
 };
 
 PAGES.library = async () => {
+  $('#view').innerHTML = pageLoading();
   const libs = await api('/api/emby/libraries').catch(() => []);
   const total = libs.reduce((a, l) => a + (l.items || 0), 0);
   const kinds = new Set(libs.map((l) => l.type)).size;
@@ -404,6 +415,7 @@ PAGES.library = async () => {
 };
 
 PAGES.imports = async () => {
+  $('#view').innerHTML = pageLoading();
   const js = await api('/api/imports?limit=50').catch(() => []);
   $('#view').innerHTML = `
     ${card('新建导入', '提交网盘链接或云盘目录',
@@ -441,6 +453,7 @@ async function cancelImport(id) {
 }
 
 PAGES.nodes = async () => {
+  $('#view').innerHTML = pageLoading();
   const [ns, log, dispatch, st] = await Promise.all([
     api('/api/nodes').catch(() => []),
     api('/api/dispatch/log?limit=20').catch(() => []),
@@ -717,6 +730,7 @@ async function deleteNode(name) {
 }
 
 PAGES.pipeline = async () => {
+  $('#view').innerHTML = pageLoading();
   const p = await api('/api/pipeline').catch(() => ({ available: false }));
   if (!p.available) { $('#view').innerHTML = `<div class="card"><div class="empty">管线快照不可用</div></div>`; return; }
   const d = p.data, f = d.fallback || {};
@@ -739,6 +753,7 @@ PAGES.pipeline = async () => {
 };
 
 PAGES.mounts = async () => {
+  $('#view').innerHTML = pageLoading();
   const m = await api('/api/mounts').catch(() => ({ available: false }));
   if (!m.available) {
     $('#view').innerHTML = `<div class="card"><div class="empty">挂载快照不可用</div></div>`;
@@ -776,6 +791,7 @@ PAGES.mounts = async () => {
 };
 
 PAGES.tasks = async () => {
+  $('#view').innerHTML = pageLoading();
   const t = await api('/api/tasks').catch(() => ({ available: false }));
   if (!t.available) {
     $('#view').innerHTML = `<div class="card"><div class="empty">调度快照不可用</div></div>`;
@@ -818,6 +834,7 @@ PAGES.tasks = async () => {
 };
 
 PAGES.settings = async () => {
+  $('#view').innerHTML = pageLoading();
   const s = await api('/api/settings').catch(() => null);
   if (!s) { $('#view').innerHTML = `<div class="card"><div class="empty">设置加载失败</div></div>`; return; }
   const e = s.emby, d = s.dispatch, p = s.playback, ig = s.integration;
@@ -1120,6 +1137,7 @@ async function clearImageCache() {
 }
 
 PAGES.update = async () => {
+  $('#view').innerHTML = pageLoading();
   const v = await api('/api/update/version').catch(() => ({ version: '?', commit: '?' }));
   $('#view').innerHTML = `
     <div class="stat-grid">

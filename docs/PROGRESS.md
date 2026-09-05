@@ -4,6 +4,26 @@ Newest entries first. Every working session appends one entry.
 
 ---
 
+## 2026-09-05 — navigation grouped by task, and no more blank pages
+**Done**
+- Navigation regrouped by what the operator is doing rather than by which
+  subsystem implements it. Invite quota and claim approvals used to sit under
+  "Telegram" because the bot delivers them, and requests under "operations"
+  because they are a business feature — so finding either one meant knowing the
+  implementation first. Everything about *who may watch* is now under 成员,
+  everything about *what there is to watch* under 内容.
+- 自动化 no longer holds a single item: the plugin centre and the host task
+  monitor are both scheduling, so they share a group. 审计日志 moved beside the
+  other two forensic views under 安全 — all three answer "what happened".
+- Every page now paints a placeholder before its first await. Nine pages in
+  app.js had none, so a slow request left the previous page on screen and a
+  click read as having done nothing. 23 of 24 pages covered; the last one
+  renders synchronously and has nothing to wait for.
+
+**Next**
+- Split `PAGES.settings` (164 lines, seven cards in one function) so editing
+  one field does not re-render the whole page.
+
 ## 2026-09-05 — media requests, uploader claiming and admin commands
 **Done**
 - **A request names a film, not a string.** Members send a TMDB link or id;
