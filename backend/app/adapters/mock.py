@@ -182,6 +182,33 @@ class MockEmby:
         ]
         return items[:max(1, limit)]
 
+    # -- intake observability ------------------------------------------------
+    async def scheduled_tasks(self) -> list[dict[str, Any]]:
+        return [
+            {"Key": "ScanExternalTrackTask", "Name": "Scan External Tracks",
+             "State": "Idle",
+             "LastExecutionResult": {"Status": "Completed",
+                                     "EndTimeUtc": "2026-01-01T00:00:00.0000000Z"}},
+            {"Key": "RefreshLibrary", "Name": "Scan media library",
+             "State": "Running", "CurrentProgressPercentage": 42.5,
+             "LastExecutionResult": {"Status": "Completed",
+                                     "EndTimeUtc": "2026-01-01T00:00:00.0000000Z"}},
+        ]
+
+    async def latest_created(self, limit: int = 1) -> dict[str, Any]:
+        now = time.strftime("%Y-%m-%dT%H:%M:%S.0000000Z", time.gmtime())
+        return {"TotalRecordCount": 1,
+                "Items": [{"Id": "mock-item-1", "Name": "Demo Episode",
+                           "Type": "Episode", "DateCreated": now}][:max(1, limit)]}
+
+    async def server_log_tail(self, max_bytes: int = 512_000,
+                              name: str = "embyserver.txt") -> str:
+        line = ("2026-01-01 00:00:00.000 Info MediaProbeManager: ProcessRun "
+                "'ffprobe' Execute: /bin/ffprobe -i file:\"/media/Demo/Show/a.mkv\" "
+                "-threads 0")
+        other = line.replace("/media/Demo/Show/a.mkv", "/media/Other/Film/b.mkv")
+        return "\n".join([line] * 6 + [other] * 4)[-max_bytes:]
+
 
 class MockProbe:
     """Simulates per-node /load probes with drifting load values."""

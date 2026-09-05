@@ -490,6 +490,72 @@ class LiveEmby:
             return out
 
 
+    # -- intake observability ------------------------------------------------
+    # Three read-only calls behind the intake page. They are separate from the
+    # dashboard's calls because they run on a slow timer and must stay cheap:
+    # this page is opened when the server is already unwell, and a diagnostic
+    # that adds load is a diagnostic that cannot be used.
+    async def scheduled_tasks(self) -> list[dict[str, Any]]:
+        base, headers, timeout, verify = self._conn()
+        async with self._client(timeout, verify) as client:
+            r = self._check(
+                await client.get(f"{base}/emby/ScheduledTasks", headers=headers))
+            r.raise_for_status()
+            data = r.json()
+        return data if isinstance(data, list) else []
+
+    async def latest_created(self, limit: int = 1) -> dict[str, Any]:
+        """Newest episodes/movies by creation time.
+
+        Episodes are included here, unlike the dashboard wall: the question is
+        "did anything at all land recently", and a series that gained one
+        episode is exactly the evidence wanted.
+        """
+        base, headers, timeout, verify = self._conn()
+        params = {
+            "Recursive": "true",
+            "IncludeItemTypes": "Episode,Movie",
+            "SortBy": "DateCreated",
+            "SortOrder": "Descending",
+            "Limit": str(max(1, min(limit, 20))),
+            "Fields": "DateCreated",
+        }
+        async with self._client(timeout, verify) as client:
+            r = self._check(
+                await client.get(f"{base}/emby/Items", headers=headers, params=params))
+            r.raise_for_status()
+            data = r.json()
+        return data if isinstance(data, dict) else {}
+
+    async def server_log_tail(self, max_bytes: int = 512_000,
+                              name: str = "embyserver.txt") -> str:
+        """Tail of the server log.
+
+        The endpoint ignores Range and always returns the whole file (verified
+        against the deployed server), so the tail is taken client-side. The
+        response is streamed and the last ``max_bytes`` kept, which bounds
+        memory even when the log is hundreds of megabytes.
+        """
+        base, headers, timeout, verify = self._conn()
+        chunks: list[bytes] = []
+        held = 0
+        async with self._client(timeout, verify) as client, client.stream(
+            "GET", f"{base}/emby/System/Logs/Log",
+            headers=headers, params={"name": name},
+        ) as response:
+            self._check(response)
+            response.raise_for_status()
+            async for chunk in response.aiter_bytes(65536):
+                chunks.append(chunk)
+                held += len(chunk)
+                while held - len(chunks[0]) >= max_bytes and len(chunks) > 1:
+                    held -= len(chunks.pop(0))
+        blob = b"".join(chunks)[-max_bytes:]
+        text = blob.decode("utf-8", errors="replace")
+        # Drop a partial first line so a truncated record cannot be parsed.
+        return text.split("\n", 1)[1] if "\n" in text else text
+
+
 class LiveProbe:
     async def load(self, probe_url: str) -> dict[str, Any]:
         try:

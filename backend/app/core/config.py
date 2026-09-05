@@ -99,6 +99,34 @@ class Settings(BaseSettings):
     mounts_snapshot_path: str = ""
     tasks_snapshot_path: str = ""
 
+    # -- intake pipeline observability ---------------------------------------
+    # Where the intake stages keep their state on this host. All optional and
+    # all empty by default: the panel must run anywhere, and a deployment's
+    # real layout is configuration, never something baked into the package.
+    # Each unset value simply makes its card report "not configured".
+    intake_refresh_queue_dir: str = ""
+    intake_refresh_sent_dir: str = ""
+    intake_refresh_suppress_file: str = ""
+    intake_notify_pending_dir: str = ""
+    intake_notify_log: str = ""
+    intake_upload_lane_root: str = ""
+    intake_staging_dir: str = ""
+    intake_local_fallback_dir: str = ""
+    intake_quarantine_dir: str = ""
+    intake_upload_state_dir: str = ""
+    intake_cloud_claims_dir: str = ""
+    intake_cloud_done_dir: str = ""
+    intake_cloud_pending_dir: str = ""
+    intake_cloud_events_dir: str = ""
+    intake_cloud_backlog_file: str = ""
+    intake_cloud_queue_file: str = ""
+    intake_cloud_active_file: str = ""
+
+    # Torrent clients summarised on the intake page. JSON list of
+    # {"name": ..., "url": ..., "username": ..., "password": ...}; the
+    # credential fields are optional and never leave the process.
+    intake_downloaders: str = "[]"
+
     repo_root: str = ""
     service_name: str = "mediadeck"
 
@@ -116,6 +144,27 @@ class Settings(BaseSettings):
     @property
     def settings_file(self) -> Path:
         return self.data_dir / "settings.json"
+
+    def intake_paths(self) -> dict[str, str]:
+        """Env-configured intake locations, keyed as IntakePaths expects."""
+        prefix = "intake_"
+        return {
+            name[len(prefix):]: getattr(self, name)
+            for name in type(self).model_fields
+            if name.startswith(prefix) and name != "intake_downloaders"
+        }
+
+    def intake_downloader_specs(self) -> list[dict[str, str]]:
+        try:
+            raw = json.loads(self.intake_downloaders or "[]")
+        except json.JSONDecodeError:
+            return []
+        out = []
+        for item in raw if isinstance(raw, list) else []:
+            if not isinstance(item, dict) or not item.get("url"):
+                continue
+            out.append({k: str(v or "") for k, v in item.items()})
+        return out
 
     def nodes(self) -> list[StreamNode]:
         """Legacy env-defined nodes, used only to seed the settings store."""

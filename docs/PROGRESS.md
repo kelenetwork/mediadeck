@@ -4,6 +4,69 @@ Newest entries first. Every working session appends one entry.
 
 ---
 
+## 2026-09-06 — intake pipeline on one screen (v0.22.0)
+**Done**
+- **A new 入库流水线 page answers "why has nothing arrived?" without a shell.**
+  A file becomes watchable only after a chain of independent steps — download,
+  staging, cloud upload, refresh queue, notification — each a separate process
+  with its own state directory and no view of the others. When nothing shows
+  up, the fault could be an idle download queue (fine), a stalled upload lane,
+  a refresh queue suppressed hours ago, or a media server re-probing one
+  directory in a loop. Answering that meant opening shells on three machines.
+  Now it is one screen with a red/amber/green verdict at the top.
+- **The verdict is conjunctive where a single signal would lie.** "No new item
+  for 90 minutes" is a quiet night, not a fault; it only turns red when
+  notifications are *also* waiting, because that combination is the one that
+  means work is stuck rather than absent. A test pins this specific false
+  positive, since a light that cries wolf overnight is a light nobody reads.
+- **Probe concentration is the loop detector.** A healthy server probes many
+  files across many directories; a wedged one probes the same handful forever.
+  Only the grouped view separates those, so probe lines are aggregated by their
+  first two directory levels and the top share is compared to a threshold.
+- **"Unknown" and "zero" are never conflated.** Every section reports its own
+  availability, and a missing directory, a truncated JSON file, an unrecognised
+  log format and an unreachable media server each degrade alone. This page is
+  read during incidents — exactly when parts of the system are broken — so a
+  card that renders 0 for a directory it could not open would be worse than
+  useless. Nine tests cover those paths specifically.
+- **Collection runs on the plugin timer, not per request.** One snapshot walks
+  several thousand files, tails a large log and makes three media-server calls.
+  Once a minute that is fine; on every page load of an auto-refreshing page it
+  would put that cost on a server already struggling. The API serves the last
+  snapshot with its age attached, a failed collection keeps the previous one
+  rather than erasing it, and 立即采集 forces a fresh pass.
+- **Every path is configuration.** The repository carries no deployment layout:
+  seventeen optional env keys, all empty by default, so an unconfigured install
+  shows honest "未配置" cards instead of failing. Tests build a whole fake host
+  under tmp_path.
+- The nav guard in `test_plugins.py` now derives its script list from
+  `index.html` instead of naming two files, so a page added in a new file
+  cannot silently escape the check. It caught this page before the first
+  commit — which is what it is for.
+
+**Decisions**
+- *Cached snapshot over live collection.* Freshness is bounded and labelled;
+  the alternative charges an incident-time page against a sick media server.
+- *Emby log tailed client-side.* The log endpoint ignores `Range` and returns
+  the whole file (verified against the deployment), so the response is streamed
+  and only the last 512 KB retained — bounded memory without server support.
+- *Task matched on `Key`, not name.* Three tasks have "scan" in their display
+  name and the name is localised; the key is stable. Tested against all three.
+- *Downloader auth is lazy.* The API is commonly bound to loopback with auth
+  off, so a login is attempted only after a 401/403 rather than unconditionally.
+- *Zero-byte files excluded from lane sizing.* Lanes are pre-created with
+  placeholder markers; counting them makes an idle lane look busy.
+
+**Verification**
+- 775 tests passing (was 722): +53 for this feature. `ruff` clean.
+- Boots in mock mode; `/api/intake` returns a fully populated snapshot with no
+  credentials configured.
+
+**Next**
+- Direct-link traffic accounting (v0.23.0): `members.traffic_used_bytes` covers
+  only 7 days and misses direct-link bytes entirely, so it cannot be trusted
+  for any decision about an account.
+
 ## 2026-09-05 — navigation grouped by task, and no more blank pages
 **Done**
 - Navigation regrouped by what the operator is doing rather than by which

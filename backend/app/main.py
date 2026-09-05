@@ -30,11 +30,14 @@ from app.core.db import Database
 from app.core.errors import ConfigError, ConflictError, NotConfigured, UpstreamError
 from app.core.store import SettingsStore
 from app.modules.access import AccessRules
+from app.modules.downloaders import MockDownloader, QbittorrentClient
 from app.modules.enforcement import EnforcementService
 from app.modules.events import EventStream, safe_stream
 from app.modules.groups import GroupService
 from app.modules.imagecache import ALLOWED_IMAGE_TYPES, ImageCache
 from app.modules.imports import ImportManager, JobKind, MockExecutor
+from app.modules.intake import FsReader, IntakePaths
+from app.modules.intake_plugin import IntakeStore
 from app.modules.members import MemberService, random_password, rate_bytes_per_sec
 from app.modules.mounts import MockMounts, MountsReader
 from app.modules.pipeline import MockPipeline, PipelineReader
@@ -118,6 +121,26 @@ def _digest(secret_text: str) -> str:
     return hashlib.sha256(secret_text.encode()).hexdigest()
 
 
+def _build_downloaders(cfg: Any) -> list[Any]:
+    """Torrent clients summarised on the intake page.
+
+    Credentials are read from local configuration into the client object and
+    never leave it: they are not returned by any endpoint, not logged, and not
+    part of any snapshot.
+    """
+    if cfg.mediadeck_mock:
+        return [MockDownloader("mock-downloader")]
+    out = []
+    for spec in cfg.intake_downloader_specs():
+        out.append(QbittorrentClient(
+            name=spec.get("name") or "downloader",
+            base_url=spec.get("url") or "",
+            username=spec.get("username") or "",
+            pw_value=spec.get("password") or "",
+        ))
+    return out
+
+
 def _storage_call(fn: Any, *args: Any, **kwargs: Any) -> Any:
     try:
         return fn(*args, **kwargs)
@@ -180,6 +203,14 @@ async def _startup() -> None:
         MockTasks() if cfg.mediadeck_mock else TasksReader(cfg.tasks_snapshot_path)
     )
     app.state.imports = ImportManager(MockExecutor() if cfg.mediadeck_mock else None)
+
+    # ---- intake pipeline observability -----------------------------------
+    # Assembled here so the collector's three seams (paths, filesystem, media
+    # server) are all injected from one place, and so mock mode gets a fully
+    # populated page without touching a real host.
+    app.state.intake_store = IntakeStore()
+    app.state.intake_paths = IntakePaths.from_mapping(cfg.intake_paths())
+    app.state.intake_downloaders = _build_downloaders(cfg)
     if cfg.mediadeck_mock or not cfg.repo_root:
         app.state.updater = MockUpdater()
     else:
@@ -372,6 +403,11 @@ async def _startup() -> None:
         shop=app.state.shop,
         scheduler=app.state.scheduler,
         requests=app.state.requests,
+        intake_store=app.state.intake_store,
+        intake_paths=app.state.intake_paths,
+        intake_fs=FsReader(),
+        intake_emby=app.state.emby,
+        intake_downloaders=app.state.intake_downloaders,
     )
     # Carry the old loop's settings onto the new cards before the scheduler
     # starts, so an operator who had the ranking post switched on keeps it,
@@ -385,6 +421,17 @@ async def _startup() -> None:
     # registry does not exist until the plugins are registered against it.
     app.state.telegram.bind_plugins(app.state.plugins)
     app.state.plugins.start()
+
+    async def _prime_intake() -> None:
+        """Collect once at boot instead of leaving the page empty for a minute.
+
+        Off the startup path: a slow or unreachable media server must delay a
+        diagnostic page, never the panel itself.
+        """
+        with contextlib.suppress(Exception):
+            await app.state.plugins.run_now("intake_pipeline", trigger="startup")
+
+    app.state.intake_prime_task = asyncio.create_task(_prime_intake())
 
     async def _nodes_topic() -> Any:
         config = {n["name"]: n for n in app.state.settings_service.nodes_public()}
@@ -405,6 +452,9 @@ async def _startup() -> None:
         "tasks": lambda: asyncio.to_thread(app.state.tasks.snapshot),
         "mounts": lambda: asyncio.to_thread(app.state.mounts.snapshot),
         "playback": lambda: asyncio.to_thread(app.state.playback.recent, 30),
+        # Served from the cached snapshot, so pushing it costs nothing beyond
+        # the collection that already happened on the plugin timer.
+        "intake": lambda: asyncio.to_thread(app.state.intake_store.get),
     })
 
 
@@ -427,7 +477,7 @@ async def root(_: str = Depends(_auth)) -> HTMLResponse:
     except Exception:  # noqa: BLE001 - version stamping must never break the page
         ver = ""
     if ver:
-        for asset in ("app.css", "app.js", "ops.js"):
+        for asset in ("app.css", "app.js", "intake.js", "ops.js"):
             html = html.replace(f"/static/{asset}", f"/static/{asset}?v={ver}")
     return HTMLResponse(html)
 
@@ -616,6 +666,25 @@ async def stream_redirect(path: str) -> RedirectResponse:
 @app.get("/api/pipeline", dependencies=[Depends(_auth)])
 async def pipeline() -> dict[str, Any]:
     return app.state.pipeline.snapshot()
+
+
+@app.get("/api/intake", dependencies=[Depends(_auth)])
+async def intake() -> dict[str, Any]:
+    """Last collected intake snapshot, with its age.
+
+    Deliberately serves the cached snapshot rather than collecting on demand:
+    the collection walks thousands of files and tails a large log, and this
+    page auto-refreshes.
+    """
+    return app.state.intake_store.get()
+
+
+@app.post("/api/intake/refresh", dependencies=[Depends(_auth)])
+async def intake_refresh() -> dict[str, Any]:
+    """Collect now, for an operator who will not wait for the next tick."""
+    result = await app.state.plugins.run_now("intake_pipeline", trigger="manual")
+    return {"ok": bool(result.get("ok", True)), "result": result,
+            "snapshot": app.state.intake_store.get()}
 
 
 # ---- self-update -----------------------------------------------------------

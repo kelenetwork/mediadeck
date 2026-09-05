@@ -27,6 +27,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.modules.intake_plugin import IntakePipelinePlugin
 from app.modules.plugins import Field, Plugin, PluginRegistry, Spec
 from app.modules.plugins_points import POINTS_PLUGINS
 
@@ -60,6 +61,16 @@ class PluginContext:
     scheduler: Any = None
     # Media requests, for the digest card that nudges uploaders.
     requests: Any = None
+    # -- intake pipeline observability ---------------------------------------
+    # Injected wholesale rather than reached for: the collector's filesystem
+    # reader and media-server client are the two seams the tests replace, and
+    # a plugin that imported either directly could only be tested by booting
+    # the whole application against a real host.
+    intake_store: Any = None
+    intake_paths: Any = None
+    intake_fs: Any = None
+    intake_emby: Any = None
+    intake_downloaders: Any = None
     # Set by register_builtin. A points plugin needs its own live config at
     # the moment a member taps a button, which is not the config that was
     # passed to the last scheduled run.
@@ -544,6 +555,7 @@ class RequestDigestPlugin(Plugin):
 
 
 BUILTIN_PLUGINS = (
+    IntakePipelinePlugin,
     GroupAuditPlugin,
     InactiveCleanupPlugin,
     ViewingReportPlugin,
