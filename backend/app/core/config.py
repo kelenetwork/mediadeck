@@ -75,6 +75,10 @@ class StreamNode(BaseModel):
     # `rclone config`, which is exactly the manual step this replaces.
     rclone_conf: str = ""
     enroll_token: str = ""         # one-shot token for unattended install
+    # Long-lived credential the node's traffic reporter presents. Distinct
+    # from enroll_token, which is one-shot by design: rotating the install
+    # credential must not silently stop traffic accounting.
+    report_token: str = ""
     # Global storage mounts this node should carry. Empty means "not bound
     # to the global list yet"; existing nodes may still have rclone_conf.
     mount_ids: list[str] = []

@@ -411,6 +411,46 @@ CREATE INDEX IF NOT EXISTS idx_shop_orders_user
     ON shop_orders(emby_user_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_shop_orders_item ON shop_orders(item_id);
 
+-- v0.23: bytes measured on the edge, per user per node per day.
+--
+-- Deliberately NOT merged into usage_daily. That table holds an estimate
+-- derived from playback sampling (playing time x bitrate) and therefore only
+-- sees what the media server observes -- which excludes signed direct links,
+-- i.e. nearly all real traffic. This table holds bytes nginx actually put on
+-- the wire. Keeping them apart is what makes it possible to say which figure
+-- came from where; conflating them is how an estimate came to be trusted as
+-- a measurement.
+--
+-- Keyed on (day, node, utag) rather than user id: the log carries the
+-- anonymised tag, and a line whose tag is not yet linked to a member must
+-- still be counted. emby_user_id is filled in when known and backfilled
+-- later, so history becomes attributable retroactively.
+CREATE TABLE IF NOT EXISTS edge_usage_daily (
+    day          TEXT NOT NULL,
+    node         TEXT NOT NULL,
+    utag         TEXT NOT NULL,
+    emby_user_id TEXT NOT NULL DEFAULT '',
+    bytes        INTEGER NOT NULL DEFAULT 0,
+    requests     INTEGER NOT NULL DEFAULT 0,
+    seconds      INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (day, node, utag)
+);
+CREATE INDEX IF NOT EXISTS idx_edge_usage_user
+    ON edge_usage_daily(emby_user_id, day);
+CREATE INDEX IF NOT EXISTS idx_edge_usage_day ON edge_usage_daily(day);
+
+-- How far each node's log has been consumed. (inode, offset) rather than a
+-- timestamp: re-reading a window would double-count permanently, and inode
+-- is what distinguishes a rotated file from the same file grown longer.
+CREATE TABLE IF NOT EXISTS edge_cursors (
+    node       TEXT NOT NULL,
+    path       TEXT NOT NULL,
+    inode      INTEGER NOT NULL DEFAULT 0,
+    offset     INTEGER NOT NULL DEFAULT 0,
+    updated_at INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (node, path)
+);
+
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL

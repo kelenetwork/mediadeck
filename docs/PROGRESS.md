@@ -4,6 +4,68 @@ Newest entries first. Every working session appends one entry.
 
 ---
 
+## 2026-09-06 — traffic measured instead of guessed (v0.23.0)
+**Done**
+- **`members.traffic_used_bytes` was never a traffic figure.** It is derived
+  from sampled playback sessions — playing time × bitrate — so it only sees
+  what the media server observes. But playback is served by signed direct
+  links straight from the edge nodes, which the media server never sees at
+  all. On top of that it resets on a rolling period, so it answers "recently"
+  rather than "ever". Read as lifetime usage it makes active accounts look
+  idle, which is how a cleanup nearly removed 196 of them.
+- **The ledger records bytes the edge actually sent**, per user × node × day,
+  parsed from each node's nginx access log. Measured against the live fleet:
+  **5.8 TB and 218 distinct users** that the old counter never saw.
+- **Idempotent by construction.** Cursors are `(inode, offset)` per file and
+  owned by the panel, not the node — the panel is the party that must not
+  double count, and a node-side cursor would diverge after any restore.
+  Rotation is detected by inode change, truncation by a file shorter than the
+  cursor; neither replays counted data. Writes are additive upserts of only
+  newly-seen bytes, so a retried batch adds nothing twice.
+- **Unattributable bytes are kept, not dropped.** A line whose tag matches no
+  member is recorded against the tag with an empty user id and surfaced in
+  `/api/edge/status`. Traffic that cannot be attributed still left the
+  building, and discarding it would make totals disagree with the nodes for
+  reasons nobody could later reconstruct. `relink` backfills those rows once
+  the member is known, so history becomes attributable retroactively.
+- **Both log formats parse.** Nodes provisioned at different times write
+  different shapes, and one began appending `s=$status $uri` mid-deployment.
+  Fields are read by name with unknown trailing tokens ignored. Verified
+  against every real log on all three nodes: **98.4–99.8% coverage**, and
+  every rejected line was checked to be legitimately non-billable (unsigned
+  request, zero-byte response, or a truncated final write).
+- **Members page**: sortable 直链 7 天 / 30 天 / 累计 columns plus 最近活跃
+  from Emby's own `LastActivityDate`. Member detail gets per-node and per-day
+  breakdowns. The old field stays but is labelled 旧口径（不含直链）.
+- **Node side is purely additive**: one new agent file and one systemd unit.
+  Nothing in nginx is touched — in particular nothing near `secure_link` or
+  rate limiting — so a mistake here cannot break playback.
+
+**Decisions**
+- *Push, not pull.* The nodes' existing probe route drops query arguments
+  (verified live), so a pull design would have required editing the nginx
+  site that also carries `secure_link` and `limit_rate`. The reporter posts
+  outward instead: all three nodes already reach the panel over HTTPS, and
+  the change set on a node is two new files.
+- *A separate table, not an extension of `usage_daily`.* One holds an
+  estimate, the other a measurement. Merging them destroys the ability to say
+  which is which — and treating the estimate as a measurement is the entire
+  bug being fixed.
+- *A dedicated per-node credential*, distinct from the one-shot enrol token
+  (rotating the installer's credential must not silently stop accounting) and
+  scoped to its own node, so one node cannot post another's traffic. It is
+  never included in the node list the settings page loads.
+- *Client-side sorting.* A few hundred rows are already in the browser; a
+  round trip per header click would make an instant interaction depend on the
+  network.
+
+**Verification**
+- 824 tests (was 780): +44. `ruff` clean.
+- Parser run over every real log on all three nodes before merge.
+
+**Next**
+- Node pool management in the UI (v0.24.0).
+
 ## 2026-09-06 — three things the intake page got wrong in production (v0.22.1)
 **Done**
 Deployed v0.22.0 and read it against the live system. It was wrong in three

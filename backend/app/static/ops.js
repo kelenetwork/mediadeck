@@ -146,14 +146,43 @@ async function deleteMount(name) {
    shows provenance (which door they came in by, who vouched for them) because
    that is what the invite tree is for. */
 const MEMBER_COLS = ['', 'Emby 账号', '套餐', '有效期', '注册渠道', '邀请人',
-  '下级', 'TG', '积分', '本月观看', ''];
+  '下级', 'TG', '积分', '本月观看',
+  '直链 7 天', '直链 30 天', '直链累计', '最近活跃', ''];
+
+/* Sortable columns. Sorting happens client-side over the page already
+   fetched: the list is capped at a few hundred rows, and a round trip per
+   header click would make an interaction that should feel instant depend on
+   the network. */
+const MEMBER_SORTS = {
+  edge7: (m) => Number((m.edge || {}).bytes_7d || 0),
+  edge30: (m) => Number((m.edge || {}).bytes_30d || 0),
+  edgeTotal: (m) => Number((m.edge || {}).bytes_total || 0),
+  lastActive: (m) => Number(m.last_activity_ts || 0),
+};
 
 PAGES.members = async () => {
   $('#view').innerHTML = pageLoading();
-  const [listing, groups] = await Promise.all([api('/api/members'), api('/api/groups')]);
+  /* Last-activity rides along but must never block the page: it is one extra
+     call to Emby, and a member list that fails because a decorative column
+     could not load is worse than one missing the column. */
+  const [listing, groups, activity] = await Promise.all([
+    api('/api/members'), api('/api/groups'),
+    api('/api/members-activity').catch(() => ({ activity: {} })),
+  ]);
   state.memberListing = listing;
   state.groups = groups;
   const members = listing.members || [];
+  const activityMap = (activity && activity.activity) || {};
+  for (const m of members) {
+    const stamp = activityMap[m.emby_user_id];
+    const parsed = stamp ? Date.parse(String(stamp).replace(/(\.\d{3})\d+/, '$1')) : NaN;
+    m.last_activity_ts = Number.isNaN(parsed) ? 0 : parsed / 1000;
+  }
+  if (state.memberSort && MEMBER_SORTS[state.memberSort.key]) {
+    const pick = MEMBER_SORTS[state.memberSort.key];
+    const dir = state.memberSort.desc ? -1 : 1;
+    members.sort((a, b) => (pick(a) - pick(b)) * dir);
+  }
   state.watchPeak = members.reduce((max, m) => Math.max(max, Number(m.watch_hours || 0)), 0);
   const midnight = new Date(); midnight.setHours(0, 0, 0, 0);
   const dayStart = midnight.getTime() / 1000;
@@ -226,6 +255,7 @@ PAGES.members = async () => {
     headCell.innerHTML = '<input type="checkbox" id="m-pick-all">';
     $('#m-pick-all').onchange = (e) => toggleAllMembers(e.target.checked);
   }
+  bindMemberSorting();
   $('#mf-apply').onclick = filterMembers;
   $('#mf-reset').onclick = resetMemberFilters;
   ['mf-q', 'mf-inviter'].forEach((id) => {
@@ -236,6 +266,28 @@ PAGES.members = async () => {
   if ($('#mf-enroll-all')) $('#mf-enroll-all').onclick = enrollAllDefaults;
   if (state.memberFilter) applyStoredMemberFilter();
 };
+/* Header clicks toggle the sort and re-render. The chosen sort lives in
+   state, like the filters, so it survives the re-render it triggers. */
+function bindMemberSorting() {
+  const heads = document.querySelectorAll('#member-table thead th');
+  const order = [null, null, null, null, null, null, null, null, null, null,
+    'edge7', 'edge30', 'edgeTotal', 'lastActive', null];
+  heads.forEach((cell, index) => {
+    const key = order[index];
+    if (!key) return;
+    cell.classList.add('sortable');
+    const active = state.memberSort && state.memberSort.key === key;
+    if (active) cell.textContent += state.memberSort.desc ? ' ↓' : ' ↑';
+    cell.onclick = () => {
+      const wasDesc = active && state.memberSort.desc;
+      // First click on a byte column sorts descending: "who used the most"
+      // is the question being asked, and ascending would open on zeros.
+      state.memberSort = { key, desc: !active ? true : !wasDesc };
+      renderPage('members');
+    };
+  });
+}
+
 /* Jumping from an inviter cell to "everyone they brought in" has to survive
    the page re-render, so the intent is stored rather than applied to DOM that
    is about to be replaced. */
@@ -331,6 +383,10 @@ function memberRow(m) {
     <td>${tgCell(m)}</td>
     <td>${pointsCell(m)}</td>
     <td>${watchCell(m)}</td>
+    <td>${edgeCell(m, 'bytes_7d')}</td>
+    <td>${edgeCell(m, 'bytes_30d')}</td>
+    <td>${edgeCell(m, 'bytes_total')}</td>
+    <td>${lastActiveCell(m)}</td>
     <td class="icon-actions">
       <button class="btn sm" title="详情" onclick="memberDetail('${id}')">👁</button>
       <button class="btn sm" title="续期" onclick="memberRenew('${id}')">⏳</button>
@@ -339,6 +395,52 @@ function memberRow(m) {
       <button class="btn sm danger" title="删除"
         onclick="memberDelete('${id}','${q(m.username)}')">🗑</button>
     </td></tr>`;
+}
+
+/* Measured direct-link bytes. Zero is muted rather than bold: on a server
+   whose ledger has only just started every row reads zero, and shouting it
+   would make the column look broken rather than new. */
+/* Per-node and per-day measured bytes. Shown as its own section rather than
+   folded into the legacy bar above, because the two numbers are not the same
+   quantity: one is sampled from playback the media server saw, the other is
+   bytes the edge actually sent. Presenting them as one figure is what made
+   the old number look authoritative. */
+function edgeDetailSection(edge) {
+  const byNode = (edge && edge.by_node) || [];
+  const byDay = (edge && edge.by_day) || [];
+  if (!byNode.length && !byDay.length) {
+    return `<h3 style="font-size:13px;margin:16px 0 6px">直链流量（实测）</h3>
+      <div class="help muted">该成员在统计窗口内没有直链流量记录。</div>`;
+  }
+  const total = byNode.reduce((sum, r) => sum + Number(r.bytes || 0), 0);
+  const nodeRows = byNode.map((r) => `<tr><td>${esc(r.node)}</td>
+    <td>${fmtBytes(r.bytes)}</td><td>${esc(r.requests)}</td></tr>`).join('');
+  const recent = byDay.slice(-14).reverse();
+  const dayRows = recent.map((r) => `<tr><td>${esc(r.day)}</td>
+    <td>${fmtBytes(r.bytes)}</td><td>${esc(r.requests)}</td></tr>`).join('');
+  return `<h3 style="font-size:13px;margin:16px 0 6px">直链流量（实测 · 近 ${esc((edge && edge.days) || 30)} 天）</h3>
+    <div class="help">合计 <b>${fmtBytes(total)}</b>，来自各节点 nginx 实际发送字节。</div>
+    <table><thead><tr><th>节点</th><th>流量</th><th>请求数</th></tr></thead>
+      <tbody>${nodeRows || '<tr><td colspan="3" class="muted">无</td></tr>'}</tbody></table>
+    <h3 style="font-size:13px;margin:16px 0 6px">按日明细</h3>
+    <table><thead><tr><th>日期</th><th>流量</th><th>请求数</th></tr></thead>
+      <tbody>${dayRows || '<tr><td colspan="3" class="muted">无</td></tr>'}</tbody></table>`;
+}
+
+function edgeCell(m, key) {
+  const n = Number((m.edge || {})[key] || 0);
+  return n ? fmtBytes(n) : '<span class="muted">0</span>';
+}
+
+/* Last activity comes from Emby, which tracks it per account. Inferring
+   "inactive" from a traffic total is precisely the mistake that made an
+   unmeasured account indistinguishable from an idle one. */
+function lastActiveCell(m) {
+  const ts = Number(m.last_activity_ts || 0);
+  if (!ts) return '<span class="muted">—</span>';
+  const age = Date.now() / 1000 - ts;
+  const cls = age > 90 * 86400 ? 'danger-text' : '';
+  return `<span class="${cls}">${esc(fmtAge(age))}前</span>`;
 }
 
 /* A zero balance is muted rather than bold: on a server that has just
@@ -777,7 +879,9 @@ async function memberDetail(id) {
     body.innerHTML = `
       <div class="help">${esc(m.username)} · ${esc(m.group_name)} · ${stateTag(m.state)}${roleTags(m)}
         <span class="muted">${esc(m.state_reason || '')}</span></div>
-      <div class="help">到期 ${esc(fmtExpiry(m.expires_at_effective || m.expires_at))} · 流量 ${fmtBytes(m.traffic_used_bytes)} / ${fmtQuota(m.traffic_quota_bytes)}</div>
+      <div class="help">到期 ${esc(fmtExpiry(m.expires_at_effective || m.expires_at))}
+        · <span title="按播放会话采样估算，不含直链流量">旧口径流量（不含直链）</span>
+        ${fmtBytes(m.traffic_used_bytes)} / ${fmtQuota(m.traffic_quota_bytes)}</div>
       <div class="help">注册渠道 ${channelTag(m.register_via)}
         · 邀请人 ${m.inviter_name ? esc(m.inviter_name) : '<span class="muted">—</span>'}
         · 下级 ${esc(m.invitee_count || 0)} 人
@@ -798,6 +902,7 @@ async function memberDetail(id) {
         <label><input type="checkbox" ${hasUploader ? 'checked' : ''} onchange="memberToggleRole('${q(id)}','uploader')"> 上片员</label>
       </div>
       ${trafficBar(m.traffic_used_bytes, m.traffic_quota_bytes)}
+      ${edgeDetailSection(d.edge)}
       <h3 style="font-size:13px;margin:16px 0 6px">求片记录</h3>
       ${memberRequests(d)}
       <h3 style="font-size:13px;margin:16px 0 6px">权限覆盖</h3>

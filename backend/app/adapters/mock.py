@@ -8,11 +8,15 @@ from typing import Any
 
 class MockEmby:
     def __init__(self) -> None:
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S.0000000Z", time.gmtime())
         self._users: dict[str, dict[str, Any]] = {
-            "u1": {"Id": "u1", "Name": "demo-user-1", "Policy": {"IsDisabled": False}},
-            "u2": {"Id": "u2", "Name": "demo-user-2", "Policy": {"IsDisabled": True}},
+            "u1": {"Id": "u1", "Name": "demo-user-1", "Policy": {"IsDisabled": False},
+                   "LastActivityDate": stamp},
+            "u2": {"Id": "u2", "Name": "demo-user-2", "Policy": {"IsDisabled": True},
+                   "LastActivityDate": stamp},
             "admin": {"Id": "admin", "Name": "demo-admin",
-                      "Policy": {"IsDisabled": False, "IsAdministrator": True}},
+                      "Policy": {"IsDisabled": False, "IsAdministrator": True},
+                      "LastActivityDate": stamp},
         }
         self._next = 3
         self._sessions: list[dict[str, Any]] = []
