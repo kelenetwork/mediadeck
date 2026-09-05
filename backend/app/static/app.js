@@ -39,6 +39,7 @@ const NAV = [
     { id: 'tasks', icon: '⏱', label: '调度中心', sub: '主机定时任务运行状态与失败追踪' },
   ]},
   { group: '资源', items: [
+    { id: 'intake', icon: '⇉', label: '入库流水线', sub: '一屏看完扫描、刷新、通知、上传与拉取' },
     { id: 'nodes', icon: '⛁', label: '节点管理', sub: '推流节点负载与调度' },
     { id: 'pipeline', icon: '⇄', label: '管线状态', sub: '整理、上传队列与配额' },
     { id: 'storage', icon: '☁', label: '存储管理', sub: '云盘账号与挂载点' },
@@ -1180,6 +1181,7 @@ async function applyUpdate() {
 const LIVE = {
   dashboard: ['nodes', 'sessions', 'pipeline'],
   nodes: ['nodes'],
+  intake: ['intake'],
   pipeline: ['pipeline'],
   tasks: ['tasks'],
   mounts: ['mounts'],

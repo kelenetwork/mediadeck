@@ -998,9 +998,17 @@ def test_history_is_empty_before_anything_has_run() -> None:
 _STATIC = FilePath(__file__).resolve().parents[1] / "app" / "static"
 
 
+#: Every script index.html loads. A page defined in a file missing from this
+#: list would look absent to the nav guard below, so the list is derived from
+#: the document rather than repeated by hand.
+def _panel_scripts() -> list[str]:
+    html = (_STATIC / "index.html").read_text(encoding="utf-8")
+    return re.findall(r'src="/static/([A-Za-z0-9_.-]+\.js)"', html)
+
+
 def _panel_source() -> str:
-    return ((_STATIC / "app.js").read_text(encoding="utf-8")
-            + (_STATIC / "ops.js").read_text(encoding="utf-8"))
+    return "".join((_STATIC / name).read_text(encoding="utf-8")
+                   for name in _panel_scripts())
 
 
 def _nav_ids() -> list[str]:
