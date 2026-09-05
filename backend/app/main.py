@@ -487,7 +487,7 @@ async def root(_: str = Depends(_auth)) -> HTMLResponse:
     except Exception:  # noqa: BLE001 - version stamping must never break the page
         ver = ""
     if ver:
-        for asset in ("app.css", "app.js", "intake.js", "ops.js"):
+        for asset in ("app.css", "app.js", "intake.js", "nodepool.js", "ops.js"):
             html = html.replace(f"/static/{asset}", f"/static/{asset}?v={ver}")
     return HTMLResponse(html)
 
@@ -633,6 +633,60 @@ async def enable_node(name: str) -> dict[str, bool]:
     if not app.state.scheduler.set_disabled(name, False):
         raise HTTPException(404, "unknown node")
     return {"disabled": False}
+
+
+@app.put("/api/nodes/{name}/pool", dependencies=[Depends(_auth)])
+async def update_node_pool(name: str, payload: dict[str, Any] = Body(...),  # noqa: B008
+                           user: str = Depends(_auth)) -> dict[str, Any]:
+    """Edit a node's dispatch parameters, live.
+
+    Applies through the settings service, which reconfigures the running
+    scheduler in place -- an operator pulling a node out of rotation during an
+    incident cannot be asked to restart the panel to make it take effect.
+    """
+    try:
+        result = app.state.settings_service.update_node_pool(name, payload)
+    except KeyError:
+        raise HTTPException(404, "unknown node") from None
+    changed = result["changed"]
+    if changed:
+        detail = ", ".join(f"{k}: {v[0]} -> {v[1]}" for k, v in changed.items())
+        app.state.members.audit(user, "node.pool", name, detail[:400])
+    return {**result["node"], "changed": changed}
+
+
+@app.get("/api/nodes/pool", dependencies=[Depends(_auth)])
+async def node_pool_overview() -> list[dict[str, Any]]:
+    """Configured node parameters joined with live probe state.
+
+    One payload rather than two: the page shows configuration and reality side
+    by side, and fetching them separately makes them disagree for a moment on
+    every refresh.
+    """
+    config = {n["name"]: n for n in app.state.settings_service.nodes_public()}
+    live = {s["name"]: s for s in app.state.scheduler.snapshot()}
+    total = sum(float(n.get("capacity") or 0)
+                for n in config.values() if n.get("enabled"))
+    out = []
+    for name, node in config.items():
+        state = live.get(name, {})
+        capacity = float(node.get("capacity") or 0)
+        out.append({
+            **node,
+            "ok": state.get("ok", False),
+            "available": state.get("available", False),
+            "active_streams": state.get("active_streams", 0),
+            "egress_mbps": state.get("egress_mbps", 0.0),
+            "utilisation": state.get("utilisation", 0.0),
+            "last_probe_ts": state.get("last_probe_ts", 0),
+            "manually_disabled": state.get("manually_disabled", False),
+            # Share of the fleet this node is expected to carry. Only enabled
+            # nodes count, so a disabled node reads 0 rather than inflating
+            # the denominator and making every share look too small.
+            "share": (round(capacity / total, 4)
+                      if total > 0 and node.get("enabled") else 0.0),
+        })
+    return out
 
 
 @app.get("/api/nodes/{name}/history", dependencies=[Depends(_auth)])

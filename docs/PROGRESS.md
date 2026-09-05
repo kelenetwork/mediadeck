@@ -4,6 +4,47 @@ Newest entries first. Every working session appends one entry.
 
 ---
 
+## 2026-09-06 — node pool editable from the panel (v0.24.0)
+**Done**
+- **A new 节点池 page** under 资源: per node, an 参与调度 switch, weight,
+  bandwidth ceiling and capacity, alongside the live numbers that say whether
+  the change did anything — active streams, egress, utilisation and probe
+  age. Pulling a node out of rotation is an incident action, so it takes
+  effect immediately: saves go through the settings service, which
+  reconfigures the **running** scheduler in place. No restart, no shell.
+- **A narrow endpoint rather than the existing node update.** `update_node`
+  rebuilds a node from its payload and therefore blanks anything the caller
+  omitted — a four-field pool editor posting through it could wipe a node's
+  media roots or signing key, which would 404 or 403 every stream that node
+  serves. `update_node_pool` touches exactly the four fields and leaves the
+  rest of the record untouched, with a test that pins it.
+- **The audit entry records the change, not the submission.** A form that
+  posts every field would otherwise log an edit that changed nothing, and an
+  audit log full of no-ops is one nobody reads. No-op saves write no row.
+- **Share is computed over enabled nodes only**, so a disabled node reads 0%
+  instead of inflating the denominator and making every other node's share
+  look too small.
+
+**Decisions**
+- *Weight is stored as capacity, not as a second number.* Capacity is what the
+  scheduler actually divides by; a separate weight understood only by the UI
+  would eventually disagree with it.
+- *Config and live state in one payload.* The page shows what was set beside
+  what the fleet is doing; fetching them separately makes them disagree for a
+  moment on every refresh.
+- *ca1 left disabled.* It was taken out of the pool by hand earlier and stays
+  that way — this work only makes that state visible and editable.
+
+**Verification**
+- 852 tests (was 824): +28. `ruff` clean. Both directions covered: a disabled
+  node is never picked across repeated dispatches (not merely deprioritised),
+  and re-enabling puts it back; illegal values rejected and a refused edit
+  changes nothing; probe history survives an edit.
+
+**Next**
+- Consider switching quota enforcement from the legacy sampled field to the
+  measured ledger, once it has run long enough to be trusted.
+
 ## 2026-09-06 — traffic measured instead of guessed (v0.23.0)
 **Done**
 - **`members.traffic_used_bytes` was never a traffic figure.** It is derived
