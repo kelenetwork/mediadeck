@@ -4,6 +4,50 @@ Newest entries first. Every working session appends one entry.
 
 ---
 
+## 2026-09-06 — three things the intake page got wrong in production (v0.22.1)
+**Done**
+Deployed v0.22.0 and read it against the live system. It was wrong in three
+ways that no amount of tmp-directory testing would have surfaced, because all
+three only appear at production scale or during a routine operation.
+
+- **A capped listing was being subtracted.** Outstanding cloud jobs are derived
+  as claims minus receipts. Both directories hold ~8k entries against a 4000
+  cap, so every claim whose receipt fell outside the window counted as
+  unfinished: the page reported **2103 outstanding jobs when the true figure
+  was five**. Counting now uses a separate cheap path (one syscall per entry,
+  200k cap) and, when even that truncates, `outstanding` is `null` and the card
+  shows 未知. A partial listing cannot support a subtraction, and a confident
+  wrong number is worse than an admitted unknown — this is the same class of
+  error as the traffic figure that nearly cost 196 accounts.
+- **The probe-loop alarm fired during a normal library scan.** A full scan
+  walks one directory at a time, so it concentrates probes *by construction* —
+  observed at 100% on a completely healthy server. As written, the page would
+  have been red for the entire duration of every scheduled scan. Concentration
+  is now only evidence of a loop when nothing is scanning; during a scan it is
+  reported as expected.
+- **Queue-age amber fired while the drain switch was deliberately off.** With
+  suppression on, a growing refresh queue is the switch working as intended.
+  Both false positives train an operator to ignore the colour, which costs more
+  than the alert was ever worth.
+- Refresh queue depth is now exact regardless of how deep it gets: it is a
+  headline number, while only the handful of rows actually rendered are parsed.
+
+**Decisions**
+- *Separate counting from listing.* They have different failure modes:
+  truncating a display list drops rows nobody misses; truncating a set a count
+  is derived from invents work that does not exist.
+- *Suppress rather than downgrade.* Both false positives keep their row on the
+  page at 灰 with the reason stated, instead of disappearing — the operator
+  should still see that concentration or queue growth is happening, just not be
+  told it is a fault.
+
+**Verification**
+- 780 tests (was 775); `ruff` clean. Each fix has a test pinning the exact
+  production observation that motivated it.
+
+**Next**
+- Direct-link traffic accounting (v0.23.0).
+
 ## 2026-09-06 — intake pipeline on one screen (v0.22.0)
 **Done**
 - **A new 入库流水线 page answers "why has nothing arrived?" without a shell.**

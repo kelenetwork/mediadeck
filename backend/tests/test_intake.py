@@ -19,6 +19,7 @@ from app.main import app
 from app.modules.downloaders import QbittorrentClient
 from app.modules.intake import (
     DEFAULT_THRESHOLDS,
+    MAX_QUEUE_PARSE,
     FsReader,
     IntakeCollector,
     IntakePaths,
@@ -299,10 +300,41 @@ def test_collect_cloud_counts_outstanding_claims(intake_root) -> None:
     assert out["claims"]["total"] == 3
     assert out["claims"]["done"] == 1
     assert out["claims"]["outstanding"] == 2
+    assert out["claims"]["truncated"] is False
     assert out["backlog"]["rows"] == 2
     assert out["queue"]["depth"] == 2
     assert out["active"]["manifest_items"] == 3
     assert out["pending_identity"] is None
+
+
+def test_collect_cloud_refuses_to_subtract_a_truncated_listing(
+        intake_root, monkeypatch) -> None:
+    """A capped listing cannot support claims-minus-receipts.
+
+    Observed live: with both directories at ~8k entries and a 4000 cap, every
+    claim whose receipt fell outside the window counted as unfinished and the
+    page reported 2103 outstanding jobs against a true figure of five. An
+    admitted unknown is worth more than a confident wrong number.
+    """
+    monkeypatch.setattr("app.modules.intake.MAX_COUNT_FILES", 2)
+    out = IntakeCollector(paths=intake_root, fs=FsReader()).collect_cloud()
+    assert out["claims"]["available"] is True
+    assert out["claims"]["truncated"] is True
+    assert out["claims"]["outstanding"] is None
+
+
+def test_refresh_depth_is_exact_beyond_the_parse_limit(tmp_path) -> None:
+    """Queue depth is a headline number: it must count every entry even though
+    only a handful are opened and rendered."""
+    queue = tmp_path / "queue"
+    queue.mkdir()
+    for i in range(MAX_QUEUE_PARSE + 25):
+        (queue / f"{i:05d}.json").write_text("{}", encoding="utf-8")
+    out = IntakeCollector(paths=IntakePaths(refresh_queue_dir=str(queue)),
+                          fs=FsReader()).collect_refresh()
+    assert out["total"] == MAX_QUEUE_PARSE + 25
+    assert out["truncated"] is False
+    assert len(out["top"]) <= 5
 
 
 def test_collect_cloud_missing_state() -> None:
@@ -399,12 +431,14 @@ async def test_latest_created_timestamp_is_utc() -> None:
 # health verdict
 # ---------------------------------------------------------------------------
 def _snapshot(latest_minutes=1.0, pending=0, top_ratio=0.1,
-              refresh_age=60.0, rate_limited=(), suppressed=False):
+              refresh_age=60.0, rate_limited=(), suppressed=False,
+              scanning=False):
     return {
         "emby": {
             "latest": {"available": True, "age_minutes": latest_minutes},
             "probe": {"available": True, "top_ratio": top_ratio,
                       "top_group": "/media/Shows"},
+            "scan": {"available": True, "running": scanning},
         },
         "notify": {"pending": {"available": True, "total": pending}},
         "refresh": {"available": True, "oldest_age_seconds": refresh_age,
@@ -437,6 +471,22 @@ def test_health_red_on_probe_loop() -> None:
     assert "探测" in out["alerts"][0]["message"]
 
 
+def test_health_probe_concentration_during_a_scan_is_expected() -> None:
+    """A running full-library scan walks one directory at a time, so it
+    concentrates probes by construction -- observed at 100% on a healthy
+    server. Alarming then would hold the page red for the whole scan, which is
+    how an indicator stops being read."""
+    out = IntakeCollector().evaluate(_snapshot(top_ratio=1.0, scanning=True))
+    assert out["level"] == "idle"
+    assert "扫描进行中" in out["alerts"][0]["message"]
+
+
+def test_health_probe_loop_still_red_when_nothing_is_scanning() -> None:
+    out = IntakeCollector().evaluate(_snapshot(top_ratio=1.0, scanning=False))
+    assert out["level"] == "bad"
+    assert "疑似探测循环" in out["alerts"][0]["message"]
+
+
 def test_health_probe_below_threshold_is_quiet() -> None:
     out = IntakeCollector().evaluate(_snapshot(top_ratio=0.4))
     assert out["level"] == "ok"
@@ -445,6 +495,15 @@ def test_health_probe_below_threshold_is_quiet() -> None:
 def test_health_amber_on_old_refresh_queue() -> None:
     out = IntakeCollector().evaluate(_snapshot(refresh_age=8 * 3600))
     assert out["level"] == "warn"
+
+
+def test_health_old_refresh_queue_is_expected_while_suppressed() -> None:
+    """With the switch deliberately off, a growing queue is the switch working.
+    Flagging it amber trains the operator to ignore the colour."""
+    out = IntakeCollector().evaluate(
+        _snapshot(refresh_age=8 * 3600, suppressed=True))
+    assert out["level"] == "idle"
+    assert any("属预期" in a["message"] for a in out["alerts"])
 
 
 def test_health_amber_on_rate_limit_marker() -> None:
