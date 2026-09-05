@@ -259,6 +259,22 @@ def test_status_reports_coverage(ledger) -> None:
 # ---------------------------------------------------------------------------
 # node agent
 # ---------------------------------------------------------------------------
+def test_agent_declares_a_real_user_agent() -> None:
+    """urllib's default agent is blocked outright by common WAF rules.
+
+    Measured against the production edge: the default agent got 403 while an
+    identical request with any other agent got through. Declaring what the
+    reporter is fixes that without asking anyone to weaken a security rule --
+    so the header is a functional requirement, not cosmetic.
+    """
+    module = _agent()
+    assert module.USER_AGENT
+    assert "urllib" not in module.USER_AGENT.lower()
+    source = AGENT.read_text(encoding="utf-8")
+    # Both outbound calls must carry it; one missing is one silent 403.
+    assert source.count("USER_AGENT") >= 3
+
+
 def test_agent_reads_rotations_before_the_live_file(tmp_path) -> None:
     """Consuming the live file first would advance a cursor past rotated data
     that had not been read yet."""

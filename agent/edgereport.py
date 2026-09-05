@@ -32,6 +32,13 @@ import time
 import urllib.error
 import urllib.request
 
+#: Sent on every request. urllib's default ("Python-urllib/3.x") is blocked
+#: outright by common WAF rules -- measured against the production edge, the
+#: default agent got 403 while an identical request with any other agent got
+#: through. Declaring what this actually is fixes that without asking anyone
+#: to weaken a security rule.
+USER_AGENT = "mediadeck-edgereport/1.0"
+
 #: Lines sent in one request. Large enough that a busy node drains quickly,
 #: small enough that a failed POST retries cheaply.
 BATCH_LINES = 20_000
@@ -112,7 +119,8 @@ def post(panel: str, node: str, creds: str, payload: dict,
         f"{panel.rstrip('/')}/api/edge/{node}/report",
         data=body,
         headers={"Content-Type": "application/json",
-                 "Authorization": f"Bearer {creds}"},
+                 "Authorization": f"Bearer {creds}",
+                 "User-Agent": USER_AGENT},
         method="POST")
     with urllib.request.urlopen(request, timeout=timeout) as response:
         return json.loads(response.read().decode("utf-8", "replace"))
@@ -127,7 +135,8 @@ def cursors_from(panel: str, node: str, creds: str, timeout: float = 30.0) -> di
     """
     request = urllib.request.Request(
         f"{panel.rstrip('/')}/api/edge/{node}/cursors",
-        headers={"Authorization": f"Bearer {creds}"})
+        headers={"Authorization": f"Bearer {creds}",
+                 "User-Agent": USER_AGENT})
     with urllib.request.urlopen(request, timeout=timeout) as response:
         data = json.loads(response.read().decode("utf-8", "replace"))
     return {c["path"]: c for c in data.get("cursors", [])}
