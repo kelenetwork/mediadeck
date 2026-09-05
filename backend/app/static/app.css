@@ -222,6 +222,10 @@ th { background: #080d1b; color: var(--muted); font-weight: 500; font-size: 12px
 tbody tr:nth-child(even) { background: var(--panel-3); }
 tbody tr:last-child td { border-bottom: none; }
 tbody tr:hover { background: #111830; }
+/* Sortable headers read as controls only on hover: a permanently highlighted
+   header competes with the data for attention on a dense table. */
+th.sortable { cursor: pointer; user-select: none; }
+th.sortable:hover { color: var(--text-2); }
 
 .tag { display: inline-block; padding: 2px 8px; border-radius: 20px; font-size: 12px; border: 1px solid transparent; }
 .tag.ok { background: var(--ok-soft); color: var(--ok); border-color: rgba(52, 211, 153, .25); }

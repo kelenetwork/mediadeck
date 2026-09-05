@@ -531,6 +531,8 @@ class SettingsService:
         secret = data.pop("sign_secret", "") or ""
         rclone_conf = data.pop("rclone_conf", "") or ""
         data.pop("enroll_token", None)
+        report_creds = data.pop("report_token", "") or ""
+        data["report_token_set"] = bool(report_creds)
         data["sign_secret_set"] = bool(secret)
         data["sign_secret_masked"] = mask_secret(secret)
         # The Drive config contains OAuth tokens; only report whether it is set.
@@ -645,6 +647,7 @@ class SettingsService:
             rclone_conf=str(payload.get(
                 "rclone_conf", base.get("rclone_conf", "")) or ""),
             enroll_token=str(base.get("enroll_token", "")),
+            report_token=str(base.get("report_token", "")),
             mount_ids=[str(x) for x in (
                 payload.get("mount_ids", base.get("mount_ids") or []) or [])
                 if str(x).strip()],
@@ -688,6 +691,44 @@ class SettingsService:
             raise KeyError(name)
         self._persist_nodes(remaining)
         return True
+
+    # -- edge traffic reporting ----------------------------------------------
+    def node_by_report_token(self, name: str, token: str) -> StreamNode | None:
+        """Match a node by name *and* credential.
+
+        Compared with ``compare_digest`` and only against the named node, so a
+        valid credential for one node cannot be used to post another's
+        traffic.
+        """
+        token = (token or "").strip()
+        if not token:
+            return None
+        node = self.node(name)
+        if node is None or not node.report_token:
+            return None
+        if not secrets.compare_digest(node.report_token, token):
+            return None
+        return node
+
+    def node_report_token(self, name: str) -> str:
+        """Return (creating if needed) the node's traffic-report credential."""
+        nodes = self.nodes()
+        index = next((i for i, n in enumerate(nodes) if n.name == name), None)
+        if index is None:
+            raise KeyError(name)
+        if not nodes[index].report_token:
+            nodes[index].report_token = secrets.token_urlsafe(24)
+            self._persist_nodes(nodes)
+        return nodes[index].report_token
+
+    def rotate_report_token(self, name: str) -> str:
+        nodes = self.nodes()
+        index = next((i for i, n in enumerate(nodes) if n.name == name), None)
+        if index is None:
+            raise KeyError(name)
+        nodes[index].report_token = secrets.token_urlsafe(24)
+        self._persist_nodes(nodes)
+        return nodes[index].report_token
 
     def rotate_node_secret(self, name: str) -> dict[str, Any]:
         nodes = self.nodes()

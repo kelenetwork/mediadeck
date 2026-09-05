@@ -31,6 +31,12 @@ from app.core.errors import ConfigError, ConflictError, NotConfigured, UpstreamE
 from app.core.store import SettingsStore
 from app.modules.access import AccessRules
 from app.modules.downloaders import MockDownloader, QbittorrentClient
+from app.modules.edgelog import (
+    MAX_LINES_PER_INGEST,
+    TrafficLedger,
+    aggregate,
+    parse_lines,
+)
 from app.modules.enforcement import EnforcementService
 from app.modules.events import EventStream, safe_stream
 from app.modules.groups import GroupService
@@ -280,6 +286,10 @@ async def _startup() -> None:
     app.state.enforcement = EnforcementService(
         app.state.db, app.state.members, app.state.emby)
     app.state.stats = StatsService(app.state.db)
+    # Bytes measured on the edge. Kept separate from the sampled estimate in
+    # usage_daily: conflating a measurement with a guess is what made the old
+    # traffic figure unsafe to act on.
+    app.state.ledger = TrafficLedger(app.state.db)
     # Points are a ledger, so the service is a thin wrapper over the database
     # and can be built as soon as it exists. The shop is what spends them.
     app.state.points = PointsService(app.state.db)
@@ -942,6 +952,109 @@ async def node_install_script(name: str) -> dict[str, Any]:
     }
 
 
+# ---- edge traffic ingestion ------------------------------------------------
+def _tag_map() -> dict[str, str]:
+    """Anonymised link tag -> member id.
+
+    Rebuilt from the member list rather than stored: the tag is a pure
+    function of the account id (the same function used when signing a link),
+    so a stored copy could only ever drift out of step with it.
+    """
+    out: dict[str, str] = {}
+    for member in app.state.members.list(limit=5000):
+        uid = member.get("emby_user_id") or ""
+        if uid:
+            out[user_tag(uid)] = uid
+    return out
+
+
+def _edge_node_or_401(name: str, request: Request) -> Any:
+    auth = request.headers.get("authorization", "")
+    token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+    node = app.state.settings_service.node_by_report_token(name, token)
+    if node is None:
+        raise HTTPException(401, "invalid node report credential")
+    return node
+
+
+@app.get("/api/edge/{name}/cursors", include_in_schema=False)
+async def edge_cursors(name: str, request: Request) -> dict[str, Any]:
+    """Where this node's logs have been consumed to.
+
+    The panel owns the cursors because it is the party that must not double
+    count; a node-side copy would diverge after any restore.
+    """
+    _edge_node_or_401(name, request)
+    rows = app.state.db.query(
+        "SELECT path, inode, offset, updated_at FROM edge_cursors WHERE node=?",
+        (name,))
+    return {"node": name, "cursors": [dict(r) for r in rows]}
+
+
+@app.post("/api/edge/{name}/report", include_in_schema=False)
+async def edge_report(name: str, request: Request,
+                      payload: dict[str, Any] = Body(...)) -> dict[str, Any]:  # noqa: B008
+    """Accept one batch of access-log lines from a node.
+
+    Authenticated by the node's own long-lived credential rather than the
+    panel admin login: this runs unattended on the node, and giving it an
+    operator credential would put a far more powerful secret on every edge.
+    """
+    _edge_node_or_401(name, request)
+    lines = payload.get("lines")
+    if not isinstance(lines, list):
+        raise HTTPException(422, "lines must be a list")
+    if len(lines) > MAX_LINES_PER_INGEST:
+        raise HTTPException(413, "batch too large")
+
+    ledger: TrafficLedger = app.state.ledger
+    buckets = aggregate(parse_lines(str(x) for x in lines))
+    result = ledger.record(name, buckets, _tag_map())
+
+    path = str(payload.get("path") or "")
+    if path:
+        ledger.set_cursor(name, path, int(payload.get("inode") or 0),
+                          int(payload.get("offset") or 0))
+    return {"ok": True, "node": name, "lines": len(lines),
+            "events": result["rows"], "bytes": result["bytes"],
+            "unknown_bytes": result["unknown_bytes"]}
+
+
+@app.get("/api/edge/status", dependencies=[Depends(_auth)])
+async def edge_status(days: int = 30) -> dict[str, Any]:
+    """Ledger health: coverage, per-node totals and unattributed bytes."""
+    days = max(1, min(int(days or 30), 400))
+    ledger: TrafficLedger = app.state.ledger
+    return {
+        **ledger.status(),
+        "nodes": ledger.node_totals(days),
+        "unattributed": ledger.unattributed(days),
+        "days": days,
+    }
+
+
+@app.post("/api/edge/relink", dependencies=[Depends(_auth)])
+async def edge_relink() -> dict[str, int]:
+    """Attach tags to rows ingested before their member was known."""
+    return {"updated": app.state.ledger.relink(_tag_map())}
+
+
+@app.get("/api/nodes/{name}/report-token", dependencies=[Depends(_auth)])
+async def node_report_token(name: str, rotate: bool = False) -> dict[str, Any]:
+    """Issue (or rotate) the node's traffic-report credential.
+
+    Returned once to the operator who is installing the reporter; it is never
+    included in the node list, which is rendered on every settings page load.
+    """
+    try:
+        service = app.state.settings_service
+        value = (service.rotate_report_token(name) if rotate
+                 else service.node_report_token(name))
+    except KeyError:
+        raise HTTPException(404, "unknown node") from None
+    return {"node": name, "report_token": value}
+
+
 @app.post("/api/enroll/{token}/report", include_in_schema=False)
 async def enroll_report(token: str, payload: dict[str, Any] = Body(default={})) -> dict[str, Any]:  # noqa: B008
     """Public by design: the install token is the credential.
@@ -1272,9 +1385,19 @@ async def members_list(status: str | None = None, group_id: str | None = None,
     balances = {}
     with contextlib.suppress(Exception):
         balances = app.state.points.balances()
+    # Measured edge bytes, in one GROUP BY for the whole page. The older
+    # traffic_used_bytes stays on the row but is labelled in the UI as the
+    # legacy figure: it is a sampled estimate that never saw a direct link,
+    # and hundreds of active accounts look idle by it.
+    edge = {}
+    with contextlib.suppress(Exception):
+        edge = app.state.ledger.summary_for_users()
     for member in members:
         member["watch_hours"] = hours.get(member["emby_user_id"], 0.0)
         member["points"] = balances.get(member["emby_user_id"], 0)
+        member["edge"] = edge.get(member["emby_user_id"],
+                                  {"bytes_7d": 0, "bytes_30d": 0,
+                                   "bytes_total": 0})
     truncated = len(members) >= limit
     known = {m["emby_user_id"] for m in members}
     unmanaged: list[dict[str, Any]] = []
@@ -1299,6 +1422,26 @@ async def members_list(status: str | None = None, group_id: str | None = None,
     return {"members": members, "unmanaged": unmanaged[:500],
             "unmanaged_total": len(unmanaged), "truncated": truncated,
             "limit": limit}
+
+
+@app.get("/api/members-activity", dependencies=[Depends(_auth)])
+async def members_activity() -> dict[str, Any]:
+    """Member id -> last activity, straight from Emby.
+
+    Emby already tracks this per account, so asking it is both cheaper and
+    more accurate than inferring "active" from a traffic total -- which is
+    exactly the inference that made an idle-looking account indistinguishable
+    from an unmeasured one.
+    """
+    out: dict[str, str] = {}
+    try:
+        for user in await app.state.emby.list_users():
+            stamp = user.get("LastActivityDate") or ""
+            if stamp:
+                out[str(user.get("Id"))] = str(stamp)
+    except Exception as exc:  # noqa: BLE001 - the column is optional
+        return {"available": False, "reason": str(exc)[:200], "activity": {}}
+    return {"available": True, "activity": out}
 
 
 @app.post("/api/members/enroll-defaults", dependencies=[Depends(_auth)])
@@ -1338,8 +1481,12 @@ async def members_get(user_id: str, days: int = 30) -> dict[str, Any]:
     sessions = []
     with contextlib.suppress(Exception):
         sessions = await app.state.emby.sessions_for_user(user_id)
+    edge_detail = {}
+    with contextlib.suppress(Exception):
+        edge_detail = app.state.ledger.member_detail(user_id, days)
     return {
         **detail,
+        "edge": edge_detail,
         "points": app.state.points.balance(user_id),
         "points_ledger": app.state.points.ledger(user_id, 20),
         "requests": app.state.requests.for_user(user_id, limit=10),
