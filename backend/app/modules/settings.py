@@ -692,6 +692,69 @@ class SettingsService:
         self._persist_nodes(remaining)
         return True
 
+    def update_node_pool(self, name: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Edit only the dispatch-relevant fields of one node.
+
+        Deliberately narrower than :meth:`update_node`, which rebuilds the
+        whole node from a payload and therefore silently resets anything the
+        caller omitted. A pool editor that sends four fields must not be able
+        to blank a node's media roots or signing key, so this touches exactly
+        the four and leaves the rest of the record alone.
+
+        Returns (public node, changed fields) so the caller can audit what
+        actually changed rather than what was submitted.
+        """
+        nodes = self.nodes()
+        index = next((i for i, n in enumerate(nodes) if n.name == name), None)
+        if index is None:
+            raise KeyError(name)
+        node = nodes[index]
+        before = node.model_dump()
+        changed: dict[str, Any] = {}
+
+        if "enabled" in payload:
+            value = bool(payload["enabled"])
+            if value != node.enabled:
+                changed["enabled"] = [node.enabled, value]
+            node.enabled = value
+
+        for field, label, low, high in (
+            ("capacity", "并发容量", 1, 100000),
+            ("bandwidth_mbps", "带宽上限", 0, 1000000),
+        ):
+            if field not in payload:
+                continue
+            try:
+                value = float(payload[field])
+            except (TypeError, ValueError):
+                raise ConfigError(f"{label}必须是数字") from None
+            if not low <= value <= high:
+                raise ConfigError(f"{label}必须在 {low}–{high} 之间")
+            if value != float(getattr(node, field)):
+                changed[field] = [getattr(node, field), value]
+            setattr(node, field, value)
+
+        if "weight" in payload:
+            # Weight is presented in the UI as a node's share of the fleet.
+            # It is stored as capacity because that is what the scheduler
+            # actually divides by -- keeping a second number that only the UI
+            # understands would let the two disagree.
+            try:
+                value = float(payload["weight"])
+            except (TypeError, ValueError):
+                raise ConfigError("权重必须是数字") from None
+            if not 1 <= value <= 100000:
+                raise ConfigError("权重必须在 1–100000 之间")
+            if value != float(node.capacity):
+                changed["capacity"] = [node.capacity, value]
+            node.capacity = value
+
+        nodes[index] = node
+        self._persist_nodes(nodes)
+        after = node.model_dump()
+        assert before.keys() == after.keys()
+        return {"node": self.node_public(node), "changed": changed}
+
     # -- edge traffic reporting ----------------------------------------------
     def node_by_report_token(self, name: str, token: str) -> StreamNode | None:
         """Match a node by name *and* credential.

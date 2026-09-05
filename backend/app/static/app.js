@@ -41,6 +41,7 @@ const NAV = [
   { group: '资源', items: [
     { id: 'intake', icon: '⇉', label: '入库流水线', sub: '一屏看完扫描、刷新、通知、上传与拉取' },
     { id: 'nodes', icon: '⛁', label: '节点管理', sub: '推流节点负载与调度' },
+    { id: 'nodepool', icon: '⚖', label: '节点池', sub: '启停、权重、带宽与实时负载' },
     { id: 'pipeline', icon: '⇄', label: '管线状态', sub: '整理、上传队列与配额' },
     { id: 'storage', icon: '☁', label: '存储管理', sub: '云盘账号与挂载点' },
     { id: 'mounts', icon: '⛃', label: '挂载管理', sub: '存储挂载健康与缓存占用' },
