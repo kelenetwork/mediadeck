@@ -52,6 +52,12 @@ from typing import Any
 # ---------------------------------------------------------------------------
 MAX_QUEUE_FILES = 4000       # queue entries stat-ed per collection
 MAX_QUEUE_PARSE = 400        # of those, how many are opened and parsed
+#: Directories that are counted but never parsed use this much higher cap.
+#: Counting is one cheap syscall per entry, so the limit only exists to bound
+#: a pathological directory -- and a cap that truncates turns a derived count
+#: (claims minus receipts) into a fabricated number, which is worse than no
+#: number at all. Measured against a real deployment: ~8k entries per side.
+MAX_COUNT_FILES = 200_000
 MAX_LOG_TAIL_BYTES = 512_000  # how much of the media-server log tail is read
 MAX_PROBE_LINES = 300        # probe lines aggregated (per the owner's spec)
 MAX_NOTIFY_TAIL_BYTES = 64_000
@@ -148,6 +154,37 @@ class FsReader:
             return Path(path).exists()
         except OSError:
             return False
+
+    def count_names(self, path: str, suffix: str = "",
+                    limit: int | None = None) -> tuple[set[str], bool] | None:
+        """Entry names in a directory, and whether the cap was hit.
+
+        Separate from :meth:`listdir` because the two have different failure
+        modes. Truncating a *display* list drops rows nobody misses;
+        truncating a set that a count is *derived* from (claims that have no
+        receipt) invents work that does not exist -- observed live as "2103
+        outstanding" against a true figure of five.
+        """
+        if not path:
+            return None
+        # Resolved here rather than as a default argument so the cap stays a
+        # single module-level knob, adjustable in tests.
+        cap = MAX_COUNT_FILES if limit is None else limit
+        try:
+            base = Path(path)
+            if not base.is_dir():
+                return None
+            names: set[str] = set()
+            for entry in base.iterdir():
+                name = entry.name
+                if suffix and not name.endswith(suffix):
+                    continue
+                names.add(name)
+                if len(names) >= cap:
+                    return names, True
+            return names, False
+        except OSError:
+            return None
 
     def listdir(self, path: str, limit: int = MAX_QUEUE_FILES) -> list[Path] | None:
         """Entries in a directory, or None if it cannot be listed."""
@@ -476,12 +513,17 @@ class IntakeCollector:
 
     # -- refresh queue -----------------------------------------------------
     def collect_refresh(self) -> dict[str, Any]:
+        # Counted with the cheap counter and listed separately: the depth is a
+        # headline number and must be exact even when the queue is deep, while
+        # only the handful of rows actually rendered need to be parsed.
+        counted = self.fs.count_names(self.paths.refresh_queue_dir, ".json")
         entries = self.fs.listdir(self.paths.refresh_queue_dir)
         suppressed = self.fs.exists(self.paths.refresh_suppress_file)
-        if entries is None:
+        if entries is None or counted is None:
             out = unavailable("刷新队列目录不存在")
             out["suppressed"] = suppressed
             return out
+        queue_names, queue_capped = counted
         files = [p for p in entries if p.name.endswith(".json")]
         now = self.now()
         oldest_age = 0.0
@@ -508,16 +550,16 @@ class IntakeCollector:
                 "age_seconds": round(age, 1),
             })
         rows.sort(key=lambda r: (-r["age_seconds"], r["label"]))
-        sent = self.fs.listdir(self.paths.refresh_sent_dir)
+        sent = self.fs.count_names(self.paths.refresh_sent_dir)
         return {
             "available": True,
-            "total": len(files),
-            "truncated": len(files) >= MAX_QUEUE_FILES,
+            "total": len(queue_names),
+            "truncated": queue_capped,
             "parsed": parsed,
             "unreadable": broken,
             "oldest_age_seconds": round(oldest_age, 1),
             "suppressed": suppressed,
-            "sent_total": len(sent) if sent is not None else None,
+            "sent_total": len(sent[0]) if sent is not None else None,
             "top": rows[:TOP_N],
         }
 
@@ -604,31 +646,30 @@ class IntakeCollector:
         work is therefore claims with no receipt, which is derived rather than
         stored — there is no counter to drift out of step with the files.
         """
-        claims = self.fs.listdir(self.paths.cloud_claims_dir)
-        done = self.fs.listdir(self.paths.cloud_done_dir)
+        claims = self.fs.count_names(self.paths.cloud_claims_dir, ".json")
+        done = self.fs.count_names(self.paths.cloud_done_dir, ".json")
         out: dict[str, Any] = {}
         if claims is None or done is None:
             out["claims"] = unavailable("拉取状态目录不存在")
         else:
-            claim_ids = {p.name.rsplit(".", 1)[0] for p in claims
-                         if p.name.endswith(".json")}
-            done_ids = set()
-            for path in done:
-                name = path.name
-                if not name.endswith(".json"):
-                    continue
-                # "<job_id>-done-<stamp>.json" -> job id
-                job_id = name.split("-done-", 1)[0]
-                done_ids.add(job_id)
-            outstanding = sorted(claim_ids - done_ids)
-            out["claims"] = {
+            claim_names, claims_capped = claims
+            done_names, done_capped = done
+            claim_ids = {name.rsplit(".", 1)[0] for name in claim_names}
+            # "<job_id>-done-<stamp>.json" -> job id
+            done_ids = {name.split("-done-", 1)[0] for name in done_names}
+            truncated = claims_capped or done_capped
+            entry: dict[str, Any] = {
                 "available": True,
                 "total": len(claim_ids),
                 "done": len(done_ids & claim_ids),
-                "outstanding": len(outstanding),
-                "truncated": len(claims) >= MAX_QUEUE_FILES
-                or len(done) >= MAX_QUEUE_FILES,
+                "truncated": truncated,
             }
+            # A partial listing cannot support a subtraction: every claim whose
+            # receipt fell outside the cap would be reported as unfinished
+            # work. Report the count as unknown rather than confidently wrong.
+            entry["outstanding"] = (None if truncated
+                                    else len(claim_ids - done_ids))
+            out["claims"] = entry
 
         pending = self.fs.listdir(self.paths.cloud_pending_dir)
         events = self.fs.listdir(self.paths.cloud_events_dir)
@@ -710,14 +751,23 @@ class IntakeCollector:
             })
 
         probe = emby.get("probe") or {}
+        scan = emby.get("scan") or {}
         hotspot = _float(self.thresholds.get("probe_hotspot_ratio"),
                          DEFAULT_THRESHOLDS["probe_hotspot_ratio"])
         if probe.get("available") and _float(probe.get("top_ratio")) > hotspot:
+            # A running full-library scan walks one directory at a time, so it
+            # concentrates probes by construction -- observed live at 100% on a
+            # perfectly healthy server. Raising the alarm then would light the
+            # page red for the entire duration of a routine scan, which is how
+            # an indicator stops being read. Concentration is only evidence of
+            # a loop when nothing is scanning.
+            scanning = bool(scan.get("available")) and bool(scan.get("running"))
             alerts.append({
-                "level": "bad",
+                "level": "idle" if scanning else "bad",
                 "message": (f"探测集中在 {probe.get('top_group')}"
-                            f"（{round(_float(probe.get('top_ratio')) * 100)}%），"
-                            "疑似探测循环"),
+                            f"（{round(_float(probe.get('top_ratio')) * 100)}%）"
+                            + ("，媒体库扫描进行中，属预期" if scanning
+                               else "，疑似探测循环")),
             })
 
         warn_hours = _float(self.thresholds.get("refresh_age_warn_hours"),
@@ -725,8 +775,16 @@ class IntakeCollector:
         if (refresh.get("available")
                 and _float(refresh.get("oldest_age_seconds")) > warn_hours * 3600):
             hours = _float(refresh.get("oldest_age_seconds")) / 3600
-            alerts.append({"level": "warn",
-                           "message": f"刷新队列最老条目已等待 {hours:.1f} 小时"})
+            # An ageing queue is only a fault when something is meant to be
+            # draining it. With the suppression switch deliberately on, a
+            # growing queue is the switch working as intended, and flagging it
+            # amber would train the operator to ignore the colour.
+            suppressed = bool(refresh.get("suppressed"))
+            alerts.append({
+                "level": "idle" if suppressed else "warn",
+                "message": (f"刷新队列最老条目已等待 {hours:.1f} 小时"
+                            + ("（推送已抑制，属预期）" if suppressed else "")),
+            })
 
         if upload.get("rate_limited"):
             alerts.append({

@@ -174,9 +174,13 @@ function intakeUploadCard(upload) {
 function intakeCloudCard(cloud) {
   if (!cloud) return card('云端拉取', '', intakeNA('未采集'));
   const claims = cloud.claims;
+  /* outstanding is null when the listing was capped: a partial listing cannot
+     support claims-minus-receipts, and a fabricated backlog is worse than an
+     admitted unknown. */
   const claimsBody = intakeSection(claims, (c) => `<div class="card-body">
       <div class="stat-grid">
-        ${stat('⇩', c.outstanding, '未完成任务', `共 ${c.total} 个认领`)}
+        ${stat('⇩', c.outstanding == null ? '—' : c.outstanding, '未完成任务',
+    c.outstanding == null ? '条目过多，无法精确统计' : `共 ${c.total} 个认领`)}
         ${stat('✓', c.done, '已完成', c.truncated ? '已达扫描上限' : '有完成回执')}
       </div></div>`);
 
